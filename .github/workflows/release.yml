@@ -1,0 +1,44 @@
+name: Publish Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  pack-and-publish:
+    runs-on: ubuntu-latest
+
+    environment:
+      name: production
+      url: https://nuget.org
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v3
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: '9.0.x'
+
+    - name: Restore Dependencies
+      run: dotnet restore Bhengu.Finance.Payments.sln
+
+    - name: Build Solution
+      run: dotnet build Bhengu.Finance.Payments.sln --configuration Release --no-restore
+
+    - name: Pack NuGet Projects
+      run: |
+        dotnet pack Bhengu.Finance.Payments.Core/Bhengu.Finance.Payments.Core.csproj -c Release -o ./nupkgs
+        dotnet pack Bhengu.Finance.Payments.PayFast/Bhengu.Finance.Payments.PayFast.csproj -c Release -o ./nupkgs
+        dotnet pack Bhengu.Finance.Payments.Google/Bhengu.Finance.Payments.Google.csproj -c Release -o ./nupkgs
+        dotnet pack Bhengu.Finance.Payments.ApplePay/Bhengu.Finance.Payments.ApplePay.csproj -c Release -o ./nupkgs
+        dotnet pack Bhengu.Finance.Payments.BricsPay/Bhengu.Finance.Payments.BricsPay.csproj -c Release -o ./nupkgs
+
+    - name: Publish All NuGets
+      run: |
+        for file in ./nupkgs/*.nupkg; do
+          dotnet nuget push "$file" --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json
+        done
+      env:
+        NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}

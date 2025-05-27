@@ -1,0 +1,21 @@
+# Ignore Visual Studio files
+.vs/
+*.user
+*.suo
+
+# Ignore build artifacts
+bin/
+obj/
+*.nupkg
+
+# Ignore Rider/JetBrains
+.idea/
+
+# Ignore Test Results
+TestResults/
+
+# Ignore secrets
+*.pfx
+*.key
+*.snk
+appsettings.*.json

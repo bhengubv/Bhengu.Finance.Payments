@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "Bhengu.Finance.Payments.ApiHost": {
+      "commandName": "Project",
+      "launchBrowser": true,
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development"
+      },
+      "applicationUrl": "https://localhost:60298;http://localhost:60299"
+    }
+  }
+}

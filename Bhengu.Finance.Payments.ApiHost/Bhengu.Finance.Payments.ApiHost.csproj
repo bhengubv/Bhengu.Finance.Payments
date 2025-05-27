@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Http" Version="2.3.0" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="9.0.5" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Bhengu.Finance.Payments.PayFast\Bhengu.Finance.Payments.PayFast.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Google\Bhengu.Finance.Payments.Google.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Bhengu.Finance.Payments.ApplePay\Bhengu.Finance.Payments.ApplePay.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Bhengu.Finance.Payments.BricsPay\Bhengu.Finance.Payments.BricsPay.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Core\Bhengu.Finance.Payments.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Http" Version="8.0.0" />
+  </ItemGroup>
+</Project>

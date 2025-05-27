@@ -1,0 +1,37 @@
+name: Build, Test and Publish NuGet Packages
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-test-pack:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: '9.0.x'
+
+    - name: Restore dependencies
+      run: dotnet restore Bhengu.Finance.Payments.sln
+
+    - name: Build solution
+      run: dotnet build Bhengu.Finance.Payments.sln --configuration Release --no-restore
+
+    - name: Run unit tests
+      run: dotnet test Bhengu.Finance.Payments.Tests --no-build --verbosity normal
+
+    - name: Run integration tests (optional)
+      run: dotnet test Bhengu.Finance.Payments.IntegrationTests --no-build --verbosity normal
+
+    - name: Pack Core project
+      run: dotnet pack Bhengu.Finance.Payments.Core/Bhengu.Finance.Payments.Core.csproj --configuration Release --output ./nupkgs
+
+    - name: Push to NuGet (commented by default)
+      run: echo "dotnet nuget push ./nupkgs/*.nupkg --api-key <YOUR_NUGET_API_KEY> --source https://api.nuget.org/v3/index.json"

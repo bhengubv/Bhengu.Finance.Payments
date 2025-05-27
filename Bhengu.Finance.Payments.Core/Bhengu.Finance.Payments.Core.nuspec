@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<package >
+  <metadata>
+    <id>Bhengu.Finance.Payments.Core</id>
+    <version>1.0.0</version>
+    <authors>Bhengu</authors>
+    <owners>Bhengu</owners>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <description>Core models and interfaces for Bhengu Finance Payments integration platform.</description>
+    <tags>payments finance bhengu payfast google apple brics</tags>
+    <dependencies>
+      <dependency id="Microsoft.Extensions.DependencyInjection" version="8.0.0" />
+    </dependencies>
+  </metadata>
+</package>
