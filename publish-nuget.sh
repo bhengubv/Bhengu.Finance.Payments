@@ -13,4 +13,4 @@ echo "Packing Core project..."
 dotnet pack Bhengu.Finance.Payments.Core/Bhengu.Finance.Payments.Core.csproj -c Release -o ./nupkgs
 
 echo "Use the following to publish:"
-echo "dotnet nuget push ./nupkgs/*.nupkg --api-key <YOUR_KEY> --source https://api.nuget.org/v3/index.json"
+echo "dotnet nuget push *.nupkg -k $NUGET_API_KEY -s https://api.nuget.org/v3/index.json"
