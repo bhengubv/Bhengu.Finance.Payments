@@ -15,7 +15,7 @@
     <ProjectReference Include="..\Bhengu.Finance.Payments.PayFast\Bhengu.Finance.Payments.PayFast.csproj" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="..\Bhengu.Finance.Payments.Google\Bhengu.Finance.Payments.Google.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Google\Bhengu.Finance.Payments.GooglePay.csproj" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Bhengu.Finance.Payments.ApplePay\Bhengu.Finance.Payments.ApplePay.csproj" />

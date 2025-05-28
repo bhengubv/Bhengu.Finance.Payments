@@ -4,14 +4,8 @@
     <PackageId>Bhengu.Finance.Payments.All</PackageId>
     <Authors>T. M.Bengu</Authors>
     <Company>Bhengu B.V.</Company>
-    <Description>All Bhengu Payments packages core functionality.</Description>
+    <Description>All Bhengu payment providers bundled together.</Description>
     <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;PayFast;GooglePay;ApplePay;BricsPay</PackageTags>
     <RepositoryUrl>https://github.com/bhengubv/Bhengu.Finance.Payments</RepositoryUrl>
-    <Nullable>enable</Nullable>
   </PropertyGroup>
-
-  <ItemGroup>
-    <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.0" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.0" />
-  </ItemGroup>
 </Project>

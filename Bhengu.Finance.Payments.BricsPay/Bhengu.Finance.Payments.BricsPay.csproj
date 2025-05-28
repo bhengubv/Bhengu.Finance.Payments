@@ -1,6 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
+    <PackageId>Bhengu.Finance.Payments.BricsPay</PackageId>
+    <Authors>T. M.Bengu</Authors>
+    <Company>Bhengu B.V.</Company>
+    <Description>>Consumes the Brics Pay API into Bhengu Payments packages for ease of integration within the Microsoft .Net context.</Description>
+    <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;PayFast;GooglePay;ApplePay;BricsPay</PackageTags>
+    <RepositoryUrl>https://github.com/bhengubv/Bhengu.Finance.Payments</RepositoryUrl>
   </PropertyGroup>
 
   <ItemGroup>
