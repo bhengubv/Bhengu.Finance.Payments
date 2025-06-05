@@ -1,12 +1,69 @@
-name: Publish Release
+name: Auto Version + Pack + Publish
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - master
 
 jobs:
+  bump-tag-and-release:
+    runs-on: ubuntu-latest
+
+    outputs:
+      version: ${{ steps.versioning.outputs.version }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: '9.0.x'
+
+    - name: Bump patch version in all non-test .csproj files
+      id: versioning
+      run: |
+        newVersion=""
+        for csproj in $(find . -name '*.csproj' ! -name '*.Tests.csproj'); do
+          current=$(grep -oPm1 "(?<=<Version>)[^<]+" "$csproj")
+          IFS='.' read -r major minor patch <<< "$current"
+          patch=$((patch + 1))
+          version="$major.$minor.$patch"
+          sed -i "s|<Version>.*</Version>|<Version>$version</Version>|" "$csproj"
+          echo "📦 Updated $csproj to version $version"
+          newVersion=$version
+        done
+        echo "version=$newVersion" >> $GITHUB_OUTPUT
+
+    - name: Commit and tag
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add .
+        git commit -m "🔖 Auto-release version ${{ steps.versioning.outputs.version }}"
+        git tag "v${{ steps.versioning.outputs.version }}"
+        git push origin master --follow-tags
+
+  create-release:
+    needs: bump-tag-and-release
+    runs-on: ubuntu-latest
+    steps:
+    - name: Generate JSON Changelog
+      run: |
+        echo "{\"version\": \"${{ needs.bump-tag-and-release.outputs.version }}\", \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > changelog.json
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v${{ needs.bump-tag-and-release.outputs.version }}
+        name: v${{ needs.bump-tag-and-release.outputs.version }}
+        files: changelog.json
+        body: |
+          Automated release for v${{ needs.bump-tag-and-release.outputs.version }}
+
   pack-and-publish:
+    needs: bump-tag-and-release
     runs-on: ubuntu-latest
 
     environment:
@@ -14,27 +71,32 @@ jobs:
       url: https://nuget.org
 
     steps:
-    - name: Checkout Code
+    - name: Checkout code
       uses: actions/checkout@v3
 
-    - name: Setup .NET
+    - name: Set up .NET
       uses: actions/setup-dotnet@v3
       with:
         dotnet-version: '9.0.x'
 
     - name: Restore Dependencies
-      run: dotnet restore Bhengu.Finance.Payments.sln
+      run: |
+        for csproj in $(find . -name '*.csproj' ! -name '*.Tests.csproj'); do
+          dotnet restore "$csproj"
+        done
 
-    - name: Build Solution
-      run: dotnet build Bhengu.Finance.Payments.sln --configuration Release --no-restore
+    - name: Build Projects
+      run: |
+        for csproj in $(find . -name '*.csproj' ! -name '*.Tests.csproj'); do
+          dotnet build "$csproj" --configuration Release --no-restore
+        done
 
     - name: Pack NuGet Projects
       run: |
-        dotnet pack Bhengu.Finance.Payments.Core/Bhengu.Finance.Payments.Core.csproj -c Release -o ./nupkgs
-        dotnet pack Bhengu.Finance.Payments.PayFast/Bhengu.Finance.Payments.PayFast.csproj -c Release -o ./nupkgs
-        dotnet pack Bhengu.Finance.Payments.Google/Bhengu.Finance.Payments.Google.csproj -c Release -o ./nupkgs
-        dotnet pack Bhengu.Finance.Payments.ApplePay/Bhengu.Finance.Payments.ApplePay.csproj -c Release -o ./nupkgs
-        dotnet pack Bhengu.Finance.Payments.BricsPay/Bhengu.Finance.Payments.BricsPay.csproj -c Release -o ./nupkgs
+        mkdir -p ./nupkgs
+        for csproj in $(find . -name '*.csproj' ! -name '*.Tests.csproj'); do
+          dotnet pack "$csproj" -c Release -o ./nupkgs
+        done
 
     - name: Publish All NuGets
       run: |
