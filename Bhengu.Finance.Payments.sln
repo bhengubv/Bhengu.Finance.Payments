@@ -23,6 +23,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Bhengu.Finance.Payments.Int
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Bhengu.Finance.Payments.All", "Bhengu.Finance.Payments.All\Bhengu.Finance.Payments.All.csproj", "{0A68E649-F5BA-4BC3-B61A-15B00C469CB1}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Bhengu.Finance.Payments.PayShap", "Bhengu.Finance.Payments.PayShap\Bhengu.Finance.Payments.PayShap.csproj", "{35DF1612-7E5C-4CC3-A2FF-499A1E3EEAEE}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -153,6 +155,18 @@ Global
 		{0A68E649-F5BA-4BC3-B61A-15B00C469CB1}.Release|x64.Build.0 = Release|Any CPU
 		{0A68E649-F5BA-4BC3-B61A-15B00C469CB1}.Release|x86.ActiveCfg = Release|Any CPU
 		{0A68E649-F5BA-4BC3-B61A-15B00C469CB1}.Release|x86.Build.0 = Release|Any CPU
+		{35DF1612-7E5C-4CC3-A2FF-499A1E3EEAEE}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{35DF1612-7E5C-4CC3-A2FF-499A1E3EEAEE}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{35DF1612-7E5C-4CC3-A2FF-499A1E3EEAEE}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{35DF1612-7E5C-4CC3-A2FF-499A1E3EEAEE}.Debug|x64.Build.0 = Debug|Any CPU
+		{35DF1612-7E5C-4CC3-A2FF-499A1E3EEAEE}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{35DF1612-7E5C-4CC3-A2FF-499A1E3EEAEE}.Debug|x86.Build.0 = Debug|Any CPU
+		{35DF1612-7E5C-4CC3-A2FF-499A1E3EEAEE}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{35DF1612-7E5C-4CC3-A2FF-499A1E3EEAEE}.Release|Any CPU.Build.0 = Release|Any CPU
+		{35DF1612-7E5C-4CC3-A2FF-499A1E3EEAEE}.Release|x64.ActiveCfg = Release|Any CPU
+		{35DF1612-7E5C-4CC3-A2FF-499A1E3EEAEE}.Release|x64.Build.0 = Release|Any CPU
+		{35DF1612-7E5C-4CC3-A2FF-499A1E3EEAEE}.Release|x86.ActiveCfg = Release|Any CPU
+		{35DF1612-7E5C-4CC3-A2FF-499A1E3EEAEE}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
