@@ -1,8 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
+    <Version>At line:1 char:140..1</Version>
     <PackageId>Bhengu.Finance.Payments.All</PackageId>
-    <Authors>T. M.Bengu</Authors>
+    <Authors>T.M. Bengu</Authors>
     <Company>Bhengu B.V.</Company>
     <Description>All Bhengu Payments packages core functionality.</Description>
     <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;PayFast;GooglePay;ApplePay;BricsPay</PackageTags>
