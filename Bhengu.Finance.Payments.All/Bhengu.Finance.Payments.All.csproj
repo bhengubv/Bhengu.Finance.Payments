@@ -1,12 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
-    <Version>git</Version>
+    <Version>1.0.4</Version>
     <PackageId>Bhengu.Finance.Payments.All</PackageId>
     <Authors>T.M. Bengu</Authors>
     <Company>Bhengu B.V.</Company>
     <Description>All Bhengu payment providers bundled together.</Description>
-    <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;PayFast;GooglePay;ApplePay;BricsPay</PackageTags>
+    <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;PayFast;GooglePay;ApplePay;BricsPay;PayShap</PackageTags>
     <RepositoryUrl>https://github.com/bhengubv/Bhengu.Finance.Payments</RepositoryUrl>
   </PropertyGroup>
 </Project>
