@@ -6,7 +6,7 @@
     <Authors>T.M. Bengu</Authors>
     <Company>Bhengu B.V.</Company>
     <Description>All Bhengu Payments packages core functionality.</Description>
-    <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;PayFast;GooglePay;ApplePay;BricsPay</PackageTags>
+    <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;PayFast;GooglePay;ApplePay;BricsPay;PayShap</PackageTags>
     <RepositoryUrl>https://github.com/bhengubv/Bhengu.Finance.Payments</RepositoryUrl>
     <Nullable>enable</Nullable>
   </PropertyGroup>
