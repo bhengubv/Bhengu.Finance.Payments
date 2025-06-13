@@ -1,106 +1,111 @@
-name: Release and Publish
+name: Publish Release
 
 on:
   push:
     branches:
       - master
 
+permissions:
+  contents: write
+  packages: write
+
 jobs:
   bump-tag-and-release:
-    name: Bump Version, Tag and Push
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.set_version.outputs.version }}
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v3
 
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 9.0.x
+    - name: Set up Git for pushing
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
 
-      - name: Install xmlstarlet
-        run: sudo apt-get install -y xmlstarlet
+    - name: Set up .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: '9.0.x'
 
-      - name: Get and bump version
-        id: set_version
-        run: |
-          csproj=$(find . -name '*.csproj' ! -name '*.Tests.csproj' | head -n 1)
-          echo "📄 Found project file: $csproj"
+    - name: Bump patch version in all .csproj files
+      id: versioning
+      run: |
+        csproj=$(find . -name '*.csproj' ! -name '*.Tests.csproj' | head -n 1)
+        echo "📄 Found project file: $csproj"
 
-          current=$(xmlstarlet sel -t -v "//Project/PropertyGroup/Version" "$csproj")
-          if [ -z "$current" ]; then
-            echo "❌ No <Version> tag found in $csproj"
-            exit 1
-          fi
-          echo "📦 Current version: $current"
+        current=$(grep -oPm1 "(?<=<Version>)[^<]+" "$csproj")
+        echo "📦 Current version: $current"
 
-          IFS='.' read -r major minor patch <<< "$current"
-          patch=$((patch + 1))
-          newVersion="$major.$minor.$patch"
-          echo "🔖 New version: $newVersion"
-          echo "version=$newVersion" >> $GITHUB_OUTPUT
+        IFS='.' read -r major minor patch <<< "$current"
+        patch=$((patch + 1))
+        newVersion="$major.$minor.$patch"
 
-          for f in $(find . -name '*.csproj' ! -name '*.Tests.csproj'); do
-            echo "🔧 Updating $f"
-            xmlstarlet ed --inplace -u "//Version" -v "$newVersion" "$f"
-          done
+        echo "🔖 New version: $newVersion"
+        echo "version=$newVersion" >> $GITHUB_OUTPUT
 
-          git config user.name github-actions
-          git config user.email github-actions@github.com
+        for f in $(find . -name '*.csproj' ! -name '*.Tests.csproj'); do
+          echo "🔧 Updating $f"
+          sed -i "s|<Version>.*</Version>|<Version>$newVersion</Version>|" "$f"
+        done
 
-          git add .                             # ✅ Stage version changes
-          git commit -m "🔖 Release v$newVersion"  # ✅ Commit them
-
-          git fetch origin
-          git rebase origin/master
-
-          git tag "v$newVersion"
-          git push origin master --follow-tags
-
-  create-release:
-    name: Create GitHub Release
-    needs: bump-tag-and-release
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: v${{ needs.bump-tag-and-release.outputs.version }}
-          name: Release v${{ needs.bump-tag-and-release.outputs.version }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        git add .
+        git commit -m "🔖 Release v$newVersion"
+        git tag "v$newVersion"
+        git push origin master --follow-tags
 
   pack-and-publish:
-    name: Pack and Publish to NuGet
     needs: bump-tag-and-release
     runs-on: ubuntu-latest
+
+    environment:
+      name: production
+      url: https://nuget.org
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v3
 
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 9.0.x
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: '9.0.x'
 
-      - name: Restore
-        run: dotnet restore
+    - name: Restore Dependencies
+      run: dotnet restore Bhengu.Finance.Payments.sln
 
-      - name: Pack all .csproj (excluding Tests)
-        run: |
-          for proj in $(find . -name '*.csproj' ! -name '*.Tests.csproj'); do
-            echo "📦 Packing $proj"
-            dotnet pack "$proj" --configuration Release --output ./nupkgs
-          done
+    - name: Build Solution
+      run: dotnet build Bhengu.Finance.Payments.sln --configuration Release --no-restore
 
-      - name: Publish packages to NuGet
-        run: |
-          for nupkg in ./nupkgs/*.nupkg; do
-            echo "🚀 Publishing $nupkg"
-            dotnet nuget push "$nupkg" --source https://api.nuget.org/v3/index.json --api-key ${{ secrets.NUGET_API_KEY }}
-          done
+    - name: Pack NuGet Projects
+      run: |
+        mkdir -p ./nupkgs
+        for f in $(find . -name '*.csproj' ! -name '*.Tests.csproj'); do
+          if grep -q '<IsPackable>true</IsPackable>' "$f"; then
+            echo "📦 Packing $f"
+            dotnet pack "$f" -c Release -o ./nupkgs
+          else
+            echo "⚠️ Skipping non-packable project: $f"
+          fi
+        done
+
+    - name: Publish NuGet Packages
+      run: |
+        for pkg in ./nupkgs/*.nupkg; do
+          echo "📤 Publishing $pkg"
+          dotnet nuget push "$pkg" --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json
+        done
+      env:
+        NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+
+    - name: Generate JSON changelog
+      run: |
+        git log -n 20 --pretty=format:'{"commit": "%H", "author": "%an", "message": "%s"},' | sed '$ s/,$//' | jq -s . > changelog.json
+        echo "📝 Generated changelog.json"
+
+    - name: Upload changelog to GitHub Release
+      run: |
+        version=${{ needs.bump-tag-and-release.outputs.version }}
+        gh release upload "v$version" changelog.json --clobber
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
