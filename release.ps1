@@ -27,28 +27,48 @@ Write-Host "[INFO] Scanning for .csproj files..."
 $projects = Get-ChildItem -Recurse -Filter *.csproj | Where-Object { $_.Name -notlike '*.Tests.csproj' }
 if (-not $projects) { Fail "No .csproj files found" }
 
-# Just commit the state — let GitHub Actions bump version
-$changed = $false
-foreach ($proj in $projects) {
-    [xml]$doc = Get-Content $proj.FullName
-    $pg = $doc.Project.PropertyGroup
-    if ($pg.Version) {
-        Write-Host "[INFO] Keeping version unchanged in: $($proj.FullName)"
-        $changed = $true
+# Get current version from the first .csproj
+$firstProject = $projects[0].FullName
+Write-Host "[INFO] Extracting version from: $firstProject"
+[xml]$xml = Get-Content $firstProject
+$currentVersion = $xml.Project.PropertyGroup.Version
+if (-not $currentVersion -or $currentVersion -match "[^0-9\.]") {
+    Fail "Invalid version format: $currentVersion"
+}
+Write-Host "[INFO] Current version: $currentVersion"
+
+# Check if repo has any changes
+$hasChanges = git status --porcelain | Where-Object { $_.Trim() -ne "" }
+
+if ($hasChanges) {
+    # Bump patch version
+    $parts = $currentVersion -split "\."
+    if ($parts.Count -ne 3) { Fail "Version must be in format X.Y.Z" }
+    $newVersion = "$($parts[0]).$($parts[1]).$([int]$parts[2] + 1)"
+    Write-Host "[INFO] New version (due to changes): $newVersion"
+
+    # Update version in all .csproj files
+    foreach ($proj in $projects) {
+        [xml]$doc = Get-Content $proj.FullName
+        $pg = $doc.Project.PropertyGroup
+        if ($pg.Version -and $pg.Version -ne $newVersion) {
+            Write-Host "[INFO] Updating version in: $($proj.FullName)"
+            $pg.Version = $newVersion
+            $doc.Save($proj.FullName)
+        }
     }
-}
 
-# Commit if needed
-if ($changed) {
     git add . || Fail "Git add failed"
-    if (-not $Message) { $Message = "🔖 Release trigger (let GitHub Actions bump version)" }
+    if (-not $Message) { $Message = "Release v$newVersion" }
     git commit -m "$Message" || Fail "Git commit failed"
+
+    git push origin $Branch || Fail "Git push failed"
+
+    Write-Host "[INFO] Tagging version: v$newVersion"
+    git tag -f "v$newVersion" || Rollback "Failed to create git tag", $newVersion
+    git push origin -f "v$newVersion" || Rollback "Failed to push git tag", $newVersion
+
+    Write-Host "[SUCCESS] Release v$newVersion pushed and tagged." -ForegroundColor Green
 } else {
-    Write-Host "[INFO] No changes to commit — exiting early"
-    exit 0
+    Write-Host "[INFO] No changes detected — skipping version bump and tag."
 }
-
-# Push to origin and let CI/CD handle versioning and tagging
-git push origin $Branch || Fail "Git push failed"
-
-Write-Host "[SUCCESS] Release commit pushed — GitHub Actions will handle version bumping." -ForegroundColor Green
