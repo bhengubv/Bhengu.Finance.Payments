@@ -1,6 +1,5 @@
 param (
-    [string]$Message = "",
-    [string]$Branch = "master"
+    [string]$NewVersion = ""
 )
 
 function Fail {
@@ -9,75 +8,41 @@ function Fail {
     exit 1
 }
 
-function Rollback {
-    param([string]$Reason, [string]$Version)
-    Write-Host "[ROLLBACK] $Reason" -ForegroundColor Yellow
-    git reset --soft HEAD~1 | Out-Null
-    git tag -d "v$Version" | Out-Null
-    git push origin ":refs/tags/v$Version" | Out-Null
-    Fail "$Reason (rollback complete for v$Version)"
-}
+# Switch to script directory
+Set-Location -Path $PSScriptRoot
+Write-Host "[INFO] Changed to script directory: $PSScriptRoot"
 
-# Change to script directory
-$scriptPath = $MyInvocation.MyCommand.Path
-$scriptDir = Split-Path $scriptPath -Parent
-Set-Location $scriptDir
-Write-Host "[INFO] Changed to script directory: $scriptDir"
-
-# Find all .csproj files excluding tests
+# Get .csproj files
 Write-Host "[INFO] Scanning for .csproj files..."
 $projects = Get-ChildItem -Recurse -Filter *.csproj | Where-Object { $_.Name -notlike '*.Tests.csproj' }
 if (-not $projects) { Fail "No .csproj files found" }
 
-# Extract version from first project
-$firstProject = $projects[0].FullName
-Write-Host "[INFO] Extracting version from: $firstProject"
-$xml = [xml](Get-Content $firstProject)
-$currentVersion = $xml.Project.PropertyGroup.Version
-if (-not $currentVersion -or $currentVersion -notmatch '^\d+\.\d+\.\d+$') {
-    Fail "Invalid version format: $currentVersion"
+if (-not $NewVersion) {
+    # Attempt to read version from first .csproj and bump patch version
+    [xml]$xml = Get-Content $projects[0].FullName
+    $currentVersion = $xml.Project.PropertyGroup.Version
+    if (-not $currentVersion -or $currentVersion -match "[^0-9\.]") {
+        Fail "Invalid or missing version: $currentVersion"
+    }
+
+    Write-Host "[INFO] Current version: $currentVersion"
+    $parts = $currentVersion -split "\."
+    if ($parts.Count -ne 3) { Fail "Version must be in format X.Y.Z" }
+    $NewVersion = "$($parts[0]).$($parts[1]).$([int]$parts[2] + 1)"
 }
-Write-Host "[INFO] Current version: $currentVersion"
 
-# Bump patch version
-$parts = $currentVersion -split '\.'
-$patch = [int]$parts[2] + 1
-$newVersion = "$($parts[0]).$($parts[1]).$patch"
-Write-Host "[INFO] New version: $newVersion"
+Write-Host "[INFO] New version: $NewVersion"
 
-# Update all .csproj files
+# Update version in all .csproj files
 Write-Host "[INFO] Updating all .csproj files..."
 foreach ($proj in $projects) {
-    Write-Host "[INFO] Updating: $($proj.FullName)"
-    $xml = [xml](Get-Content $proj.FullName)
-    $xml.Project.PropertyGroup.Version = $newVersion
-    $xml.Save($proj.FullName)
-    git add $proj.FullName
+    [xml]$doc = Get-Content $proj.FullName
+    $pg = $doc.Project.PropertyGroup
+    if ($pg.Version -and $pg.Version -ne $NewVersion) {
+        Write-Host "[INFO] Updating: $($proj.FullName)"
+        $pg.Version = $NewVersion
+        $doc.Save($proj.FullName)
+    }
 }
 
-# Commit
-git diff --cached --quiet
-if ($LASTEXITCODE -ne 0) {
-    git commit -m "Release v$newVersion" || Fail "Git commit failed"
-} else {
-    Fail "No changes to commit"
-}
-
-# Push to branch
-git push origin $Branch || Fail "Git push failed"
-
-# Tag release
-git tag "v$newVersion" || Rollback -Reason "Failed to create git tag" -Version $newVersion
-git push origin "v$newVersion"
-if ($LASTEXITCODE -ne 0) {
-    Rollback -Reason "Failed to push git tag" -Version $newVersion
-}
-
-# Create GitHub release
-if (-not $Message) { $Message = "Automated release v$newVersion" }
-gh release create "v$newVersion" --title "v$newVersion" --notes "$Message"
-if ($LASTEXITCODE -ne 0) {
-    Rollback -Reason "GitHub release failed" -Version $newVersion
-}
-
-Write-Host "[SUCCESS] Release v$newVersion complete!" -ForegroundColor Green
+Write-Host "[SUCCESS] Updated all projects to version $NewVersion" -ForegroundColor Green
