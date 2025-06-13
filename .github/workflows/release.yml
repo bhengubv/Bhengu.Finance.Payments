@@ -3,7 +3,7 @@ name: Publish Release
 on:
   push:
     branches:
-      - master
+      - release/latest
 
 permissions:
   contents: write
@@ -52,7 +52,7 @@ jobs:
         git add .
         git commit -m "🔖 Release v$newVersion"
         git tag "v$newVersion"
-        git push origin master --follow-tags
+        git push origin release/latest --follow-tags
 
   pack-and-publish:
     needs: bump-tag-and-release
