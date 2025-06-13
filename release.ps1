@@ -1,11 +1,21 @@
 param (
-    [string]$NewVersion = ""
+    [string]$Message = "",
+    [string]$Branch = "master"
 )
 
 function Fail {
     param([string]$Step)
     Write-Host "[ERROR] $Step" -ForegroundColor Red
     exit 1
+}
+
+function Rollback {
+    param([string]$Reason, [string]$Version)
+    Write-Host "[ROLLBACK] $Reason" -ForegroundColor Yellow
+    git reset --soft HEAD~1 | Out-Null
+    git tag -d "v$Version" | Out-Null
+    git push origin ":refs/tags/v$Version" | Out-Null
+    Fail "$Reason (rollback complete)"
 }
 
 # Switch to script directory
@@ -17,32 +27,28 @@ Write-Host "[INFO] Scanning for .csproj files..."
 $projects = Get-ChildItem -Recurse -Filter *.csproj | Where-Object { $_.Name -notlike '*.Tests.csproj' }
 if (-not $projects) { Fail "No .csproj files found" }
 
-if (-not $NewVersion) {
-    # Attempt to read version from first .csproj and bump patch version
-    [xml]$xml = Get-Content $projects[0].FullName
-    $currentVersion = $xml.Project.PropertyGroup.Version
-    if (-not $currentVersion -or $currentVersion -match "[^0-9\.]") {
-        Fail "Invalid or missing version: $currentVersion"
-    }
-
-    Write-Host "[INFO] Current version: $currentVersion"
-    $parts = $currentVersion -split "\."
-    if ($parts.Count -ne 3) { Fail "Version must be in format X.Y.Z" }
-    $NewVersion = "$($parts[0]).$($parts[1]).$([int]$parts[2] + 1)"
-}
-
-Write-Host "[INFO] New version: $NewVersion"
-
-# Update version in all .csproj files
-Write-Host "[INFO] Updating all .csproj files..."
+# Just commit the state — let GitHub Actions bump version
+$changed = $false
 foreach ($proj in $projects) {
     [xml]$doc = Get-Content $proj.FullName
     $pg = $doc.Project.PropertyGroup
-    if ($pg.Version -and $pg.Version -ne $NewVersion) {
-        Write-Host "[INFO] Updating: $($proj.FullName)"
-        $pg.Version = $NewVersion
-        $doc.Save($proj.FullName)
+    if ($pg.Version) {
+        Write-Host "[INFO] Keeping version unchanged in: $($proj.FullName)"
+        $changed = $true
     }
 }
 
-Write-Host "[SUCCESS] Updated all projects to version $NewVersion" -ForegroundColor Green
+# Commit if needed
+if ($changed) {
+    git add . || Fail "Git add failed"
+    if (-not $Message) { $Message = "🔖 Release trigger (let GitHub Actions bump version)" }
+    git commit -m "$Message" || Fail "Git commit failed"
+} else {
+    Write-Host "[INFO] No changes to commit — exiting early"
+    exit 0
+}
+
+# Push to origin and let CI/CD handle versioning and tagging
+git push origin $Branch || Fail "Git push failed"
+
+Write-Host "[SUCCESS] Release commit pushed — GitHub Actions will handle version bumping." -ForegroundColor Green
