@@ -3,7 +3,7 @@ name: Publish Release
 on:
   push:
     branches:
-      - master
+      - release/latest
 
 permissions:
   contents: write
@@ -12,6 +12,8 @@ permissions:
 jobs:
   bump-tag-and-release:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.versioning.outputs.version }}
 
     steps:
     - name: Checkout code
@@ -52,7 +54,7 @@ jobs:
         git add .
         git commit -m "🔖 Release v$newVersion"
         git tag "v$newVersion"
-        git push origin master --follow-tags
+        git push origin release/latest --follow-tags
 
   pack-and-publish:
     needs: bump-tag-and-release
