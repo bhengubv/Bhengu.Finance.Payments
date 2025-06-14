@@ -2,7 +2,7 @@
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
     <IsPackable>true</IsPackable>
-    <Version>1.0.24</Version>
+    <Version>1.0.25</Version>
     <PackageId>Bhengu.Finance.Payments.All</PackageId>
     <Authors>T.M. Bengu</Authors>
     <Company>Bhengu B.V.</Company>
@@ -10,4 +10,12 @@
     <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;PayFast;GooglePay;ApplePay;BricsPay;PayShap</PackageTags>
     <RepositoryUrl>https://github.com/bhengubv/Bhengu.Finance.Payments</RepositoryUrl>
   </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Bhengu.Finance.Payments.Core" Version="1.0.*" />
+    <PackageReference Include="Bhengu.Finance.Payments.PayFast" Version="1.0.*" />
+    <PackageReference Include="Bhengu.Finance.Payments.Google" Version="1.0.*" />
+    <PackageReference Include="Bhengu.Finance.Payments.ApplePay" Version="1.0.*" />
+    <PackageReference Include="Bhengu.Finance.Payments.BricsPay" Version="1.0.*" />
+    <PackageReference Include="Bhengu.Finance.Payments.PayShap" Version="1.0.*" />
+  </ItemGroup>
 </Project>
