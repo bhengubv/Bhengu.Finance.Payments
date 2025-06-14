@@ -12,6 +12,8 @@ permissions:
 jobs:
   bump-tag-and-release:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.versioning.outputs.version }}
 
     steps:
     - name: Checkout code
