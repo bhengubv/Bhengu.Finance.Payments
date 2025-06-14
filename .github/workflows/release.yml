@@ -12,8 +12,6 @@ permissions:
 jobs:
   bump-tag-and-release:
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.versioning.outputs.version }}
 
     steps:
     - name: Checkout code
@@ -35,22 +33,17 @@ jobs:
       run: |
         csproj=$(find . -name '*.csproj' ! -name '*.Tests.csproj' | head -n 1)
         echo "📄 Found project file: $csproj"
-
         current=$(grep -oPm1 "(?<=<Version>)[^<]+" "$csproj")
         echo "📦 Current version: $current"
-
         IFS='.' read -r major minor patch <<< "$current"
         patch=$((patch + 1))
         newVersion="$major.$minor.$patch"
-
         echo "🔖 New version: $newVersion"
         echo "version=$newVersion" >> $GITHUB_OUTPUT
-
         for f in $(find . -name '*.csproj' ! -name '*.Tests.csproj'); do
           echo "🔧 Updating $f"
           sed -i "s|<Version>.*</Version>|<Version>$newVersion</Version>|" "$f"
         done
-
         git add .
         git commit -m "🔖 Release v$newVersion"
         git tag "v$newVersion"
@@ -108,6 +101,7 @@ jobs:
     - name: Upload changelog to GitHub Release
       run: |
         version=${{ needs.bump-tag-and-release.outputs.version }}
+        gh release view "v$version" || gh release create "v$version" --notes "Auto-generated release"
         gh release upload "v$version" changelog.json --clobber
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
