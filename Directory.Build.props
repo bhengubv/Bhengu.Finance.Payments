@@ -1,0 +1,24 @@
+<Project>
+  <PropertyGroup>
+    <!-- NuGet metadata -->
+    <Authors>T.M. Bengu</Authors>
+    <Company>Bhengu B.V.</Company>
+    <Copyright>© Bhengu B.V. 2025</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/bhengubv/Bhengu.Finance.Payments</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageIcon>assets/icon.png</PackageIcon>
+    <PackageTags>Bhengu;Payments;Payment Gateway;Finance;PayFast;GooglePay;ApplePay;BricsPay;PayShap</PackageTags>
+
+    <!-- .NET build options -->
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <!-- Include icon in the NuGet package -->
+  <ItemGroup>
+    <None Include="assets/icon.png" Pack="true" PackagePath="" />
+  </ItemGroup>
+</Project>
