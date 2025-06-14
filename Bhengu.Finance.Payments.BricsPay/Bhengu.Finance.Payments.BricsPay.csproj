@@ -2,7 +2,7 @@
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
     <IsPackable>true</IsPackable>
-    <Version>1.0.27</Version>
+    <Version>1.0.28</Version>
     <PackageId>Bhengu.Finance.Payments.BricsPay</PackageId>
     <Authors>T.M. Bengu</Authors>
     <Company>Bhengu B.V.</Company>
