@@ -2,11 +2,11 @@
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
     <IsPackable>true</IsPackable>
-    <Version>1.0.22</Version>
+    <Version>1.0.23</Version>
     <PackageId>Bhengu.Finance.Payments.All</PackageId>
     <Authors>T.M. Bengu</Authors>
     <Company>Bhengu B.V.</Company>
-    <Description>All Bhengu payment providers bundled together.</Description>
+    <Description>All Bhengu payment providers bundled together. Bhengu.Finance.Payments.PayFast;Bhengu.Finance.Payments.GooglePay;Bhengu.Finance.Payments.ApplePay;Bhengu.Finance.Payments.BricsPay;Bhengu.Finance.Payments.PayShap</Description>
     <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;PayFast;GooglePay;ApplePay;BricsPay;PayShap</PackageTags>
     <RepositoryUrl>https://github.com/bhengubv/Bhengu.Finance.Payments</RepositoryUrl>
   </PropertyGroup>
