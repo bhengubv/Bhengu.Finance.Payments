@@ -6,8 +6,8 @@
     <PackageId>Bhengu.Finance.Payments.All</PackageId>
     <Authors>T.M. Bengu</Authors>
     <Company>Bhengu B.V.</Company>
-    <Description>All Bhengu payment providers bundled together. Bhengu.Finance.Payments.PayFast;Bhengu.Finance.Payments.GooglePay;Bhengu.Finance.Payments.ApplePay;Bhengu.Finance.Payments.BricsPay;Bhengu.Finance.Payments.PayShap</Description>
-    <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;PayFast;GooglePay;ApplePay;BricsPay;PayShap</PackageTags>
+    <Description>All Bhengu payment providers bundled together. Bhengu.Finance.Payments.PayFast;Bhengu.Finance.Payments.GooglePay;Bhengu.Finance.Payments.ApplePay;Bhengu.Finance.Payments.BricsPay;Bhengu.Finance.Payments.PayShap;Bhengu.Finance.Payments.Stripe;Bhengu.Finance.Payments.Yoco;Bhengu.Finance.Payments.Paystack;Bhengu.Finance.Payments.PayJustNow;Bhengu.Finance.Payments.Ozow</Description>
+    <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;PayFast;GooglePay;ApplePay;BricsPay;PayShap;Stripe;Yoco;Paystack;PayJustNow;Ozow</PackageTags>
     <RepositoryUrl>https://github.com/bhengubv/Bhengu.Finance.Payments</RepositoryUrl>
   </PropertyGroup>
   <ItemGroup>
@@ -17,5 +17,10 @@
     <PackageReference Include="Bhengu.Finance.Payments.ApplePay" Version="1.0.*" />
     <PackageReference Include="Bhengu.Finance.Payments.BricsPay" Version="1.0.*" />
     <PackageReference Include="Bhengu.Finance.Payments.PayShap" Version="1.0.*" />
+    <PackageReference Include="Bhengu.Finance.Payments.Stripe" Version="1.0.*" />
+    <PackageReference Include="Bhengu.Finance.Payments.Yoco" Version="1.0.*" />
+    <PackageReference Include="Bhengu.Finance.Payments.Paystack" Version="1.0.*" />
+    <PackageReference Include="Bhengu.Finance.Payments.PayJustNow" Version="1.0.*" />
+    <PackageReference Include="Bhengu.Finance.Payments.Ozow" Version="1.0.*" />
   </ItemGroup>
 </Project>
