@@ -4,23 +4,29 @@ namespace Bhengu.Finance.Payments.ApplePay.Configuration;
 
 /// <summary>
 /// Configuration for Apple Pay. Bound from <c>Bhengu:Finance:Payments:ApplePay</c>.
-/// NOTE: This package currently ships as a scaffold — a real Apple Pay integration requires
-/// the merchant to complete the Apple Developer Apple Pay setup, an ApplePay payment processing
-/// certificate, and an Apple Pay merchant identifier. See README for completion steps.
+/// Apple Pay tokenises only — settlement is performed by the downstream processor named in
+/// <see cref="DownstreamProcessor"/> (typically Stripe, Yoco, or Paystack).
 /// </summary>
 public sealed class ApplePayOptions
 {
     public const string ConfigSection = "Bhengu:Finance:Payments:ApplePay";
 
-    /// <summary>The Apple Pay merchant identifier (merchant.com.your-app).</summary>
+    /// <summary>The Apple Pay merchant identifier (e.g. merchant.com.your-app).</summary>
     public string MerchantId { get; set; } = string.Empty;
 
-    /// <summary>Path to the Apple Pay merchant identity certificate (.pem or .pfx).</summary>
-    public string? MerchantCertificatePath { get; set; }
-
-    /// <summary>Password protecting the merchant certificate, if any.</summary>
-    public string? MerchantCertificatePassword { get; set; }
+    /// <summary>
+    /// The downstream processor that actually settles the payment. Must match the
+    /// <c>ProviderName</c> of a registered <see cref="Core.Interfaces.IPaymentGatewayProvider"/>
+    /// (e.g. "stripe", "yoco", "paystack").
+    /// </summary>
+    public string DownstreamProcessor { get; set; } = "stripe";
 
     /// <summary>Domain validated with Apple for Apple Pay on the Web. Required for web flows.</summary>
     public string? DomainName { get; set; }
+
+    /// <summary>Optional path to the merchant identity certificate (for local-decryption flows). Not used when the downstream processor decrypts.</summary>
+    public string? MerchantCertificatePath { get; set; }
+
+    /// <summary>Optional password protecting the merchant certificate.</summary>
+    public string? MerchantCertificatePassword { get; set; }
 }

@@ -4,10 +4,8 @@ namespace Bhengu.Finance.Payments.Google.Configuration;
 
 /// <summary>
 /// Configuration for Google Pay. Bound from <c>Bhengu:Finance:Payments:GooglePay</c>.
-/// NOTE: This package currently ships as a scaffold — a real Google Pay integration requires
-/// a Google Pay merchant ID and a configured payment processor (Stripe, Adyen, Braintree, etc.)
-/// to actually settle transactions. Google Pay itself only tokenises; settlement is downstream.
-/// See README for completion steps.
+/// Google Pay tokenises only — settlement is performed by the downstream processor named in
+/// <see cref="DownstreamProcessor"/> (typically Stripe, Yoco, or Paystack).
 /// </summary>
 public sealed class GooglePayOptions
 {
@@ -16,8 +14,12 @@ public sealed class GooglePayOptions
     /// <summary>The Google Pay merchant identifier registered with Google.</summary>
     public string MerchantId { get; set; } = string.Empty;
 
-    /// <summary>The downstream processor (stripe|adyen|braintree|cybersource) that actually settles the payment.</summary>
-    public string ProcessorName { get; set; } = string.Empty;
+    /// <summary>
+    /// The downstream processor that actually settles the payment. Must match the
+    /// <c>ProviderName</c> of a registered <see cref="Core.Interfaces.IPaymentGatewayProvider"/>
+    /// (e.g. "stripe", "yoco", "paystack").
+    /// </summary>
+    public string DownstreamProcessor { get; set; } = "stripe";
 
     /// <summary>If true, use the Google Pay TEST environment. False = PRODUCTION.</summary>
     public bool UseTestEnvironment { get; set; } = false;
