@@ -41,7 +41,7 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
             throw new ProviderConfigurationException(ProviderName, $"{nameof(YocoOptions.SecretKey)} is required");
 
         if (_httpClient.BaseAddress is null)
-            _httpClient.BaseAddress = new Uri(_options.BaseUrlOverride ?? "https://online.yoco.com/v1/");
+            _httpClient.BaseAddress = new Uri(_options.BaseUrl ?? "https://online.yoco.com/v1/");
 
         _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _options.SecretKey);
     }

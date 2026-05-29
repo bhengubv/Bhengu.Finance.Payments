@@ -17,17 +17,28 @@ public static class ServiceCollectionExtensions
     /// Fails fast at startup if required options (MerchantId) are missing.
     /// </summary>
     public static IServiceCollection AddPayFastPayments(this IServiceCollection services, IConfiguration configuration)
+        => AddPayFastPayments(services, configuration, PayFastOptions.ConfigSection);
+
+    /// <summary>
+    /// Register the PayFast provider, binding from a non-default configuration section.
+    /// Use this overload when migrating from a legacy configuration layout (e.g. a top-level
+    /// <c>"PayFast"</c> section in an existing appsettings.json) without renaming production keys.
+    /// </summary>
+    public static IServiceCollection AddPayFastPayments(
+        this IServiceCollection services,
+        IConfiguration configuration,
+        string configSectionName)
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(configuration);
+        ArgumentException.ThrowIfNullOrWhiteSpace(configSectionName);
 
-        var section = configuration.GetSection(PayFastOptions.ConfigSection);
+        var section = configuration.GetSection(configSectionName);
         services.Configure<PayFastOptions>(section);
 
-        // Fail fast — read the bound options and validate before the app starts taking traffic.
         var probe = section.Get<PayFastOptions>() ?? new PayFastOptions();
         if (string.IsNullOrWhiteSpace(probe.MerchantId))
-            throw new ProviderConfigurationException("payfast", $"{PayFastOptions.ConfigSection}:MerchantId is required");
+            throw new ProviderConfigurationException("payfast", $"{configSectionName}:MerchantId is required");
 
         services.AddHttpClient<PayFastPaymentProvider>();
         services.AddTransient<IPaymentGatewayProvider, PayFastPaymentProvider>(sp =>

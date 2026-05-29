@@ -25,5 +25,5 @@ public sealed class PaystackOptions
     public string? DefaultEmail { get; set; }
 
     /// <summary>Override the Paystack base URL. Leave null in normal use (defaults to https://api.paystack.co/).</summary>
-    public string? BaseUrlOverride { get; set; }
+    public string? BaseUrl { get; set; }
 }

@@ -30,9 +30,9 @@ public sealed class PayFastOptions
     /// <summary>URL PayFast posts the ITN webhook to. Required for redirect-flow payments to be settled.</summary>
     public string? NotifyUrl { get; set; }
 
-    /// <summary>Override of the production PayFast base URL — leave null in normal use.</summary>
-    public string? BaseUrlOverride { get; set; }
+    /// <summary>Override of the production PayFast base URL — leave null to use the default https://www.payfast.co.za.</summary>
+    public string? BaseUrl { get; set; }
 
-    /// <summary>Override of the sandbox PayFast base URL — leave null in normal use.</summary>
-    public string? SandboxUrlOverride { get; set; }
+    /// <summary>Override of the sandbox PayFast base URL — leave null to use the default https://sandbox.payfast.co.za.</summary>
+    public string? SandboxUrl { get; set; }
 }

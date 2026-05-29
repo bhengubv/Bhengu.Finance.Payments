@@ -45,8 +45,8 @@ public sealed class BricsPayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
             throw new ProviderConfigurationException(ProviderName, $"{nameof(BricsPayOptions.SecretKey)} is required");
 
         _baseUrl = _options.UseSandbox
-            ? (_options.SandboxUrlOverride ?? "https://sandbox.bricspay.org/api/v1")
-            : (_options.BaseUrlOverride ?? "https://api.bricspay.org/api/v1");
+            ? (_options.SandboxUrl ?? "https://sandbox.bricspay.org/api/v1")
+            : (_options.BaseUrl ?? "https://api.bricspay.org/api/v1");
     }
 
     public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)

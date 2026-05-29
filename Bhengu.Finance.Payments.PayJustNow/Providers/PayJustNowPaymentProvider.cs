@@ -46,8 +46,8 @@ public sealed class PayJustNowPaymentProvider : IPaymentGatewayProvider
         if (_httpClient.BaseAddress is null)
         {
             _httpClient.BaseAddress = new Uri(_options.UseSandbox
-                ? (_options.SandboxUrlOverride ?? "https://sandbox.payjustnow.com/v1/")
-                : (_options.BaseUrlOverride ?? "https://api.payjustnow.com/v1/"));
+                ? (_options.SandboxUrl ?? "https://sandbox.payjustnow.com/v1/")
+                : (_options.BaseUrl ?? "https://api.payjustnow.com/v1/"));
         }
 
         _httpClient.DefaultRequestHeaders.Add("X-Api-Key", _options.ApiKey);

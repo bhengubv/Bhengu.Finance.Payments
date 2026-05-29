@@ -167,8 +167,8 @@ public sealed class PayFastFormBuilder
     }
 
     private string GetBaseUrl() => _options.UseSandbox
-        ? (_options.SandboxUrlOverride ?? "https://sandbox.payfast.co.za")
-        : (_options.BaseUrlOverride ?? "https://www.payfast.co.za");
+        ? (_options.SandboxUrl ?? "https://sandbox.payfast.co.za")
+        : (_options.BaseUrl ?? "https://www.payfast.co.za");
 
     private string GenerateSignature(Dictionary<string, string> formData)
     {

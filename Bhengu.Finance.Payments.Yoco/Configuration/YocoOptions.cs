@@ -16,5 +16,5 @@ public sealed class YocoOptions
     public string WebhookSecret { get; set; } = string.Empty;
 
     /// <summary>Override the Yoco base URL. Leave null in normal use (defaults to https://online.yoco.com/v1/).</summary>
-    public string? BaseUrlOverride { get; set; }
+    public string? BaseUrl { get; set; }
 }

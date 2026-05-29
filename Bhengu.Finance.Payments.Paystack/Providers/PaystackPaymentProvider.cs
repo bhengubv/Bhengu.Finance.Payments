@@ -40,7 +40,7 @@ public sealed class PaystackPaymentProvider : IPaymentGatewayProvider, IPayoutPr
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PaystackOptions.SecretKey)} is required");
 
         if (_httpClient.BaseAddress is null)
-            _httpClient.BaseAddress = new Uri(_options.BaseUrlOverride ?? "https://api.paystack.co/");
+            _httpClient.BaseAddress = new Uri(_options.BaseUrl ?? "https://api.paystack.co/");
 
         _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _options.SecretKey);
     }

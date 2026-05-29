@@ -50,8 +50,8 @@ public sealed class OzowPaymentProvider : IPaymentGatewayProvider
         if (_httpClient.BaseAddress is null)
         {
             _httpClient.BaseAddress = new Uri(_options.UseSandbox
-                ? (_options.SandboxUrlOverride ?? "https://api-sandbox.ozow.com/")
-                : (_options.BaseUrlOverride ?? "https://api.ozow.com/"));
+                ? (_options.SandboxUrl ?? "https://api-sandbox.ozow.com/")
+                : (_options.BaseUrl ?? "https://api.ozow.com/"));
         }
 
         _httpClient.DefaultRequestHeaders.Add("ApiKey", _options.ApiKey);

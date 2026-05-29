@@ -21,9 +21,9 @@ public sealed class OzowOptions
     /// <summary>If true, all requests go to api-sandbox.ozow.com instead of production.</summary>
     public bool UseSandbox { get; set; } = false;
 
-    /// <summary>Override the production base URL. Leave null in normal use.</summary>
-    public string? BaseUrlOverride { get; set; }
+    /// <summary>Override the production base URL. Leave null to use the default.</summary>
+    public string? BaseUrl { get; set; }
 
-    /// <summary>Override the sandbox base URL. Leave null in normal use.</summary>
-    public string? SandboxUrlOverride { get; set; }
+    /// <summary>Override the sandbox base URL. Leave null to use the default.</summary>
+    public string? SandboxUrl { get; set; }
 }
