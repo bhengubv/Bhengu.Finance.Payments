@@ -3,11 +3,11 @@
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>true</IsPackable>
     <Version>1.0.32</Version>
-    <PackageId>Bhengu.Finance.Payments.BricsPay</PackageId>
+    <PackageId>Bhengu.Finance.Payments.Yoco</PackageId>
     <Authors>T.M. Bengu</Authors>
     <Company>Bhengu B.V.</Company>
-    <Description>BRICS Pay payment gateway for the Bhengu.Finance.Payments family. Cross-border payments within South Africa, Brazil, Russia, India, China with automatic currency conversion.</Description>
-    <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;PayFast;GooglePay;ApplePay;BricsPay;PayShap</PackageTags>
+    <Description>Yoco payment gateway for the Bhengu.Finance.Payments family. South African card payments and refunds via the Yoco Online REST API.</Description>
+    <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;Yoco;PayFast;GooglePay;ApplePay;BricsPay;PayShap</PackageTags>
     <RepositoryUrl>https://github.com/bhengubv/Bhengu.Finance.Payments</RepositoryUrl>
   </PropertyGroup>
   <ItemGroup>
