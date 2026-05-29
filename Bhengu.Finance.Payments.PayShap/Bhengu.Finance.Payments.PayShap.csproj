@@ -3,10 +3,9 @@
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>true</IsPackable>
     <Version>1.0.32</Version>
-    <PackageId>Bhengu.Finance.Payments.PayFast</PackageId>
+    <PackageId>Bhengu.Finance.Payments.PayShap</PackageId>
     <Authors>T.M. Bengu</Authors>
     <Company>Bhengu B.V.</Company>
-    <PackageId>Bhengu.Finance.Payments.PayShap</PackageId>
     <Description>Integration with Electrum's PayShap API for proxy resolution and credit transfers.</Description>
     <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;PayFast;GooglePay;ApplePay;BricsPay;PayShap</PackageTags>
   </PropertyGroup>

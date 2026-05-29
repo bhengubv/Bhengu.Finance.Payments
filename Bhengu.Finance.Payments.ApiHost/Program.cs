@@ -1,19 +1,11 @@
-using Bhengu.Finance.Payments.PayFast.Services;
-using Bhengu.Finance.Payments.Google.Services;
-using Bhengu.Finance.Payments.ApplePay.Services;
-using Bhengu.Finance.Payments.BricsPay.Services;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
+// © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+// Minimal smoke-test host. DI extensions will be re-wired once the new
+// IPaymentGatewayProvider implementations are in place (Phase C of the
+// house-style migration). See Bhengu.Family/HOUSE_STYLE.md.
 
 var builder = WebApplication.CreateBuilder(args);
-builder.Services
-    .AddPayFastPayments()
-    .AddGooglePayments()
-    .AddApplePayPayments()
-    .AddBricsPayPayments();
 
 var app = builder.Build();
-app.MapGet("/", () => "Bhengu.Finance.Payments API Host Running");
+app.MapGet("/", () => "Bhengu.Finance.Payments API Host — smoke test only.");
 app.Run();
