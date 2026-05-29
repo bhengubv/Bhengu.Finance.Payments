@@ -3,11 +3,15 @@
 All notable changes to `Bhengu.Finance.Payments` packages are documented here.
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0-preview.1] — 2026-05-29
+## [2.0.0-preview.1] — 2026-05-29
 
 ### Breaking — full SDK redesign per the `Bhengu.*` family house style
 
-All packages in this release adopt the typed `IPaymentGatewayProvider` interface and the typed exception hierarchy. Pre-1.0 stub interfaces (`IPaymentService` / `ISubscriptionService` returning `Task<string>`) are gone. Callers of pre-`1.0.0-preview.1` versions must migrate.
+All packages in this release adopt the typed `IPaymentGatewayProvider` interface and the typed exception hierarchy. Pre-2.0 stub interfaces (`IPaymentService` / `ISubscriptionService` returning `Task<string>`) are gone. Callers of `1.0.32` and earlier must migrate.
+
+**Why 2.0.0 and not 1.1.0?** Per the `Bhengu.*` house style semver rules, *anything that breaks a caller* is a major version. The interface, return types, and exception model all changed — every consumer needs to adapt. The previous `1.x` line stays available on NuGet for callers who can't migrate yet.
+
+**Why `-preview.1`?** The redesign is opinionated and the surface may still tighten before `2.0.0` final. Pre-release tag signals "API still tentative — feedback welcome before lock." See HOUSE_STYLE.md §Semver.
 
 ### Added
 
