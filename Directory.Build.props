@@ -3,7 +3,9 @@
     <!-- 🔐 Core Metadata -->
     <Authors>T.M. Bengu</Authors>
     <Company>Bhengu B.V.</Company>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <Copyright>© 2026 The Other Bhengu (Pty) Ltd t/a The Geek</Copyright>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageLicenseFile></PackageLicenseFile>
     <RepositoryUrl>https://github.com/bhengubv/Bhengu.Finance.Payments</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageTags>Payments;Gateway;PayFast;GooglePay;ApplePay;BricsPay;PayShap</PackageTags>
