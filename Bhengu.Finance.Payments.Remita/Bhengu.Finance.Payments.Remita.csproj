@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>true</IsPackable>
+    <Version>2.0.0-preview.1</Version>
+    <PackageId>Bhengu.Finance.Payments.Remita</PackageId>
+    <Authors>T.M. Bengu</Authors>
+    <Company>Bhengu B.V.</Company>
+    <Description>Remita (SystemSpecs) provider for the Bhengu.Finance.Payments family. Nigerian government revenue collection, corporate disbursement, e-collection, and Single Send Money payouts via the Remita REST API.</Description>
+    <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;Remita;SystemSpecs;Nigeria;NGN;RRR;eCollection;Disbursement;Payout</PackageTags>
+    <RepositoryUrl>https://github.com/bhengubv/Bhengu.Finance.Payments</RepositoryUrl>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Http" Version="9.0.6" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="9.0.6" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Core\Bhengu.Finance.Payments.Core.csproj" />
+  </ItemGroup>
+</Project>

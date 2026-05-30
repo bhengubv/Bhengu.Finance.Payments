@@ -46,6 +46,20 @@
     <ProjectReference Include="..\Bhengu.Finance.Payments.Wave\Bhengu.Finance.Payments.Wave.csproj" />
     <ProjectReference Include="..\Bhengu.Finance.Payments.DPO\Bhengu.Finance.Payments.DPO.csproj" />
     <ProjectReference Include="..\Bhengu.Finance.Payments.Onafriq\Bhengu.Finance.Payments.Onafriq.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Fawry\Bhengu.Finance.Payments.Fawry.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Paymob\Bhengu.Finance.Payments.Paymob.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Kashier\Bhengu.Finance.Payments.Kashier.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.CMI\Bhengu.Finance.Payments.CMI.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Remita\Bhengu.Finance.Payments.Remita.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Mukuru\Bhengu.Finance.Payments.Mukuru.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.TymeBank\Bhengu.Finance.Payments.TymeBank.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Stitch\Bhengu.Finance.Payments.Stitch.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Pesapal\Bhengu.Finance.Payments.Pesapal.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.IPay\Bhengu.Finance.Payments.IPay.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.JamboPay\Bhengu.Finance.Payments.JamboPay.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Hubtel\Bhengu.Finance.Payments.Hubtel.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.ExpressPay\Bhengu.Finance.Payments.ExpressPay.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Slydepay\Bhengu.Finance.Payments.Slydepay.csproj" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Http" Version="9.0.6" />
