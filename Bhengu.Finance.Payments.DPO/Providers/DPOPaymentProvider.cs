@@ -4,6 +4,7 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -26,7 +27,15 @@ public sealed class DPOPaymentProvider : IPaymentGatewayProvider
     private readonly DPOOptions _options;
     private readonly ILogger<DPOPaymentProvider> _logger;
 
-    public string ProviderName => "dpo";
+    public string ProviderName => ProviderNames.DPO;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.RedirectFlow |
+        ProviderCapabilities.Cards |
+        ProviderCapabilities.CrossBorder;
 
     public DPOPaymentProvider(
         HttpClient httpClient,

@@ -2,8 +2,10 @@
 
 using Bhengu.Finance.Payments.ChipperCash.Configuration;
 using Bhengu.Finance.Payments.ChipperCash.Providers;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -34,6 +36,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<ChipperCashPaymentProvider>());
         services.AddTransient<IPayoutProvider, ChipperCashPaymentProvider>(sp =>
             sp.GetRequiredService<ChipperCashPaymentProvider>());
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.ChipperCash, (sp, _) => sp.GetRequiredService<ChipperCashPaymentProvider>());
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

@@ -1,7 +1,9 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Paymob.Configuration;
 using Bhengu.Finance.Payments.Paymob.Providers;
 using Microsoft.Extensions.Configuration;
@@ -32,6 +34,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<PaymobPaymentProvider>());
         services.AddTransient<IPayoutProvider, PaymobPaymentProvider>(sp =>
             sp.GetRequiredService<PaymobPaymentProvider>());
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Paymob, (sp, _) => sp.GetRequiredService<PaymobPaymentProvider>());
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

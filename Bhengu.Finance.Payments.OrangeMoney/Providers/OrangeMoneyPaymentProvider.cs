@@ -6,6 +6,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -17,7 +18,7 @@ namespace Bhengu.Finance.Payments.OrangeMoney.Providers;
 
 /// <summary>
 /// Orange Money Web Payment provider. Checkout-redirect flow: the SDK creates a payment session and
-/// returns the hosted payment URL in <see cref="PaymentResponse.Message"/>; the caller redirects the payer
+/// returns the hosted payment URL in <see cref="PaymentResponse.RedirectUrl"/>; the caller redirects the payer
 /// to that URL.
 /// <para>
 /// <b>Refund note:</b> The Orange Money Web Payment API has no automated refund endpoint.
@@ -46,7 +47,13 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider
     private DateTime _cachedTokenExpiresUtc = DateTime.MinValue;
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
 
-    public string ProviderName => "orangemoney";
+    public string ProviderName => ProviderNames.OrangeMoney;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.RedirectFlow |
+        ProviderCapabilities.MobileMoney;
 
     public OrangeMoneyPaymentProvider(
         HttpClient httpClient,
@@ -106,7 +113,7 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider
             "Orange Money web payment created: OrderId={OrderId} PayToken={PayToken} Status={Status}",
             orderId, wp?.PayToken, wp?.Status);
 
-        // payment_url is returned to the caller via Message — they redirect the payer to it.
+        // payment_url is returned to the caller via RedirectUrl — they redirect the payer to it.
         return new PaymentResponse
         {
             GatewayReference = wp?.PayToken ?? orderId,
@@ -114,7 +121,8 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider
             Amount = request.Amount,
             Currency = request.Currency,
             ProcessedAt = DateTime.UtcNow,
-            Message = wp?.PaymentUrl
+            RedirectUrl = wp?.PaymentUrl,
+            Message = wp?.Message ?? wp?.Status
         };
     }
 

@@ -5,6 +5,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -28,7 +29,14 @@ public sealed class IPayPaymentProvider : IPaymentGatewayProvider
     private readonly IPayOptions _options;
     private readonly ILogger<IPayPaymentProvider> _logger;
 
-    public string ProviderName => "ipay";
+    public string ProviderName => ProviderNames.IPay;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.RedirectFlow |
+        ProviderCapabilities.Cards |
+        ProviderCapabilities.MobileMoney;
 
     public IPayPaymentProvider(
         HttpClient httpClient,
@@ -97,7 +105,7 @@ public sealed class IPayPaymentProvider : IPaymentGatewayProvider
             Amount = request.Amount,
             Currency = request.Currency,
             ProcessedAt = DateTime.UtcNow,
-            Message = redirectUrl
+            RedirectUrl = redirectUrl
         });
     }
 

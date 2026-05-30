@@ -77,10 +77,10 @@ public class PayUIndiaPaymentProviderTests
 
         Assert.Equal("txn123", response.GatewayReference);
         Assert.Equal(PaymentStatus.Pending, response.Status);
-        Assert.NotNull(response.Message);
-        Assert.Contains("secure.payu.in/_payment?", response.Message);
-        Assert.Contains("hash=", response.Message);
-        Assert.Contains("txnid=txn123", response.Message);
+        Assert.NotNull(response.RedirectUrl);
+        Assert.Contains("secure.payu.in/_payment?", response.RedirectUrl);
+        Assert.Contains("hash=", response.RedirectUrl);
+        Assert.Contains("txnid=txn123", response.RedirectUrl);
     }
 
     [Fact]
@@ -97,7 +97,8 @@ public class PayUIndiaPaymentProviderTests
                 FailureUrl = "https://s/y"
             });
         var response = await provider.ProcessPaymentAsync(SamplePayment());
-        Assert.Contains("test.payu.in/_payment?", response.Message);
+        Assert.NotNull(response.RedirectUrl);
+        Assert.Contains("test.payu.in/_payment?", response.RedirectUrl);
     }
 
     [Fact]

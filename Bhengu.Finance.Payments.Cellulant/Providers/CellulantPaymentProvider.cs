@@ -7,6 +7,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Cellulant.Configuration;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -30,7 +31,16 @@ public sealed class CellulantPaymentProvider : IPaymentGatewayProvider, IPayoutP
     private DateTimeOffset _accessTokenExpiresAt = DateTimeOffset.MinValue;
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
 
-    public string ProviderName => "cellulant";
+    public string ProviderName => ProviderNames.Cellulant;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Payout |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.RedirectFlow |
+        ProviderCapabilities.MobileMoney |
+        ProviderCapabilities.CrossBorder;
 
     public CellulantPaymentProvider(
         HttpClient httpClient,
@@ -103,7 +113,8 @@ public sealed class CellulantPaymentProvider : IPaymentGatewayProvider, IPayoutP
             Amount = request.Amount,
             Currency = request.Currency,
             ProcessedAt = DateTime.UtcNow,
-            Message = response?.RedirectUrl ?? response?.Status
+            RedirectUrl = response?.RedirectUrl,
+            Message = response?.Status
         };
     }
 

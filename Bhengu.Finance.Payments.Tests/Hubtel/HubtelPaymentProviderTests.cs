@@ -94,7 +94,7 @@ public class HubtelPaymentProviderTests
         Assert.Equal("ck-1", response.GatewayReference);
         Assert.Equal(PaymentStatus.Pending, response.Status);
         Assert.Equal(12.50m, response.Amount);
-        Assert.Equal("https://checkout.hubtel.com/abc", response.Message);
+        Assert.Equal("https://checkout.hubtel.com/abc", response.RedirectUrl);
     }
 
     [Fact]

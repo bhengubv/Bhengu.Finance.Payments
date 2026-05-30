@@ -1,4 +1,6 @@
-﻿using Bhengu.Finance.Payments.Core.Interfaces;
+﻿using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.PayShap.Client;
 using Bhengu.Finance.Payments.PayShap.Configuration;
 using Bhengu.Finance.Payments.PayShap.Providers;
@@ -25,6 +27,12 @@ public static class ServiceCollectionExtensions
         services.AddTransient<PayShapPaymentProvider>();
         services.AddTransient<IPaymentGatewayProvider, PayShapPaymentProvider>(sp =>
             sp.GetRequiredService<PayShapPaymentProvider>());
+
+        // Register as keyed service so consumers can resolve by name: [FromKeyedServices(ProviderNames.PayShap)]
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.PayShap, (sp, _) => sp.GetRequiredService<PayShapPaymentProvider>());
+
+        // Eager startup validation — fails the app at startup if config is broken (vs first request)
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

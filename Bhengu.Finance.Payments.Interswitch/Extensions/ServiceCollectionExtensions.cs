@@ -1,7 +1,9 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Interswitch.Configuration;
 using Bhengu.Finance.Payments.Interswitch.Providers;
 using Microsoft.Extensions.Configuration;
@@ -34,6 +36,9 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<InterswitchPaymentProvider>());
         services.AddTransient<IPayoutProvider, InterswitchPaymentProvider>(sp =>
             sp.GetRequiredService<InterswitchPaymentProvider>());
+
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Interswitch, (sp, _) => sp.GetRequiredService<InterswitchPaymentProvider>());
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

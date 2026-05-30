@@ -86,7 +86,7 @@ public class ExpressPayPaymentProviderTests
         Assert.Equal("tok-abc", response.GatewayReference);
         Assert.Equal(PaymentStatus.Pending, response.Status);
         Assert.Equal(75m, response.Amount);
-        Assert.Contains("checkout.php", response.Message);
+        Assert.Contains("checkout.php", response.RedirectUrl);
     }
 
     [Fact]

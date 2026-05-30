@@ -1,7 +1,9 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Mukuru.Configuration;
 using Bhengu.Finance.Payments.Mukuru.Providers;
 using Microsoft.Extensions.Configuration;
@@ -34,6 +36,12 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<MukuruPaymentProvider>());
         services.AddTransient<IPayoutProvider, MukuruPaymentProvider>(sp =>
             sp.GetRequiredService<MukuruPaymentProvider>());
+
+        // Register as keyed service so consumers can resolve by name: [FromKeyedServices(ProviderNames.Mukuru)]
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Mukuru, (sp, _) => sp.GetRequiredService<MukuruPaymentProvider>());
+
+        // Eager startup validation — fails the app at startup if config is broken (vs first request)
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

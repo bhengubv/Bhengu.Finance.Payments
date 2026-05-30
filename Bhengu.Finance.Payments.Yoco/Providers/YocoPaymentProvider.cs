@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -26,7 +27,14 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
     private readonly YocoOptions _options;
     private readonly ILogger<YocoPaymentProvider> _logger;
 
-    public string ProviderName => "yoco";
+    public string ProviderName => ProviderNames.Yoco;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.SyncSettlement |
+        ProviderCapabilities.Cards;
 
     public YocoPaymentProvider(
         HttpClient httpClient,

@@ -6,6 +6,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -37,7 +38,13 @@ public sealed class MTNMoMoPaymentProvider : IPaymentGatewayProvider, IPayoutPro
     private readonly Dictionary<string, (string Token, DateTime ExpiresUtc)> _tokenCache = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
 
-    public string ProviderName => "mtnmomo";
+    public string ProviderName => ProviderNames.MTNMoMo;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Payout |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.MobileMoney;
 
     public MTNMoMoPaymentProvider(
         HttpClient httpClient,

@@ -1,7 +1,9 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Onafriq.Configuration;
 using Bhengu.Finance.Payments.Onafriq.Providers;
 using Microsoft.Extensions.Configuration;
@@ -35,6 +37,9 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<OnafriqPaymentProvider>());
         services.AddTransient<IPayoutProvider, OnafriqPaymentProvider>(sp =>
             sp.GetRequiredService<OnafriqPaymentProvider>());
+
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Onafriq, (sp, _) => sp.GetRequiredService<OnafriqPaymentProvider>());
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

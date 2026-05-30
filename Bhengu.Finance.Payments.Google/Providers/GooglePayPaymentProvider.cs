@@ -1,9 +1,11 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Text.Json;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Google.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -21,13 +23,26 @@ namespace Bhengu.Finance.Payments.Google.Providers;
 /// <see cref="IPaymentGatewayProvider"/> such as Stripe).
 /// </para>
 /// </summary>
-public sealed class GooglePayPaymentProvider : IPaymentGatewayProvider
+public sealed class GooglePayPaymentProvider : IPaymentGatewayProvider, IRequiresPostConstructionValidation
 {
     private readonly IServiceProvider _services;
     private readonly GooglePayOptions _options;
     private readonly ILogger<GooglePayPaymentProvider> _logger;
 
-    public string ProviderName => "googlepay";
+    public string ProviderName => ProviderNames.GooglePay;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Tokeniser |
+        ProviderCapabilities.Cards;
+
+    /// <summary>
+    /// Called at app startup by <see cref="BhenguPaymentStartupValidator"/>. Verifies that the
+    /// configured downstream processor is actually registered in DI. Fails fast at startup if
+    /// missing — instead of on the first inbound Google Pay request.
+    /// </summary>
+    public void Validate() => ResolveDownstream();
 
     public GooglePayPaymentProvider(
         IServiceProvider services,

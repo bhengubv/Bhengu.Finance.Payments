@@ -22,6 +22,14 @@ public sealed record PaymentResponse
     /// <summary>UTC timestamp the provider stamped the response.</summary>
     public DateTime ProcessedAt { get; init; } = DateTime.UtcNow;
 
-    /// <summary>Provider-supplied free-text message (e.g. "card approved", "insufficient funds").</summary>
+    /// <summary>
+    /// For redirect-flow providers (PayFast / Ozow / PayJustNow / Hubtel / iPay / CMI / UnionPay /
+    /// Mercado Pago boleto / PagSeguro PIX / Slydepay / ExpressPay / Pesapal / Cellulant Tingg etc.):
+    /// the URL the consumer must send the payer to in order to complete the payment. Null for
+    /// server-to-server flows.
+    /// </summary>
+    public string? RedirectUrl { get; init; }
+
+    /// <summary>Provider-supplied free-text message (e.g. "card approved", "insufficient funds"). Human-readable status, NOT a URL.</summary>
     public string? Message { get; init; }
 }

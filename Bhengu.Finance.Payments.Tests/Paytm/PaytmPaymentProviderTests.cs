@@ -87,7 +87,8 @@ public class PaytmPaymentProviderTests
 
         Assert.Equal("ORDER_001", response.GatewayReference);
         Assert.Equal(PaymentStatus.Completed, response.Status); // "S" -> Completed in our map
-        Assert.Contains("showPaymentPage", response.Message);
+        Assert.NotNull(response.RedirectUrl);
+        Assert.Contains("showPaymentPage", response.RedirectUrl);
         Assert.Contains("txnToken=f0b714b8118541c4b8ab57b8f3c2a3a8", response.Message);
     }
 

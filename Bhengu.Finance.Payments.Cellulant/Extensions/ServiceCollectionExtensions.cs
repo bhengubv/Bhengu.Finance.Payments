@@ -2,8 +2,10 @@
 
 using Bhengu.Finance.Payments.Cellulant.Configuration;
 using Bhengu.Finance.Payments.Cellulant.Providers;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -37,6 +39,9 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<CellulantPaymentProvider>());
         services.AddTransient<IPayoutProvider, CellulantPaymentProvider>(sp =>
             sp.GetRequiredService<CellulantPaymentProvider>());
+
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Cellulant, (sp, _) => sp.GetRequiredService<CellulantPaymentProvider>());
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

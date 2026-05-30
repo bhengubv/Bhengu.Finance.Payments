@@ -8,6 +8,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.AirtelMoney.Configuration;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -31,7 +32,14 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
     private DateTime _cachedTokenExpiresUtc = DateTime.MinValue;
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
 
-    public string ProviderName => "airtelmoney";
+    public string ProviderName => ProviderNames.AirtelMoney;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Payout |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.MobileMoney;
 
     public AirtelMoneyPaymentProvider(
         HttpClient httpClient,

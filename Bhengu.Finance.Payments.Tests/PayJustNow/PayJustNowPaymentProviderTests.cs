@@ -68,7 +68,8 @@ public class PayJustNowPaymentProviderTests
 
         Assert.Equal("pjn_order_1", response.GatewayReference);
         Assert.Equal(PaymentStatus.Completed, response.Status);
-        Assert.Contains("Checkout URL", response.Message);
+        Assert.Equal("https://sandbox.payjustnow.com/checkout/pjn_order_1", response.RedirectUrl);
+        Assert.Equal("BNPL plan created", response.Message);
     }
 
     [Fact]

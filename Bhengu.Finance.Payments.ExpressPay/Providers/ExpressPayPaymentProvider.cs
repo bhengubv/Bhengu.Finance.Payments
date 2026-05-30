@@ -5,6 +5,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -28,7 +29,14 @@ public sealed class ExpressPayPaymentProvider : IPaymentGatewayProvider
     private readonly ExpressPayOptions _options;
     private readonly ILogger<ExpressPayPaymentProvider> _logger;
 
-    public string ProviderName => "expresspay";
+    public string ProviderName => ProviderNames.ExpressPay;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.RedirectFlow |
+        ProviderCapabilities.Cards |
+        ProviderCapabilities.MobileMoney;
 
     public ExpressPayPaymentProvider(
         HttpClient httpClient,
@@ -88,7 +96,8 @@ public sealed class ExpressPayPaymentProvider : IPaymentGatewayProvider
             Amount = request.Amount,
             Currency = request.Currency,
             ProcessedAt = DateTime.UtcNow,
-            Message = submit?.PaymentUrl ?? submit?.Message
+            RedirectUrl = submit?.PaymentUrl,
+            Message = submit?.Message
         };
     }
 

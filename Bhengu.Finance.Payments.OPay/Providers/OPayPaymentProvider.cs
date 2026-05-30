@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -29,7 +30,16 @@ public sealed class OPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvid
     private readonly OPayOptions _options;
     private readonly ILogger<OPayPaymentProvider> _logger;
 
-    public string ProviderName => "opay";
+    public string ProviderName => ProviderNames.OPay;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Payout |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.RedirectFlow |
+        ProviderCapabilities.Cards |
+        ProviderCapabilities.MobileMoney;
 
     public OPayPaymentProvider(
         HttpClient httpClient,
@@ -107,6 +117,7 @@ public sealed class OPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvid
             Amount = request.Amount,
             Currency = request.Currency,
             ProcessedAt = DateTime.UtcNow,
+            RedirectUrl = resp?.Data?.CashierUrl,
             Message = resp?.Message
         };
     }

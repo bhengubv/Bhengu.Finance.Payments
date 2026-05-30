@@ -5,6 +5,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -27,7 +28,13 @@ public sealed class EcoCashPaymentProvider : IPaymentGatewayProvider
     private readonly EcoCashOptions _options;
     private readonly ILogger<EcoCashPaymentProvider> _logger;
 
-    public string ProviderName => "ecocash";
+    public string ProviderName => ProviderNames.EcoCash;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.MobileMoney;
 
     public EcoCashPaymentProvider(
         HttpClient httpClient,

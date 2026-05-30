@@ -2,8 +2,10 @@
 
 using Bhengu.Finance.Payments.CMI.Configuration;
 using Bhengu.Finance.Payments.CMI.Providers;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -32,6 +34,9 @@ public static class ServiceCollectionExtensions
         services.AddHttpClient<CMIPaymentProvider>();
         services.AddTransient<IPaymentGatewayProvider, CMIPaymentProvider>(sp =>
             sp.GetRequiredService<CMIPaymentProvider>());
+
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.CMI, (sp, _) => sp.GetRequiredService<CMIPaymentProvider>());
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

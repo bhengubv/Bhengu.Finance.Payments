@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -36,7 +37,15 @@ public sealed class PaytmPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
     private readonly PaytmOptions _options;
     private readonly ILogger<PaytmPaymentProvider> _logger;
 
-    public string ProviderName => "paytm";
+    public string ProviderName => ProviderNames.Paytm;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Payout |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.RedirectFlow |
+        ProviderCapabilities.Cards;
 
     public PaytmPaymentProvider(
         HttpClient httpClient,
@@ -116,9 +125,10 @@ public sealed class PaytmPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
             Amount = request.Amount,
             Currency = currency,
             ProcessedAt = DateTime.UtcNow,
+            RedirectUrl = string.IsNullOrEmpty(txnToken) ? null : checkoutUrl,
             Message = string.IsNullOrEmpty(txnToken)
                 ? resp?.Body?.ResultInfo?.ResultMsg
-                : $"Redirect to: {checkoutUrl} (txnToken={txnToken})"
+                : $"txnToken={txnToken}"
         };
     }
 

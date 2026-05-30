@@ -92,7 +92,7 @@ public class PesapalPaymentProviderTests
         Assert.Equal("ot-001", response.GatewayReference);
         Assert.Equal(PaymentStatus.Pending, response.Status);
         Assert.Equal(1500m, response.Amount);
-        Assert.Equal("https://pay.pesapal.com/iframe/ot-001", response.Message);
+        Assert.Equal("https://pay.pesapal.com/iframe/ot-001", response.RedirectUrl);
         Assert.Equal(2, calls);
     }
 

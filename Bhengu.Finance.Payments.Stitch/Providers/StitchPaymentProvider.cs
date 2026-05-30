@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -31,7 +32,15 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
     private readonly ILogger<StitchPaymentProvider> _logger;
     private readonly Uri _graphqlUri;
 
-    public string ProviderName => "stitch";
+    public string ProviderName => ProviderNames.Stitch;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Payout |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.RedirectFlow |
+        ProviderCapabilities.BankTransfer;
 
     public StitchPaymentProvider(
         HttpClient httpClient,
@@ -124,7 +133,8 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
             Amount = request.Amount,
             Currency = request.Currency,
             ProcessedAt = DateTime.UtcNow,
-            Message = pir?.Url
+            RedirectUrl = pir?.Url is { Length: > 0 } u ? u : null,
+            Message = "Pay-by-bank initiated"
         };
     }
 

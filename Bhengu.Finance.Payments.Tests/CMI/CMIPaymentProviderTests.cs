@@ -81,13 +81,13 @@ public class CMIPaymentProviderTests
         Assert.Equal("ORDER_42", response.GatewayReference);
         Assert.Equal(PaymentStatus.Pending, response.Status);
         Assert.Equal(150m, response.Amount);
-        Assert.NotNull(response.Message);
-        Assert.Contains("/fim/est3Dgate?", response.Message);
-        Assert.Contains("clientid=600000001", response.Message);
-        Assert.Contains("oid=ORDER_42", response.Message);
-        Assert.Contains("hash=", response.Message);
+        Assert.NotNull(response.RedirectUrl);
+        Assert.Contains("/fim/est3Dgate?", response.RedirectUrl);
+        Assert.Contains("clientid=600000001", response.RedirectUrl);
+        Assert.Contains("oid=ORDER_42", response.RedirectUrl);
+        Assert.Contains("hash=", response.RedirectUrl);
         // Currency 'MAD' should be normalised to '504'.
-        Assert.Contains("currency=504", response.Message);
+        Assert.Contains("currency=504", response.RedirectUrl);
     }
 
     [Fact]

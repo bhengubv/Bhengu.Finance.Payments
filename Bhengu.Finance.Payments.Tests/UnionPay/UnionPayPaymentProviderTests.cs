@@ -95,10 +95,10 @@ public class UnionPayPaymentProviderTests
         Assert.Equal("ORD-UP-001", response.GatewayReference);
         Assert.Equal(PaymentStatus.Pending, response.Status);
         Assert.Equal(100m, response.Amount);
-        Assert.NotNull(response.Message);
-        Assert.Contains("frontTransReq.do", response.Message);
-        Assert.Contains("orderId", response.Message);
-        Assert.Contains("signature", response.Message);
+        Assert.NotNull(response.RedirectUrl);
+        Assert.Contains("frontTransReq.do", response.RedirectUrl);
+        Assert.Contains("orderId", response.RedirectUrl);
+        Assert.Contains("signature", response.RedirectUrl);
     }
 
     [Fact]

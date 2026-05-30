@@ -3,6 +3,56 @@
 All notable changes to `Bhengu.Finance.Payments` packages are documented here.
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0-preview.2] — 2026-05-30
+
+### Breaking — ubiquity pass + 36 new providers
+
+A fresh-eyes DX audit surfaced friction points blocking adoption. This release fixes them and adds the rest of the African + BRICS landscape we'd been missing.
+
+### Added — 36 new providers (now 46 total)
+
+**African mobile money for the unbanked:** M-Pesa (KE/TZ/MZ/DRC/EG/ET/GH), MTN MoMo (17 countries), Airtel Money (14 countries), Orange Money (18 Francophone countries), Wave (SN/CI/ML/UG), EcoCash (ZW).
+
+**Pan-African aggregators:** Flutterwave (30+ countries), Cellulant (35 countries), DPO Group, Onafriq (500M wallets), Chipper Cash.
+
+**Country gateways:** Interswitch · OPay · Moniepoint · Remita (Nigeria) · Hubtel · ExpressPay · Slydepay (Ghana) · Pesapal · IPay · JamboPay (Kenya) · Fawry · Paymob · Kashier (Egypt) · CMI (Morocco) · Mukuru · TymeBank · Stitch (South Africa).
+
+**BRICS-completing:** Mercado Pago, PagSeguro (Brazil) · Razorpay, PayU India, Paytm (India) · Alipay, WeChat Pay, UnionPay (China).
+
+### Added — Core
+
+- `ProviderNames` — typed constants for all 46 providers. Use `ProviderNames.PayFast` instead of `"payfast"` to eliminate typo risk.
+- `ProviderCapabilities` `[Flags]` — query a provider's surface at runtime: `provider.Capabilities.HasFlag(ProviderCapabilities.Refund)`. Flags include Charge, Refund, Payout, Webhook, SyncSettlement, RedirectFlow, Tokeniser, CrossBorder, MobileMoney, Cards, BankTransfer.
+- `IPaymentGatewayProvider.Capabilities` — every provider now declares what it supports.
+- `PaymentResponse.RedirectUrl` — first-class property for redirect URLs (previously overloaded into `Message`).
+- `IRequiresPostConstructionValidation` — opt-in interface for providers needing cross-provider validation (Apple Pay / Google Pay checking their downstream is registered).
+- `BhenguPaymentStartupValidator` (`IHostedService`) — registered by every `AddXxxPayments()` extension; eagerly materialises every provider at app startup so misconfiguration crashes the app at startup, not at first request.
+
+### Changed — DX / API ergonomics
+
+- **Every `AddXxxPayments()` extension now also registers a keyed service.** Consumers can inject by name without LINQ: `[FromKeyedServices(ProviderNames.PayFast)] IPaymentGatewayProvider provider`.
+- **`PaymentResponse.Message`** is no longer overloaded with URLs. URLs go to `RedirectUrl`; `Message` is human-readable status text only.
+- **`VerifyWebhookSignature` normalised** — all providers return `false` on missing-secret configuration with a log warning. Previously some threw, some returned false, some silently failed; now uniformly false-on-missing.
+- **Apple Pay + Google Pay validate their downstream processor at app startup**, not at first request. Misconfiguration is a startup crash with a clear `ProviderConfigurationException` — no more sev-1 pager at midnight when the first Apple Pay charge hits an unregistered downstream.
+
+### Documentation
+
+- README rewritten: multi-provider Quickstart with keyed-services + a 46-row feature matrix.
+- Explicit warning against `Bhengu.Finance.Payments.All` in production (pulls 46 transitive deps).
+- Per-package READMEs added for PayFast, Stripe, M-Pesa, Apple Pay — each documents what goes in `PaymentMethodToken`, which `Metadata` keys are read, sync-vs-async settlement, refund support, and webhook semantics.
+
+### Test coverage
+
+706 unit tests passing across all 46 providers — constructor validation, success path with response parsing, refund, payout (where applicable), HTTP failure mapping (429/4xx/5xx/network), webhook signature valid+tampered+missing, and `ParseWebhookAsync` good+invalid+unknown-type.
+
+### Migration from `2.0.0-preview.1`
+
+- **Implementations of `IPaymentGatewayProvider`** must add a `Capabilities` property (declare which flags apply). Consumers don't need to do anything.
+- **Consumers reading the URL from `PaymentResponse.Message`** should read `PaymentResponse.RedirectUrl` instead.
+- **Consumers using bare `IPaymentGatewayProvider`** with multiple providers registered should switch to `[FromKeyedServices(ProviderNames.X)]` or filter `IEnumerable<IPaymentGatewayProvider>` by `ProviderName`. (The bare injection still works but silently returns "whichever was registered last" — DI default behaviour.)
+
+
+
 ## [2.0.0-preview.1] — 2026-05-29
 
 ### Breaking — full SDK redesign per the `Bhengu.*` family house style

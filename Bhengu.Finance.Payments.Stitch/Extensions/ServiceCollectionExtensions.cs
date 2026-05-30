@@ -1,7 +1,9 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Stitch.Configuration;
 using Bhengu.Finance.Payments.Stitch.Providers;
 using Microsoft.Extensions.Configuration;
@@ -35,6 +37,12 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<StitchPaymentProvider>());
         services.AddTransient<IPayoutProvider, StitchPaymentProvider>(sp =>
             sp.GetRequiredService<StitchPaymentProvider>());
+
+        // Register as keyed service so consumers can resolve by name: [FromKeyedServices(ProviderNames.Stitch)]
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Stitch, (sp, _) => sp.GetRequiredService<StitchPaymentProvider>());
+
+        // Eager startup validation — fails the app at startup if config is broken (vs first request)
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -28,7 +29,14 @@ public sealed class OnafriqPaymentProvider : IPaymentGatewayProvider, IPayoutPro
     private readonly OnafriqOptions _options;
     private readonly ILogger<OnafriqPaymentProvider> _logger;
 
-    public string ProviderName => "onafriq";
+    public string ProviderName => ProviderNames.Onafriq;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Payout |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.MobileMoney |
+        ProviderCapabilities.CrossBorder;
 
     public OnafriqPaymentProvider(
         HttpClient httpClient,

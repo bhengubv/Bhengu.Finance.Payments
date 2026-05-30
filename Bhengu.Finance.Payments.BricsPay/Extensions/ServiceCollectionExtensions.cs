@@ -3,8 +3,10 @@
 using Bhengu.Finance.Payments.BricsPay.Configuration;
 using Bhengu.Finance.Payments.BricsPay.Currency;
 using Bhengu.Finance.Payments.BricsPay.Providers;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -36,6 +38,12 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<BricsPayPaymentProvider>());
         services.AddTransient<IPayoutProvider, BricsPayPaymentProvider>(sp =>
             sp.GetRequiredService<BricsPayPaymentProvider>());
+
+        // Register as keyed service so consumers can resolve by name: [FromKeyedServices(ProviderNames.BricsPay)]
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.BricsPay, (sp, _) => sp.GetRequiredService<BricsPayPaymentProvider>());
+
+        // Eager startup validation — fails the app at startup if config is broken (vs first request)
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

@@ -1,7 +1,9 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Wave.Configuration;
 using Bhengu.Finance.Payments.Wave.Providers;
 using Microsoft.Extensions.Configuration;
@@ -32,6 +34,9 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<WavePaymentProvider>());
         services.AddTransient<IPayoutProvider, WavePaymentProvider>(sp =>
             sp.GetRequiredService<WavePaymentProvider>());
+
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Wave, (sp, _) => sp.GetRequiredService<WavePaymentProvider>());
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

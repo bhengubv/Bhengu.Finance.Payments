@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Xml.Linq;
 using Bhengu.Finance.Payments.CMI.Configuration;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -30,7 +31,14 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
     private readonly CMIOptions _options;
     private readonly ILogger<CMIPaymentProvider> _logger;
 
-    public string ProviderName => "cmi";
+    public string ProviderName => ProviderNames.CMI;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.RedirectFlow |
+        ProviderCapabilities.Cards;
 
     public CMIPaymentProvider(
         HttpClient httpClient,
@@ -117,7 +125,7 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
             Amount = request.Amount,
             Currency = currency,
             ProcessedAt = DateTime.UtcNow,
-            Message = redirectUrl
+            RedirectUrl = redirectUrl
         });
     }
 

@@ -69,7 +69,8 @@ public class OzowPaymentProviderTests
         var response = await provider.ProcessPaymentAsync(SamplePayment());
         Assert.Equal("ozow_tx_1", response.GatewayReference);
         Assert.Equal(PaymentStatus.Pending, response.Status);
-        Assert.Contains("Redirect to", response.Message);
+        Assert.Equal("https://sandbox.ozow.com/pay/ozow_tx_1", response.RedirectUrl);
+        Assert.Equal("Payment initiated", response.Message);
     }
 
     [Fact]

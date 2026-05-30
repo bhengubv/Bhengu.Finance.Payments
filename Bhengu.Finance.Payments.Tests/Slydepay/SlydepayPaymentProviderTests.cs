@@ -78,7 +78,7 @@ public class SlydepayPaymentProviderTests
         Assert.Equal("pt-001", response.GatewayReference);
         Assert.Equal(PaymentStatus.Pending, response.Status);
         Assert.Equal(30m, response.Amount);
-        Assert.Contains("slydepay.com.gh/pay/pt-001", response.Message);
+        Assert.Contains("slydepay.com.gh/pay/pt-001", response.RedirectUrl);
     }
 
     [Fact]

@@ -90,7 +90,7 @@ public class OrangeMoneyPaymentProviderTests
 
         Assert.Equal("PAY-TOK-XYZ", response.GatewayReference);
         Assert.Equal(PaymentStatus.Pending, response.Status);
-        Assert.Equal("https://webpayment.orange-money.com/pay/abc", response.Message);
+        Assert.Equal("https://webpayment.orange-money.com/pay/abc", response.RedirectUrl);
     }
 
     [Fact]

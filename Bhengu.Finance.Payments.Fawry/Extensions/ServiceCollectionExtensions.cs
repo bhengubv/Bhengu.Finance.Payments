@@ -1,7 +1,9 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Fawry.Configuration;
 using Bhengu.Finance.Payments.Fawry.Providers;
 using Microsoft.Extensions.Configuration;
@@ -32,6 +34,8 @@ public static class ServiceCollectionExtensions
         services.AddHttpClient<FawryPaymentProvider>();
         services.AddTransient<IPaymentGatewayProvider, FawryPaymentProvider>(sp =>
             sp.GetRequiredService<FawryPaymentProvider>());
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Fawry, (sp, _) => sp.GetRequiredService<FawryPaymentProvider>());
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

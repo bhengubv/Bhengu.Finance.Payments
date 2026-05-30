@@ -2,8 +2,10 @@
 
 using Bhengu.Finance.Payments.Alipay.Configuration;
 using Bhengu.Finance.Payments.Alipay.Providers;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -34,6 +36,9 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<AlipayPaymentProvider>());
         services.AddTransient<IPayoutProvider, AlipayPaymentProvider>(sp =>
             sp.GetRequiredService<AlipayPaymentProvider>());
+
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Alipay, (sp, _) => sp.GetRequiredService<AlipayPaymentProvider>());
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

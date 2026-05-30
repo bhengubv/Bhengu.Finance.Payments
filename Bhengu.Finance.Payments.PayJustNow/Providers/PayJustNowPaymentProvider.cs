@@ -5,6 +5,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -27,7 +28,14 @@ public sealed class PayJustNowPaymentProvider : IPaymentGatewayProvider
     private readonly PayJustNowOptions _options;
     private readonly ILogger<PayJustNowPaymentProvider> _logger;
 
-    public string ProviderName => "payjustnow";
+    public string ProviderName => ProviderNames.PayJustNow;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.RedirectFlow |
+        ProviderCapabilities.Cards;
 
     public PayJustNowPaymentProvider(
         HttpClient httpClient,
@@ -86,9 +94,8 @@ public sealed class PayJustNowPaymentProvider : IPaymentGatewayProvider
             Amount = request.Amount,
             Currency = request.Currency,
             ProcessedAt = DateTime.UtcNow,
-            Message = pjnResponse?.CheckoutUrl is { Length: > 0 } url
-                ? $"BNPL plan created. Checkout URL: {url}"
-                : "BNPL plan created"
+            RedirectUrl = pjnResponse?.CheckoutUrl is { Length: > 0 } url ? url : null,
+            Message = "BNPL plan created"
         };
     }
 

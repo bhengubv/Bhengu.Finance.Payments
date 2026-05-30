@@ -7,6 +7,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -36,7 +37,16 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
     private string? _cachedToken;
     private DateTimeOffset _cachedTokenExpiresAt = DateTimeOffset.MinValue;
 
-    public string ProviderName => "mukuru";
+    public string ProviderName => ProviderNames.Mukuru;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Payout |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.CrossBorder |
+        ProviderCapabilities.MobileMoney |
+        ProviderCapabilities.BankTransfer;
 
     public MukuruPaymentProvider(
         HttpClient httpClient,

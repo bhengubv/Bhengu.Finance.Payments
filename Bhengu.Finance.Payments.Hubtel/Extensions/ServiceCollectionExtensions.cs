@@ -1,7 +1,9 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Hubtel.Configuration;
 using Bhengu.Finance.Payments.Hubtel.Providers;
 using Microsoft.Extensions.Configuration;
@@ -36,6 +38,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<HubtelPaymentProvider>());
         services.AddTransient<IPayoutProvider, HubtelPaymentProvider>(sp =>
             sp.GetRequiredService<HubtelPaymentProvider>());
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Hubtel, (sp, _) => sp.GetRequiredService<HubtelPaymentProvider>());
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

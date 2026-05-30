@@ -1,7 +1,9 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.PayJustNow.Configuration;
 using Bhengu.Finance.Payments.PayJustNow.Providers;
 using Microsoft.Extensions.Configuration;
@@ -32,6 +34,12 @@ public static class ServiceCollectionExtensions
         services.AddHttpClient<PayJustNowPaymentProvider>();
         services.AddTransient<IPaymentGatewayProvider, PayJustNowPaymentProvider>(sp =>
             sp.GetRequiredService<PayJustNowPaymentProvider>());
+
+        // Register as keyed service so consumers can resolve by name: [FromKeyedServices(ProviderNames.PayJustNow)]
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.PayJustNow, (sp, _) => sp.GetRequiredService<PayJustNowPaymentProvider>());
+
+        // Eager startup validation — fails the app at startup if config is broken (vs first request)
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

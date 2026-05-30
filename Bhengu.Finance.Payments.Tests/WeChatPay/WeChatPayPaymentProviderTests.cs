@@ -90,7 +90,8 @@ public class WeChatPayPaymentProviderTests
         Assert.Equal("OUT_TRADE_NO_001", response.GatewayReference);
         Assert.Equal(PaymentStatus.Pending, response.Status);
         Assert.Equal(50m, response.Amount);
-        Assert.Contains("weixin://", response.Message);
+        Assert.NotNull(response.RedirectUrl);
+        Assert.Contains("weixin://", response.RedirectUrl);
     }
 
     [Fact]

@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -26,7 +27,15 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
     private readonly MercadoPagoOptions _options;
     private readonly ILogger<MercadoPagoPaymentProvider> _logger;
 
-    public string ProviderName => "mercadopago";
+    public string ProviderName => ProviderNames.MercadoPago;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Payout |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.Cards |
+        ProviderCapabilities.BankTransfer;
 
     public MercadoPagoPaymentProvider(
         HttpClient httpClient,

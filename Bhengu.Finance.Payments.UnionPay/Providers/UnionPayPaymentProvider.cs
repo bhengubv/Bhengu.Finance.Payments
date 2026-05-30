@@ -6,6 +6,7 @@ using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -33,7 +34,14 @@ public sealed class UnionPayPaymentProvider : IPaymentGatewayProvider
     private readonly ILogger<UnionPayPaymentProvider> _logger;
     private readonly string _baseUrl;
 
-    public string ProviderName => "unionpay";
+    public string ProviderName => ProviderNames.UnionPay;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.RedirectFlow |
+        ProviderCapabilities.Cards;
 
     public UnionPayPaymentProvider(
         HttpClient httpClient,
@@ -94,7 +102,7 @@ public sealed class UnionPayPaymentProvider : IPaymentGatewayProvider
 
         _logger.LogInformation("UnionPay frontTransReq prepared: orderId={OrderId} txnAmt={TxnAmt}", orderId, txnAmt);
 
-        // Returns the redirect-form payload as Message; the caller renders or HTTP-302's the user.
+        // Returns the redirect-form payload as RedirectUrl; the caller renders or HTTP-302's the user.
         return Task.FromResult(new PaymentResponse
         {
             GatewayReference = orderId,
@@ -102,7 +110,7 @@ public sealed class UnionPayPaymentProvider : IPaymentGatewayProvider
             Amount = request.Amount,
             Currency = _options.Currency,
             ProcessedAt = DateTime.UtcNow,
-            Message = $"{actionUrl}?{body}"
+            RedirectUrl = $"{actionUrl}?{body}"
         });
     }
 

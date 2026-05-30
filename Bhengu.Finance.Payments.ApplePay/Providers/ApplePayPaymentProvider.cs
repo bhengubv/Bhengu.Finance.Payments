@@ -2,9 +2,11 @@
 
 using System.Text.Json;
 using Bhengu.Finance.Payments.ApplePay.Configuration;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Validation;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -25,13 +27,26 @@ namespace Bhengu.Finance.Payments.ApplePay.Providers;
 /// has no webhook channel; the downstream processor handles webhook events.
 /// </para>
 /// </summary>
-public sealed class ApplePayPaymentProvider : IPaymentGatewayProvider
+public sealed class ApplePayPaymentProvider : IPaymentGatewayProvider, IRequiresPostConstructionValidation
 {
     private readonly IServiceProvider _services;
     private readonly ApplePayOptions _options;
     private readonly ILogger<ApplePayPaymentProvider> _logger;
 
-    public string ProviderName => "applepay";
+    public string ProviderName => ProviderNames.ApplePay;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Tokeniser |
+        ProviderCapabilities.Cards;
+
+    /// <summary>
+    /// Called at app startup by <see cref="BhenguPaymentStartupValidator"/>. Verifies that the
+    /// configured downstream processor is actually registered in DI. Fails fast at startup if
+    /// missing — instead of on the first inbound Apple Pay request.
+    /// </summary>
+    public void Validate() => ResolveDownstream();
 
     public ApplePayPaymentProvider(
         IServiceProvider services,

@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.Json;
 using Bhengu.Finance.Payments.BricsPay.Configuration;
 using Bhengu.Finance.Payments.BricsPay.Currency;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -26,7 +27,14 @@ public sealed class BricsPayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
     private readonly ILogger<BricsPayPaymentProvider> _logger;
     private readonly string _baseUrl;
 
-    public string ProviderName => "bricspay";
+    public string ProviderName => ProviderNames.BricsPay;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Payout |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.CrossBorder;
 
     public BricsPayPaymentProvider(
         HttpClient httpClient,
@@ -198,13 +206,27 @@ public sealed class BricsPayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
-        var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
-        var computed = Convert.ToBase64String(computedHash);
+        if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
+        {
+            _logger.LogWarning("BRICS Pay WebhookSecret not configured — signature verification cannot succeed.");
+            return false;
+        }
 
-        return CryptographicOperations.FixedTimeEquals(
-            Encoding.UTF8.GetBytes(signature),
-            Encoding.UTF8.GetBytes(computed));
+        try
+        {
+            using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
+            var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
+            var computed = Convert.ToBase64String(computedHash);
+
+            return CryptographicOperations.FixedTimeEquals(
+                Encoding.UTF8.GetBytes(signature),
+                Encoding.UTF8.GetBytes(computed));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "BRICS Pay webhook signature verification raised");
+            return false;
+        }
     }
 
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)

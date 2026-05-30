@@ -172,6 +172,8 @@ public class GooglePayPaymentProviderTests
     private sealed class FakeDownstreamProvider : IPaymentGatewayProvider
     {
         public string ProviderName => "fake-downstream";
+        public Bhengu.Finance.Payments.Core.ProviderCapabilities Capabilities =>
+            Bhengu.Finance.Payments.Core.ProviderCapabilities.Charge | Bhengu.Finance.Payments.Core.ProviderCapabilities.Refund;
         public PaymentRequest? LastRequest { get; private set; }
         public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
         {

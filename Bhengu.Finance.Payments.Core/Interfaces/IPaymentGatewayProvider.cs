@@ -10,8 +10,15 @@ namespace Bhengu.Finance.Payments.Core.Interfaces;
 /// </summary>
 public interface IPaymentGatewayProvider
 {
-    /// <summary>Canonical short name for the provider — e.g. "payfast", "stripe", "bricspay".</summary>
+    /// <summary>Canonical short name for the provider — e.g. "payfast", "stripe", "bricspay". Use <see cref="ProviderNames"/> constants instead of bare strings.</summary>
     string ProviderName { get; }
+
+    /// <summary>
+    /// What the provider supports at runtime. Consumers should check this before calling methods that
+    /// might not apply — e.g. <c>if (provider.Capabilities.HasFlag(ProviderCapabilities.Refund)) ...</c>.
+    /// Removes the need to read each provider's source/docs to discover its surface.
+    /// </summary>
+    ProviderCapabilities Capabilities { get; }
 
     /// <summary>Charge a tokenised payment method.</summary>
     /// <exception cref="Exceptions.PaymentDeclinedException">Provider declined the payment.</exception>

@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -29,7 +30,14 @@ public sealed class OzowPaymentProvider : IPaymentGatewayProvider
     private readonly OzowOptions _options;
     private readonly ILogger<OzowPaymentProvider> _logger;
 
-    public string ProviderName => "ozow";
+    public string ProviderName => ProviderNames.Ozow;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.RedirectFlow |
+        ProviderCapabilities.BankTransfer;
 
     public OzowPaymentProvider(
         HttpClient httpClient,
@@ -111,9 +119,8 @@ public sealed class OzowPaymentProvider : IPaymentGatewayProvider
             Amount = request.Amount,
             Currency = request.Currency,
             ProcessedAt = DateTime.UtcNow,
-            Message = ozowResponse?.PaymentUrl is { Length: > 0 } url
-                ? $"Redirect to: {url}"
-                : "Payment initiated"
+            RedirectUrl = ozowResponse?.PaymentUrl is { Length: > 0 } url ? url : null,
+            Message = "Payment initiated"
         };
     }
 

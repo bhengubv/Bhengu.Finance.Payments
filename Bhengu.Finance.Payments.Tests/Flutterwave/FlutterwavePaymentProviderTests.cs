@@ -87,7 +87,7 @@ public class FlutterwavePaymentProviderTests
 
         Assert.Equal("tx-ref-1", response.GatewayReference);
         Assert.Equal(PaymentStatus.Completed, response.Status);
-        Assert.Contains("checkout.flutterwave.com", response.Message);
+        Assert.Contains("checkout.flutterwave.com", response.RedirectUrl);
     }
 
     [Fact]

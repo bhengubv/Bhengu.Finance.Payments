@@ -1,7 +1,9 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.JamboPay.Configuration;
 using Bhengu.Finance.Payments.JamboPay.Providers;
 using Microsoft.Extensions.Configuration;
@@ -38,6 +40,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<JamboPayPaymentProvider>());
         services.AddTransient<IPayoutProvider, JamboPayPaymentProvider>(sp =>
             sp.GetRequiredService<JamboPayPaymentProvider>());
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.JamboPay, (sp, _) => sp.GetRequiredService<JamboPayPaymentProvider>());
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

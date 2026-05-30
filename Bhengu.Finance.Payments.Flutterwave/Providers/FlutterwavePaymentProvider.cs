@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -27,7 +28,18 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
     private readonly FlutterwaveOptions _options;
     private readonly ILogger<FlutterwavePaymentProvider> _logger;
 
-    public string ProviderName => "flutterwave";
+    public string ProviderName => ProviderNames.Flutterwave;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Payout |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.RedirectFlow |
+        ProviderCapabilities.Cards |
+        ProviderCapabilities.MobileMoney |
+        ProviderCapabilities.BankTransfer |
+        ProviderCapabilities.CrossBorder;
 
     public FlutterwavePaymentProvider(
         HttpClient httpClient,
@@ -90,7 +102,8 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
             Amount = request.Amount,
             Currency = request.Currency,
             ProcessedAt = DateTime.UtcNow,
-            Message = fwResponse?.Data?.Link ?? fwResponse?.Message
+            RedirectUrl = fwResponse?.Data?.Link,
+            Message = fwResponse?.Message
         };
     }
 

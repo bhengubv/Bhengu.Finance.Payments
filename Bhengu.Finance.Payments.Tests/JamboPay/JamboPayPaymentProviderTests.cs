@@ -97,7 +97,7 @@ public class JamboPayPaymentProviderTests
         Assert.Equal("txn-001", response.GatewayReference);
         Assert.Equal(PaymentStatus.Pending, response.Status);
         Assert.Equal(500m, response.Amount);
-        Assert.Equal("https://pay.jambopay.com/c/abc", response.Message);
+        Assert.Equal("https://pay.jambopay.com/c/abc", response.RedirectUrl);
     }
 
     [Fact]

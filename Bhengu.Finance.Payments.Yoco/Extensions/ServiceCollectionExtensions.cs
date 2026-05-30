@@ -1,7 +1,9 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Yoco.Configuration;
 using Bhengu.Finance.Payments.Yoco.Providers;
 using Microsoft.Extensions.Configuration;
@@ -30,6 +32,12 @@ public static class ServiceCollectionExtensions
         services.AddHttpClient<YocoPaymentProvider>();
         services.AddTransient<IPaymentGatewayProvider, YocoPaymentProvider>(sp =>
             sp.GetRequiredService<YocoPaymentProvider>());
+
+        // Register as keyed service so consumers can resolve by name: [FromKeyedServices(ProviderNames.Yoco)]
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Yoco, (sp, _) => sp.GetRequiredService<YocoPaymentProvider>());
+
+        // Eager startup validation — fails the app at startup if config is broken (vs first request)
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

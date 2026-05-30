@@ -5,6 +5,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -26,7 +27,14 @@ public sealed class SlydepayPaymentProvider : IPaymentGatewayProvider
     private readonly SlydepayOptions _options;
     private readonly ILogger<SlydepayPaymentProvider> _logger;
 
-    public string ProviderName => "slydepay";
+    public string ProviderName => ProviderNames.Slydepay;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.RedirectFlow |
+        ProviderCapabilities.Cards |
+        ProviderCapabilities.MobileMoney;
 
     public SlydepayPaymentProvider(
         HttpClient httpClient,
@@ -85,7 +93,8 @@ public sealed class SlydepayPaymentProvider : IPaymentGatewayProvider
             Amount = request.Amount,
             Currency = request.Currency,
             ProcessedAt = DateTime.UtcNow,
-            Message = result?.CheckOutUrl ?? envelope?.ErrorMessage
+            RedirectUrl = result?.CheckOutUrl,
+            Message = envelope?.ErrorMessage
         };
     }
 

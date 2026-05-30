@@ -2,8 +2,10 @@
 
 using Bhengu.Finance.Payments.AirtelMoney.Configuration;
 using Bhengu.Finance.Payments.AirtelMoney.Providers;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -38,6 +40,9 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<AirtelMoneyPaymentProvider>());
         services.AddTransient<IPayoutProvider, AirtelMoneyPaymentProvider>(sp =>
             sp.GetRequiredService<AirtelMoneyPaymentProvider>());
+
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.AirtelMoney, (sp, _) => sp.GetRequiredService<AirtelMoneyPaymentProvider>());
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

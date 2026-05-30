@@ -7,6 +7,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -29,7 +30,15 @@ public sealed class KashierPaymentProvider : IPaymentGatewayProvider, IPayoutPro
     private readonly KashierOptions _options;
     private readonly ILogger<KashierPaymentProvider> _logger;
 
-    public string ProviderName => "kashier";
+    public string ProviderName => ProviderNames.Kashier;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Payout |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.RedirectFlow |
+        ProviderCapabilities.Cards;
 
     public KashierPaymentProvider(
         HttpClient httpClient,

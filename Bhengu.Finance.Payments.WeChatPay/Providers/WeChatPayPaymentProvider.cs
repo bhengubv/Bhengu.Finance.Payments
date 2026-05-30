@@ -8,6 +8,7 @@ using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -32,7 +33,14 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
     private readonly WeChatPayOptions _options;
     private readonly ILogger<WeChatPayPaymentProvider> _logger;
 
-    public string ProviderName => "wechatpay";
+    public string ProviderName => ProviderNames.WeChatPay;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Payout |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.Cards;
 
     public WeChatPayPaymentProvider(
         HttpClient httpClient,
@@ -88,7 +96,7 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
             Amount = request.Amount,
             Currency = currency,
             ProcessedAt = DateTime.UtcNow,
-            Message = parsed?.CodeUrl
+            RedirectUrl = parsed?.CodeUrl
         };
     }
 

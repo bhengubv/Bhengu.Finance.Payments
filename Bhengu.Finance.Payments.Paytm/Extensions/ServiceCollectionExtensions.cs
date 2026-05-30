@@ -1,7 +1,9 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Paytm.Configuration;
 using Bhengu.Finance.Payments.Paytm.Providers;
 using Microsoft.Extensions.Configuration;
@@ -34,6 +36,9 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<PaytmPaymentProvider>());
         services.AddTransient<IPayoutProvider, PaytmPaymentProvider>(sp =>
             sp.GetRequiredService<PaytmPaymentProvider>());
+
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Paytm, (sp, _) => sp.GetRequiredService<PaytmPaymentProvider>());
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

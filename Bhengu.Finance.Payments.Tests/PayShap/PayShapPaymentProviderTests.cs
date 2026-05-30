@@ -148,11 +148,10 @@ public class PayShapPaymentProviderTests
     }
 
     [Fact]
-    public void VerifyWebhookSignature_Throws_WhenSignatureKeyMissing()
+    public void VerifyWebhookSignature_ReturnsFalse_WhenSignatureKeyMissing()
     {
         var provider = CreateProvider(out _, new PayShapSettings { SignatureKey = "" });
-        Assert.Throws<ProviderConfigurationException>(() =>
-            provider.VerifyWebhookSignature("payload", "any"));
+        Assert.False(provider.VerifyWebhookSignature("payload", "any"));
     }
 
     [Fact]

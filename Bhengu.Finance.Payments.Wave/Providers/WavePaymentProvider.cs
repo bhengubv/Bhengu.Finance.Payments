@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -26,7 +27,15 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
     private readonly WaveOptions _options;
     private readonly ILogger<WavePaymentProvider> _logger;
 
-    public string ProviderName => "wave";
+    public string ProviderName => ProviderNames.Wave;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Payout |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.MobileMoney |
+        ProviderCapabilities.RedirectFlow;
 
     public WavePaymentProvider(
         HttpClient httpClient,
@@ -71,7 +80,8 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
             Amount = request.Amount,
             Currency = request.Currency,
             ProcessedAt = DateTime.UtcNow,
-            Message = waveResponse?.WaveLaunchUrl ?? waveResponse?.CheckoutStatus
+            RedirectUrl = waveResponse?.WaveLaunchUrl,
+            Message = waveResponse?.CheckoutStatus
         };
     }
 

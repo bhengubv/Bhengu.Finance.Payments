@@ -81,7 +81,8 @@ public class StitchPaymentProviderTests
 
         Assert.Equal("pir_001", response.GatewayReference);
         Assert.Equal(PaymentStatus.Pending, response.Status);
-        Assert.Contains("secure.stitch.money", response.Message);
+        Assert.Equal("https://secure.stitch.money/pay/pir_001", response.RedirectUrl);
+        Assert.Equal("Pay-by-bank initiated", response.Message);
     }
 
     [Fact]

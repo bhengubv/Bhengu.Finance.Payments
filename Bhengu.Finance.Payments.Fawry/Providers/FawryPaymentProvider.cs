@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -30,7 +31,14 @@ public sealed class FawryPaymentProvider : IPaymentGatewayProvider
     private readonly FawryOptions _options;
     private readonly ILogger<FawryPaymentProvider> _logger;
 
-    public string ProviderName => "fawry";
+    public string ProviderName => ProviderNames.Fawry;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.RedirectFlow |
+        ProviderCapabilities.Cards;
 
     public FawryPaymentProvider(
         HttpClient httpClient,

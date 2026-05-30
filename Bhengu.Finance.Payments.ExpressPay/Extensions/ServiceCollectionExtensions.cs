@@ -1,7 +1,9 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.ExpressPay.Configuration;
 using Bhengu.Finance.Payments.ExpressPay.Providers;
 using Microsoft.Extensions.Configuration;
@@ -32,6 +34,8 @@ public static class ServiceCollectionExtensions
         services.AddHttpClient<ExpressPayPaymentProvider>();
         services.AddTransient<IPaymentGatewayProvider, ExpressPayPaymentProvider>(sp =>
             sp.GetRequiredService<ExpressPayPaymentProvider>());
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.ExpressPay, (sp, _) => sp.GetRequiredService<ExpressPayPaymentProvider>());
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

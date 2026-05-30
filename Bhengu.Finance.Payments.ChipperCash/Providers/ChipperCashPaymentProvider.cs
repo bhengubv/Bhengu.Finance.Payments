@@ -7,6 +7,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.ChipperCash.Configuration;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -26,7 +27,15 @@ public sealed class ChipperCashPaymentProvider : IPaymentGatewayProvider, IPayou
     private readonly ChipperCashOptions _options;
     private readonly ILogger<ChipperCashPaymentProvider> _logger;
 
-    public string ProviderName => "chippercash";
+    public string ProviderName => ProviderNames.ChipperCash;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Payout |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.MobileMoney |
+        ProviderCapabilities.CrossBorder;
 
     public ChipperCashPaymentProvider(
         HttpClient httpClient,

@@ -1,7 +1,9 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.TymeBank.Configuration;
 using Bhengu.Finance.Payments.TymeBank.Providers;
 using Microsoft.Extensions.Configuration;
@@ -34,6 +36,12 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<TymeBankPaymentProvider>());
         services.AddTransient<IPayoutProvider, TymeBankPaymentProvider>(sp =>
             sp.GetRequiredService<TymeBankPaymentProvider>());
+
+        // Register as keyed service so consumers can resolve by name: [FromKeyedServices(ProviderNames.TymeBank)]
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.TymeBank, (sp, _) => sp.GetRequiredService<TymeBankPaymentProvider>());
+
+        // Eager startup validation — fails the app at startup if config is broken (vs first request)
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -35,7 +36,15 @@ public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutP
     private readonly PayUIndiaOptions _options;
     private readonly ILogger<PayUIndiaPaymentProvider> _logger;
 
-    public string ProviderName => "payuindia";
+    public string ProviderName => ProviderNames.PayUIndia;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Payout |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.RedirectFlow |
+        ProviderCapabilities.Cards;
 
     public PayUIndiaPaymentProvider(
         HttpClient httpClient,
@@ -117,7 +126,7 @@ public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutP
             Amount = request.Amount,
             Currency = string.IsNullOrWhiteSpace(request.Currency) ? _options.Currency : request.Currency.ToUpperInvariant(),
             ProcessedAt = DateTime.UtcNow,
-            Message = $"Redirect to: {redirectUrl}"
+            RedirectUrl = redirectUrl
         });
     }
 

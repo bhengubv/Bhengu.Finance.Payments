@@ -87,9 +87,9 @@ public class PaymobPaymentProviderTests
         Assert.Equal("777", response.GatewayReference);
         Assert.Equal(PaymentStatus.Pending, response.Status);
         Assert.Equal(250m, response.Amount);
-        Assert.NotNull(response.Message);
-        Assert.Contains("payment_token=pay_key_xyz", response.Message);
-        Assert.Contains("iframes/99", response.Message);
+        Assert.NotNull(response.RedirectUrl);
+        Assert.Contains("payment_token=pay_key_xyz", response.RedirectUrl);
+        Assert.Contains("iframes/99", response.RedirectUrl);
     }
 
     [Fact]

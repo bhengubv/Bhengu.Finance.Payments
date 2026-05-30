@@ -1,7 +1,9 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Pesapal.Configuration;
 using Bhengu.Finance.Payments.Pesapal.Providers;
 using Microsoft.Extensions.Configuration;
@@ -32,6 +34,8 @@ public static class ServiceCollectionExtensions
         services.AddHttpClient<PesapalPaymentProvider>();
         services.AddTransient<IPaymentGatewayProvider, PesapalPaymentProvider>(sp =>
             sp.GetRequiredService<PesapalPaymentProvider>());
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Pesapal, (sp, _) => sp.GetRequiredService<PesapalPaymentProvider>());
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

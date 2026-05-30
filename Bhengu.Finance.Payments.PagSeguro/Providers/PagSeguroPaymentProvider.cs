@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -26,7 +27,15 @@ public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutP
     private readonly PagSeguroOptions _options;
     private readonly ILogger<PagSeguroPaymentProvider> _logger;
 
-    public string ProviderName => "pagseguro";
+    public string ProviderName => ProviderNames.PagSeguro;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Payout |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.Cards |
+        ProviderCapabilities.BankTransfer;
 
     public PagSeguroPaymentProvider(
         HttpClient httpClient,

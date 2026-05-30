@@ -78,12 +78,12 @@ public class IPayPaymentProviderTests
         Assert.Equal("order-001", response.GatewayReference);
         Assert.Equal(PaymentStatus.Pending, response.Status);
         Assert.Equal(250m, response.Amount);
-        Assert.NotNull(response.Message);
-        Assert.Contains("oid=order-001", response.Message);
-        Assert.Contains("ttl=250.00", response.Message);
-        Assert.Contains("vid=demo", response.Message);
-        Assert.Contains("hash=", response.Message);
-        Assert.Contains("payments.ipayafrica.com", response.Message);
+        Assert.NotNull(response.RedirectUrl);
+        Assert.Contains("oid=order-001", response.RedirectUrl);
+        Assert.Contains("ttl=250.00", response.RedirectUrl);
+        Assert.Contains("vid=demo", response.RedirectUrl);
+        Assert.Contains("hash=", response.RedirectUrl);
+        Assert.Contains("payments.ipayafrica.com", response.RedirectUrl);
     }
 
     [Fact]

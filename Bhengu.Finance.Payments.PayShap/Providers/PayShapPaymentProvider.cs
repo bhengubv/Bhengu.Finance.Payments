@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Text.Json;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -50,7 +51,13 @@ public sealed class PayShapPaymentProvider : IPaymentGatewayProvider
     private readonly PayShapSettings _settings;
     private readonly ILogger<PayShapPaymentProvider> _logger;
 
-    public string ProviderName => "payshap";
+    public string ProviderName => ProviderNames.PayShap;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.SyncSettlement |
+        ProviderCapabilities.BankTransfer;
 
     public PayShapPaymentProvider(
         IPayShapService payShapService,
@@ -143,12 +150,23 @@ public sealed class PayShapPaymentProvider : IPaymentGatewayProvider
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
         if (string.IsNullOrWhiteSpace(_settings.SignatureKey))
-            throw new ProviderConfigurationException(ProviderName, "PayShapSettings.SignatureKey is required to verify webhook signatures");
+        {
+            _logger.LogWarning("PayShap SignatureKey not configured — signature verification cannot succeed.");
+            return false;
+        }
 
-        var expected = PayShapSignatureHelper.GenerateSignature(payload, _settings.SignatureKey);
-        return System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
-            System.Text.Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
-            System.Text.Encoding.UTF8.GetBytes(expected));
+        try
+        {
+            var expected = PayShapSignatureHelper.GenerateSignature(payload, _settings.SignatureKey);
+            return System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
+                System.Text.Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
+                System.Text.Encoding.UTF8.GetBytes(expected));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "PayShap webhook signature verification raised");
+            return false;
+        }
     }
 
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)

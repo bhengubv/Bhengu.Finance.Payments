@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -26,7 +27,14 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
     private readonly PayFastOptions _options;
     private readonly ILogger<PayFastPaymentProvider> _logger;
 
-    public string ProviderName => "payfast";
+    public string ProviderName => ProviderNames.PayFast;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.RedirectFlow |
+        ProviderCapabilities.Cards;
 
     public PayFastPaymentProvider(
         HttpClient httpClient,

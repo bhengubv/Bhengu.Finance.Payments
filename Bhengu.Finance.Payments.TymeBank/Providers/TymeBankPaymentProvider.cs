@@ -7,6 +7,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -32,7 +33,15 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
     private string? _cachedToken;
     private DateTimeOffset _cachedTokenExpiresAt = DateTimeOffset.MinValue;
 
-    public string ProviderName => "tymebank";
+    public string ProviderName => ProviderNames.TymeBank;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Payout |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.SyncSettlement |
+        ProviderCapabilities.BankTransfer;
 
     public TymeBankPaymentProvider(
         HttpClient httpClient,

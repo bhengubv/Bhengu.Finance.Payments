@@ -1,7 +1,9 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Razorpay.Configuration;
 using Bhengu.Finance.Payments.Razorpay.Providers;
 using Microsoft.Extensions.Configuration;
@@ -34,6 +36,9 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<RazorpayPaymentProvider>());
         services.AddTransient<IPayoutProvider, RazorpayPaymentProvider>(sp =>
             sp.GetRequiredService<RazorpayPaymentProvider>());
+
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Razorpay, (sp, _) => sp.GetRequiredService<RazorpayPaymentProvider>());
+        services.AddBhenguPaymentStartupValidation();
 
         return services;
     }

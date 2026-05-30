@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -26,7 +27,16 @@ public sealed class HubtelPaymentProvider : IPaymentGatewayProvider, IPayoutProv
     private readonly HubtelOptions _options;
     private readonly ILogger<HubtelPaymentProvider> _logger;
 
-    public string ProviderName => "hubtel";
+    public string ProviderName => ProviderNames.Hubtel;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Payout |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.RedirectFlow |
+        ProviderCapabilities.Cards |
+        ProviderCapabilities.MobileMoney;
 
     public HubtelPaymentProvider(
         HttpClient httpClient,
@@ -88,7 +98,8 @@ public sealed class HubtelPaymentProvider : IPaymentGatewayProvider, IPayoutProv
             Amount = request.Amount,
             Currency = request.Currency,
             ProcessedAt = DateTime.UtcNow,
-            Message = checkout?.Data?.CheckoutUrl ?? checkout?.Message
+            RedirectUrl = checkout?.Data?.CheckoutUrl,
+            Message = checkout?.Message
         };
     }
 

@@ -5,6 +5,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -31,7 +32,15 @@ public sealed class PesapalPaymentProvider : IPaymentGatewayProvider
     private string? _cachedToken;
     private DateTime _tokenExpiresAtUtc;
 
-    public string ProviderName => "pesapal";
+    public string ProviderName => ProviderNames.Pesapal;
+
+    public ProviderCapabilities Capabilities =>
+        ProviderCapabilities.Charge |
+        ProviderCapabilities.Refund |
+        ProviderCapabilities.Webhook |
+        ProviderCapabilities.RedirectFlow |
+        ProviderCapabilities.Cards |
+        ProviderCapabilities.MobileMoney;
 
     public PesapalPaymentProvider(
         HttpClient httpClient,
@@ -102,7 +111,8 @@ public sealed class PesapalPaymentProvider : IPaymentGatewayProvider
             Amount = request.Amount,
             Currency = request.Currency,
             ProcessedAt = DateTime.UtcNow,
-            Message = submit?.RedirectUrl
+            RedirectUrl = submit?.RedirectUrl,
+            Message = submit?.Status
         };
     }
 
