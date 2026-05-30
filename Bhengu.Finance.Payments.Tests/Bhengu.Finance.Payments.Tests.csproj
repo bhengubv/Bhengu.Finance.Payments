@@ -31,6 +31,7 @@
     <ProjectReference Include="..\Bhengu.Finance.Payments.Paystack\Bhengu.Finance.Payments.Paystack.csproj" />
     <ProjectReference Include="..\Bhengu.Finance.Payments.PayJustNow\Bhengu.Finance.Payments.PayJustNow.csproj" />
     <ProjectReference Include="..\Bhengu.Finance.Payments.Ozow\Bhengu.Finance.Payments.Ozow.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.PayShap\Bhengu.Finance.Payments.PayShap.csproj" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Http" Version="9.0.6" />

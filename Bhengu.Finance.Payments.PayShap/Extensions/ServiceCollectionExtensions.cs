@@ -1,28 +1,31 @@
-﻿//using Bhengu.Finance.Payments.PayShap.Clients;
+﻿using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.PayShap.Client;
 using Bhengu.Finance.Payments.PayShap.Configuration;
+using Bhengu.Finance.Payments.PayShap.Providers;
 using Bhengu.Finance.Payments.PayShap.Services.Implementations;
 using Bhengu.Finance.Payments.PayShap.Services.Interfaces;
-
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
-namespace Bhengu.Finance.Payments.PayShap.Extensions
+namespace Bhengu.Finance.Payments.PayShap.Extensions;
+
+public static class ServiceCollectionExtensions
 {
-    public static class ServiceCollectionExtensions
+    /// <summary>
+    /// Register PayShap. Wires the rich <see cref="IPayShapService"/> (for proxy resolution / RTC /
+    /// EFT / account verification) AND the <see cref="PayShapPaymentProvider"/> adapter that exposes
+    /// PayShap via the generic <see cref="IPaymentGatewayProvider"/> interface for cross-provider tooling.
+    /// </summary>
+    public static IServiceCollection AddPayShapServices(this IServiceCollection services, IConfiguration configuration)
     {
-        public static IServiceCollection AddPayShapServices(this IServiceCollection services, IConfiguration configuration)
-        {
-            // Bind configuration
-            services.Configure<PayShapSettings>(configuration.GetSection(nameof(PayShapSettings)));
+        services.Configure<PayShapSettings>(configuration.GetSection(nameof(PayShapSettings)));
+        services.AddHttpClient<IPayShapClient, PayShapClient>();
+        services.AddScoped<IPayShapService, PayShapService>();
 
-            // Register HttpClient and client abstraction
-            services.AddHttpClient<IPayShapClient, PayShapClient>();
+        services.AddTransient<PayShapPaymentProvider>();
+        services.AddTransient<IPaymentGatewayProvider, PayShapPaymentProvider>(sp =>
+            sp.GetRequiredService<PayShapPaymentProvider>());
 
-            // Register core PayShap service
-            services.AddScoped<IPayShapService, PayShapService>();
-
-            return services;
-        }
+        return services;
     }
 }
