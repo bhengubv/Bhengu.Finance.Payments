@@ -1,12 +1,14 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using Bhengu.Finance.Payments.BricsPay.Configuration;
 using Bhengu.Finance.Payments.BricsPay.Currency;
 using Bhengu.Finance.Payments.BricsPay.Providers;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Tests.TestHelpers;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
@@ -16,24 +18,24 @@ namespace Bhengu.Finance.Payments.Tests.BricsPay;
 
 public class BricsPayPaymentProviderTests
 {
-    private static BricsPayPaymentProvider CreateProvider(StubHandler handler, Mock<ICurrencyExchangeService>? exchangeMock = null)
+    private static BricsPayPaymentProvider CreateProvider(StubHttpMessageHandler handler, Mock<ICurrencyExchangeService>? exchangeMock = null, BricsPayOptions? opts = null)
     {
-        var options = Options.Create(new BricsPayOptions
+        opts ??= new BricsPayOptions
         {
             MerchantId = "BRICS_TEST",
             SecretKey = "secret",
             WebhookSecret = "webhook-secret",
             UseSandbox = true
-        });
+        };
         var http = new HttpClient(handler);
         var exchange = exchangeMock ?? new Mock<ICurrencyExchangeService>();
-        return new BricsPayPaymentProvider(http, options, exchange.Object, NullLogger<BricsPayPaymentProvider>.Instance);
+        return new BricsPayPaymentProvider(http, Options.Create(opts), exchange.Object, NullLogger<BricsPayPaymentProvider>.Instance);
     }
 
     [Fact]
-    public void Constructor_ThrowsWhenMerchantIdMissing()
+    public void Constructor_Throws_WhenMerchantIdMissing()
     {
-        var handler = new StubHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK));
+        var handler = new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK));
         var ex = Assert.Throws<ProviderConfigurationException>(() =>
             new BricsPayPaymentProvider(
                 new HttpClient(handler),
@@ -44,9 +46,9 @@ public class BricsPayPaymentProviderTests
     }
 
     [Fact]
-    public void Constructor_ThrowsWhenSecretKeyMissing()
+    public void Constructor_Throws_WhenSecretKeyMissing()
     {
-        var handler = new StubHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK));
+        var handler = new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK));
         Assert.Throws<ProviderConfigurationException>(() =>
             new BricsPayPaymentProvider(
                 new HttpClient(handler),
@@ -59,8 +61,8 @@ public class BricsPayPaymentProviderTests
     public async Task ProcessPaymentAsync_SameCurrency_DoesNotInvokeExchange()
     {
         var exchange = new Mock<ICurrencyExchangeService>();
-        var handler = new StubHandler((_, _) =>
-            JsonResponse(HttpStatusCode.OK, """
+        var handler = new StubHttpMessageHandler((_, _) =>
+            StubHttpMessageHandler.Json(HttpStatusCode.OK, """
                 {"PaymentId":"BRICS-123","Status":"completed","Message":"ok"}
                 """));
 
@@ -80,25 +82,141 @@ public class BricsPayPaymentProviderTests
     }
 
     [Fact]
-    public async Task VerifyWebhookSignature_TamperedPayload_ReturnsFalse()
+    public async Task ProcessPaymentAsync_CrossCurrency_LocksRateAndUsesConvertedAmount()
     {
-        var handler = new StubHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK));
-        var provider = CreateProvider(handler);
+        var exchange = new Mock<ICurrencyExchangeService>();
+        exchange.Setup(e => e.LockRateAsync(100m, BricsCurrency.ZAR, BricsCurrency.INR, It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new ConversionResult
+            {
+                OriginalAmount = 100m,
+                OriginalCurrency = BricsCurrency.ZAR,
+                TargetCurrency = BricsCurrency.INR,
+                ExchangeRate = 4.5m,
+                FinalAmount = 450m,
+                Fee = 0m,
+                QuoteId = "QID-1",
+                QuoteExpiry = DateTime.UtcNow.AddMinutes(15)
+            });
 
-        var payload = """{"PaymentId":"x","Status":"completed"}""";
-        Assert.False(provider.VerifyWebhookSignature(payload, "wrong-signature"));
+        var handler = new StubHttpMessageHandler((_, _) =>
+            StubHttpMessageHandler.Json(HttpStatusCode.OK, """
+                {"PaymentId":"BRICS-X","Status":"completed"}
+                """));
+
+        var provider = CreateProvider(handler, exchange);
+        var response = await provider.ProcessPaymentAsync(new PaymentRequest
+        {
+            PaymentMethodToken = "tok",
+            Amount = 100m,
+            Currency = "ZAR",
+            Description = "cross-currency test",
+            Metadata = new Dictionary<string, string> { ["target_currency"] = "INR" }
+        });
+
+        Assert.Equal("INR", response.Currency);
+        Assert.Equal(450m, response.Amount);
+        exchange.Verify(e => e.LockRateAsync(100m, BricsCurrency.ZAR, BricsCurrency.INR, It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task ProcessPaymentAsync_Throws429AsProviderRateLimitException()
+    {
+        var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "rate limited"));
+        var provider = CreateProvider(handler);
+        await Assert.ThrowsAsync<ProviderRateLimitException>(() => provider.ProcessPaymentAsync(new PaymentRequest
+        {
+            PaymentMethodToken = "x",
+            Amount = 1m,
+            Currency = "ZAR",
+            Description = "d"
+        }));
+    }
+
+    [Fact]
+    public async Task ProcessPaymentAsync_Throws4xxAsPaymentDeclinedException()
+    {
+        var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.BadRequest, "declined"));
+        var provider = CreateProvider(handler);
+        await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.ProcessPaymentAsync(new PaymentRequest
+        {
+            PaymentMethodToken = "x", Amount = 1m, Currency = "ZAR", Description = "d"
+        }));
+    }
+
+    [Fact]
+    public async Task ProcessPaymentAsync_WrapsHttpRequestExceptionAsProviderUnavailableException()
+    {
+        var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("network down"));
+        var provider = CreateProvider(handler);
+        await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.ProcessPaymentAsync(new PaymentRequest
+        {
+            PaymentMethodToken = "x", Amount = 1m, Currency = "ZAR", Description = "d"
+        }));
+    }
+
+    [Fact]
+    public async Task ProcessRefundAsync_ReturnsResponse_OnSuccess()
+    {
+        var handler = new StubHttpMessageHandler((req, _) =>
+        {
+            Assert.Contains("refunds", req.RequestUri!.PathAndQuery);
+            return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
+                {"PaymentId":"BRICS-RF-1","Status":"refunded"}
+                """);
+        });
+        var provider = CreateProvider(handler);
+        var refund = await provider.ProcessRefundAsync(new RefundRequest
+        {
+            GatewayReference = "BRICS-123", Amount = 50m, Reason = "Customer requested"
+        });
+        Assert.Equal("BRICS-RF-1", refund.GatewayReference);
+        Assert.Equal(PaymentStatus.Refunded, refund.Status);
+    }
+
+    [Fact]
+    public async Task ProcessPayoutAsync_ReturnsResponse_OnSuccess()
+    {
+        var handler = new StubHttpMessageHandler((req, _) =>
+        {
+            Assert.Contains("payouts", req.RequestUri!.PathAndQuery);
+            return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
+                {"PaymentId":"BRICS-PO-1","Status":"completed"}
+                """);
+        });
+        var provider = CreateProvider(handler);
+        var payout = await provider.ProcessPayoutAsync(new PayoutRequest
+        {
+            DestinationToken = "dest-1", Amount = 200m, Currency = "ZAR", Description = "Payout to merchant"
+        });
+        Assert.Equal("BRICS-PO-1", payout.GatewayReference);
+        Assert.Equal(PaymentStatus.Completed, payout.Status);
+    }
+
+    [Fact]
+    public void VerifyWebhookSignature_ReturnsTrue_ForValidSignature()
+    {
+        const string secret = "webhook-secret";
+        const string payload = """{"EventType":"payment.completed","PaymentId":"x"}""";
+        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
+        var validSig = Convert.ToBase64String(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload)));
+        var provider = CreateProvider(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+        Assert.True(provider.VerifyWebhookSignature(payload, validSig));
+    }
+
+    [Fact]
+    public void VerifyWebhookSignature_ReturnsFalse_ForTamperedSignature()
+    {
+        var provider = CreateProvider(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+        Assert.False(provider.VerifyWebhookSignature("anything", "tampered=="));
     }
 
     [Fact]
     public async Task ParseWebhookAsync_ValidPayload_ReturnsNormalisedEvent()
     {
-        var handler = new StubHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK));
-        var provider = CreateProvider(handler);
-
-        var payload = """
+        var provider = CreateProvider(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+        var evt = await provider.ParseWebhookAsync("""
             {"EventType":"payment.completed","PaymentId":"BRICS-99","Status":"completed","Amount":100,"Currency":"ZAR"}
-            """;
-        var evt = await provider.ParseWebhookAsync(payload);
+            """);
 
         Assert.NotNull(evt);
         Assert.Equal("BRICS-99", evt!.GatewayReference);
@@ -106,14 +224,10 @@ public class BricsPayPaymentProviderTests
         Assert.Equal("payment.completed", evt.EventType);
     }
 
-    private static HttpResponseMessage JsonResponse(HttpStatusCode code, string json) =>
-        new(code) { Content = new StringContent(json, Encoding.UTF8, "application/json") };
-
-    private sealed class StubHandler : HttpMessageHandler
+    [Fact]
+    public async Task ParseWebhookAsync_ReturnsNull_ForInvalidJson()
     {
-        private readonly Func<HttpRequestMessage, CancellationToken, HttpResponseMessage> _handler;
-        public StubHandler(Func<HttpRequestMessage, CancellationToken, HttpResponseMessage> handler) => _handler = handler;
-        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) =>
-            Task.FromResult(_handler(request, ct));
+        var provider = CreateProvider(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+        Assert.Null(await provider.ParseWebhookAsync("not json"));
     }
 }

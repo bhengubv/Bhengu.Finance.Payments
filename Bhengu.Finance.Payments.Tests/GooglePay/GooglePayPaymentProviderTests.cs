@@ -28,6 +28,14 @@ public class GooglePayPaymentProviderTests
         return new GooglePayPaymentProvider(sp, Options.Create(opts), NullLogger<GooglePayPaymentProvider>.Instance);
     }
 
+    private static PaymentRequest SampleRequest(string token = ValidGPayToken) => new()
+    {
+        PaymentMethodToken = token,
+        Amount = 50m,
+        Currency = "ZAR",
+        Description = "Google Pay test"
+    };
+
     [Fact]
     public void Constructor_Throws_WhenMerchantIdMissing()
     {
@@ -39,12 +47,29 @@ public class GooglePayPaymentProviderTests
     }
 
     [Fact]
+    public void Constructor_Throws_WhenDownstreamProcessorMissing()
+    {
+        Assert.Throws<ProviderConfigurationException>(() =>
+            new GooglePayPaymentProvider(
+                new ServiceCollection().BuildServiceProvider(),
+                Options.Create(new GooglePayOptions { MerchantId = "x", DownstreamProcessor = "" }),
+                NullLogger<GooglePayPaymentProvider>.Instance));
+    }
+
+    [Fact]
     public async Task ProcessPaymentAsync_Throws_WhenTokenIsEmpty()
     {
         var provider = CreateProvider();
-        var ex = await Assert.ThrowsAsync<PaymentDeclinedException>(() =>
-            provider.ProcessPaymentAsync(SampleRequest("")));
+        var ex = await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.ProcessPaymentAsync(SampleRequest("")));
         Assert.Equal("missing_token", ex.ProviderErrorCode);
+    }
+
+    [Fact]
+    public async Task ProcessPaymentAsync_Throws_WhenTokenIsNotJson()
+    {
+        var provider = CreateProvider();
+        var ex = await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.ProcessPaymentAsync(SampleRequest("not-json")));
+        Assert.Equal("invalid_token_json", ex.ProviderErrorCode);
     }
 
     [Fact]
@@ -57,6 +82,15 @@ public class GooglePayPaymentProviderTests
     }
 
     [Fact]
+    public async Task ProcessPaymentAsync_Throws_WhenDownstreamProcessorNotRegistered()
+    {
+        var provider = CreateProvider();
+        var ex = await Assert.ThrowsAsync<ProviderConfigurationException>(() =>
+            provider.ProcessPaymentAsync(SampleRequest()));
+        Assert.Contains("DownstreamProcessor='fake'", ex.Message);
+    }
+
+    [Fact]
     public async Task ProcessPaymentAsync_ForwardsToDownstream_WithEnrichedMetadata()
     {
         var fake = new FakeDownstreamProvider();
@@ -66,30 +100,74 @@ public class GooglePayPaymentProviderTests
             services,
             new GooglePayOptions { MerchantId = "GMERCH-123", DownstreamProcessor = "fake-downstream", UseTestEnvironment = true });
 
-        var response = await provider.ProcessPaymentAsync(SampleRequest(ValidGPayToken));
+        var response = await provider.ProcessPaymentAsync(SampleRequest());
 
         Assert.Equal("FAKE-REF-1", response.GatewayReference);
         Assert.Equal("google_pay", fake.LastRequest!.Metadata!["payment_source"]);
         Assert.Equal("googlepay", fake.LastRequest.Metadata["original_provider"]);
         Assert.Equal("TEST", fake.LastRequest.Metadata["google_environment"]);
+        Assert.Equal("GMERCH-123", fake.LastRequest.Metadata["google_merchant_id"]);
     }
 
     [Fact]
-    public async Task ProcessPaymentAsync_Throws_WhenDownstreamProcessorNotRegistered()
+    public async Task ProcessPaymentAsync_PreservesCallerMetadata()
     {
-        var provider = CreateProvider();
-        var ex = await Assert.ThrowsAsync<ProviderConfigurationException>(() =>
-            provider.ProcessPaymentAsync(SampleRequest(ValidGPayToken)));
-        Assert.Contains("DownstreamProcessor='fake'", ex.Message);
+        var fake = new FakeDownstreamProvider();
+        var services = new ServiceCollection();
+        services.AddSingleton<IPaymentGatewayProvider>(fake);
+        var provider = CreateProvider(
+            services,
+            new GooglePayOptions { MerchantId = "GMERCH-123", DownstreamProcessor = "fake-downstream" });
+
+        var request = SampleRequest() with
+        {
+            Metadata = new Dictionary<string, string>
+            {
+                ["caller_correlation_id"] = "abc-123",
+                ["payment_source"] = "should_be_overridden"
+            }
+        };
+
+        await provider.ProcessPaymentAsync(request);
+
+        // Caller's other keys preserved
+        Assert.Equal("abc-123", fake.LastRequest!.Metadata!["caller_correlation_id"]);
+        // Adapter's own keys win
+        Assert.Equal("google_pay", fake.LastRequest.Metadata["payment_source"]);
     }
 
-    private static PaymentRequest SampleRequest(string token) => new()
+    [Fact]
+    public async Task ProcessRefundAsync_ForwardsToDownstream()
     {
-        PaymentMethodToken = token,
-        Amount = 50m,
-        Currency = "ZAR",
-        Description = "Google Pay test"
-    };
+        var fake = new FakeDownstreamProvider();
+        var services = new ServiceCollection();
+        services.AddSingleton<IPaymentGatewayProvider>(fake);
+        var provider = CreateProvider(
+            services,
+            new GooglePayOptions { MerchantId = "GMERCH-123", DownstreamProcessor = "fake-downstream" });
+
+        var refund = await provider.ProcessRefundAsync(new RefundRequest
+        {
+            GatewayReference = "GP-99", Amount = 25m, Reason = "Test"
+        });
+
+        Assert.Equal("REFUND-GP-99", refund.GatewayReference);
+        Assert.Equal(PaymentStatus.Refunded, refund.Status);
+    }
+
+    [Fact]
+    public void VerifyWebhookSignature_AlwaysReturnsFalse_BecauseGooglePayHasNoWebhooks()
+    {
+        var provider = CreateProvider();
+        Assert.False(provider.VerifyWebhookSignature("anything", "anything"));
+    }
+
+    [Fact]
+    public async Task ParseWebhookAsync_AlwaysReturnsNull_BecauseGooglePayHasNoWebhooks()
+    {
+        var provider = CreateProvider();
+        Assert.Null(await provider.ParseWebhookAsync("anything"));
+    }
 
     private sealed class FakeDownstreamProvider : IPaymentGatewayProvider
     {
@@ -100,18 +178,15 @@ public class GooglePayPaymentProviderTests
             LastRequest = request;
             return Task.FromResult(new PaymentResponse
             {
-                GatewayReference = "FAKE-REF-1",
-                Status = PaymentStatus.Completed,
-                Amount = request.Amount,
-                Currency = request.Currency
+                GatewayReference = "FAKE-REF-1", Status = PaymentStatus.Completed,
+                Amount = request.Amount, Currency = request.Currency
             });
         }
         public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default) =>
             Task.FromResult(new RefundResponse
             {
                 GatewayReference = $"REFUND-{request.GatewayReference}",
-                Amount = request.Amount,
-                Status = PaymentStatus.Refunded
+                Amount = request.Amount, Status = PaymentStatus.Refunded
             });
         public bool VerifyWebhookSignature(string payload, string signature) => true;
         public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default) =>
