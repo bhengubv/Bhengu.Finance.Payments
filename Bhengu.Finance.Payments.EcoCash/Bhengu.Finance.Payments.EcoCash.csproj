@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>true</IsPackable>
+    <Version>2.0.0-preview.1</Version>
+    <PackageId>Bhengu.Finance.Payments.EcoCash</PackageId>
+    <Authors>T.M. Bengu</Authors>
+    <Company>Bhengu B.V.</Company>
+    <Description>EcoCash (Zimbabwe) mobile-money gateway for the Bhengu.Finance.Payments family. C2B instant payments and refunds via the EcoCash Developers v2 REST API.</Description>
+    <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;EcoCash;Mobile Money;Zimbabwe;C2B</PackageTags>
+    <RepositoryUrl>https://github.com/bhengubv/Bhengu.Finance.Payments</RepositoryUrl>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Http" Version="9.0.6" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="9.0.6" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Core\Bhengu.Finance.Payments.Core.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,321 @@
+// © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
+
+using System.Globalization;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core.Exceptions;
+using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.MTNMoMo.Configuration;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+
+namespace Bhengu.Finance.Payments.MTNMoMo.Providers;
+
+/// <summary>
+/// MTN Mobile Money (MoMo) provider. Implements Collection (RequestToPay) and Disbursement (Transfer).
+/// <para>
+/// <b>Refund note:</b> MoMo Collection has no native refund API. Reversal must be performed
+/// as a Disbursement Transfer in the opposite direction. <see cref="ProcessRefundAsync"/> throws
+/// <see cref="BhenguPaymentException"/> directing the caller to use <see cref="ProcessPayoutAsync"/>.
+/// </para>
+/// <para>
+/// <b>Webhook signature note:</b> MoMo does NOT sign callbacks. Verification relies on the callback URL
+/// being unguessable and on matching the inbound externalId against a known transaction.
+/// </para>
+/// </summary>
+public sealed class MTNMoMoPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+{
+    private readonly HttpClient _httpClient;
+    private readonly MTNMoMoOptions _options;
+    private readonly ILogger<MTNMoMoPaymentProvider> _logger;
+    private readonly string _baseUrl;
+
+    private readonly Dictionary<string, (string Token, DateTime ExpiresUtc)> _tokenCache = new(StringComparer.Ordinal);
+    private readonly SemaphoreSlim _tokenLock = new(1, 1);
+
+    public string ProviderName => "mtnmomo";
+
+    public MTNMoMoPaymentProvider(
+        HttpClient httpClient,
+        IOptions<MTNMoMoOptions> options,
+        ILogger<MTNMoMoPaymentProvider> logger)
+    {
+        _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
+        _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
+        if (string.IsNullOrWhiteSpace(_options.SubscriptionKey))
+            throw new ProviderConfigurationException(ProviderName, $"{nameof(MTNMoMoOptions.SubscriptionKey)} is required");
+        if (string.IsNullOrWhiteSpace(_options.ApiUserId))
+            throw new ProviderConfigurationException(ProviderName, $"{nameof(MTNMoMoOptions.ApiUserId)} is required");
+        if (string.IsNullOrWhiteSpace(_options.ApiKey))
+            throw new ProviderConfigurationException(ProviderName, $"{nameof(MTNMoMoOptions.ApiKey)} is required");
+        if (string.IsNullOrWhiteSpace(_options.TargetEnvironment))
+            throw new ProviderConfigurationException(ProviderName, $"{nameof(MTNMoMoOptions.TargetEnvironment)} is required");
+
+        _baseUrl = _options.BaseUrl ?? (_options.UseSandbox
+            ? "https://sandbox.momodeveloper.mtn.com/"
+            : "https://momodeveloper.mtn.com/");
+        if (!_baseUrl.EndsWith('/')) _baseUrl += "/";
+
+        if (_httpClient.BaseAddress is null)
+            _httpClient.BaseAddress = new Uri(_baseUrl);
+    }
+
+    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        var msisdn = request.PaymentMethodToken;
+        if (string.IsNullOrWhiteSpace(msisdn))
+            throw new PaymentDeclinedException(ProviderName, "missing_msisdn",
+                "MTN MoMo RequestToPay requires the payer MSISDN in PaymentRequest.PaymentMethodToken.");
+
+        var referenceId = Guid.NewGuid().ToString();
+        var externalId = request.Metadata?.TryGetValue("external_id", out var ext) == true
+            ? ext
+            : referenceId;
+
+        var body = new
+        {
+            amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture),
+            currency = request.Currency.ToUpperInvariant(),
+            externalId,
+            payer = new { partyIdType = "MSISDN", partyId = msisdn },
+            payerMessage = request.Description,
+            payeeNote = request.Description
+        };
+
+        await SendAsync(
+            HttpMethod.Post, "collection/v1_0/requesttopay", body, ct, "RequestToPay",
+            product: "collection", referenceId: referenceId).ConfigureAwait(false);
+
+        _logger.LogInformation(
+            "MTN MoMo RequestToPay accepted: ReferenceId={ReferenceId} ExternalId={ExternalId}",
+            referenceId, externalId);
+
+        // MoMo accepts RequestToPay with HTTP 202 — actual settlement requires status poll or callback.
+        return new PaymentResponse
+        {
+            GatewayReference = referenceId,
+            Status = PaymentStatus.Pending,
+            Amount = request.Amount,
+            Currency = request.Currency,
+            ProcessedAt = DateTime.UtcNow,
+            Message = "RequestToPay accepted"
+        };
+    }
+
+    /// <summary>
+    /// MTN MoMo has no native refund API. Reverse a collection by issuing a new disbursement Transfer in
+    /// the opposite direction via <see cref="ProcessPayoutAsync"/>.
+    /// </summary>
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        throw new BhenguPaymentException(
+            ProviderName,
+            "MTN MoMo has no refund API. To reverse a collection, issue a Disbursement Transfer to the original payer's MSISDN via ProcessPayoutAsync.");
+    }
+
+    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        var referenceId = Guid.NewGuid().ToString();
+        var externalId = referenceId;
+
+        var body = new
+        {
+            amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture),
+            currency = request.Currency.ToUpperInvariant(),
+            externalId,
+            payee = new { partyIdType = "MSISDN", partyId = request.DestinationToken },
+            payerMessage = request.Description,
+            payeeNote = request.Description
+        };
+
+        await SendAsync(
+            HttpMethod.Post, "disbursement/v1_0/transfer", body, ct, "Transfer",
+            product: "disbursement", referenceId: referenceId).ConfigureAwait(false);
+
+        _logger.LogInformation(
+            "MTN MoMo Disbursement Transfer accepted: ReferenceId={ReferenceId}", referenceId);
+
+        return new PayoutResponse
+        {
+            GatewayReference = referenceId,
+            Status = PaymentStatus.Pending,
+            Amount = request.Amount,
+            Currency = request.Currency,
+            ProcessedAt = DateTime.UtcNow
+        };
+    }
+
+    /// <summary>
+    /// MoMo does NOT sign webhook payloads. Verification relies on URL secrecy + externalId matching.
+    /// Returns false to signal no cryptographic verification is possible.
+    /// </summary>
+    public bool VerifyWebhookSignature(string payload, string signature)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(payload);
+        ArgumentException.ThrowIfNullOrEmpty(signature);
+
+        _logger.LogWarning("MTN MoMo callbacks are NOT cryptographically signed. Verify externalId against a known transaction instead.");
+        return false;
+    }
+
+    public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(payload);
+
+        try
+        {
+            var evt = JsonSerializer.Deserialize<MTNMoMoCallback>(payload);
+            if (evt is null || string.IsNullOrEmpty(evt.ExternalId))
+                return Task.FromResult<WebhookEvent?>(null);
+
+            var status = MapStatus(evt.Status ?? string.Empty);
+            _logger.LogInformation(
+                "Parsed MTN MoMo callback: ExternalId={ExternalId} Status={Status}",
+                evt.ExternalId, evt.Status);
+
+            return Task.FromResult<WebhookEvent?>(new WebhookEvent
+            {
+                GatewayReference = evt.FinancialTransactionId ?? evt.ExternalId,
+                Status = status,
+                EventType = (evt.Status ?? "unknown").ToLowerInvariant()
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to parse MTN MoMo webhook payload");
+            return Task.FromResult<WebhookEvent?>(null);
+        }
+    }
+
+    // ===== HTTP plumbing =====
+
+    private async Task SendAsync(
+        HttpMethod method, string path, object body, CancellationToken ct, string operation,
+        string product, string referenceId)
+    {
+        var json = JsonSerializer.Serialize(body);
+        using var req = new HttpRequestMessage(method, path)
+        {
+            Content = new StringContent(json, Encoding.UTF8, "application/json")
+        };
+
+        var token = await GetAccessTokenAsync(product, ct).ConfigureAwait(false);
+        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        req.Headers.Add("X-Reference-Id", referenceId);
+        req.Headers.Add("X-Target-Environment", _options.TargetEnvironment);
+        req.Headers.Add("Ocp-Apim-Subscription-Key", _options.SubscriptionKey);
+        if (!string.IsNullOrWhiteSpace(_options.CallbackUrl))
+            req.Headers.Add("X-Callback-Url", _options.CallbackUrl);
+
+        HttpResponseMessage response;
+        try
+        {
+            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
+        }
+        catch (HttpRequestException ex)
+        {
+            throw new ProviderUnavailableException(ProviderName, $"HTTP request to MTN MoMo ({operation}) failed", ex);
+        }
+
+        var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+
+        if (response.StatusCode == HttpStatusCode.TooManyRequests)
+        {
+            var retryAfter = response.Headers.RetryAfter?.Delta?.TotalSeconds is double d ? (int)d : (int?)null;
+            throw new ProviderRateLimitException(ProviderName, retryAfter, responseBody);
+        }
+
+        // Per MoMo spec, RequestToPay/Transfer return HTTP 202 Accepted on success with empty body.
+        if (response.IsSuccessStatusCode) return;
+
+        _logger.LogError("MTN MoMo {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+        if ((int)response.StatusCode is >= 400 and < 500)
+            throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
+        throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
+    }
+
+    private async Task<string> GetAccessTokenAsync(string product, CancellationToken ct)
+    {
+        if (_tokenCache.TryGetValue(product, out var cached) && cached.ExpiresUtc > DateTime.UtcNow.AddMinutes(1))
+            return cached.Token;
+
+        await _tokenLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (_tokenCache.TryGetValue(product, out cached) && cached.ExpiresUtc > DateTime.UtcNow.AddMinutes(1))
+                return cached.Token;
+
+            var creds = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{_options.ApiUserId}:{_options.ApiKey}"));
+            using var req = new HttpRequestMessage(HttpMethod.Post, $"{product}/token/");
+            req.Headers.Authorization = new AuthenticationHeaderValue("Basic", creds);
+            req.Headers.Add("Ocp-Apim-Subscription-Key", _options.SubscriptionKey);
+
+            HttpResponseMessage response;
+            try
+            {
+                response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
+            }
+            catch (HttpRequestException ex)
+            {
+                throw new ProviderUnavailableException(ProviderName, $"MTN MoMo {product} OAuth call failed", ex);
+            }
+
+            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogError("MTN MoMo {Product} OAuth failed: {StatusCode} {Body}", product, response.StatusCode, body);
+                throw new ProviderUnavailableException(ProviderName, $"MTN MoMo {product} OAuth HTTP {(int)response.StatusCode}: {body}");
+            }
+
+            var token = JsonSerializer.Deserialize<MTNMoMoOAuthResponse>(body);
+            if (token is null || string.IsNullOrEmpty(token.AccessToken))
+                throw new ProviderUnavailableException(ProviderName, $"MTN MoMo {product} OAuth returned an empty token");
+
+            _tokenCache[product] = (token.AccessToken, DateTime.UtcNow.AddSeconds(token.ExpiresIn > 0 ? token.ExpiresIn : 3599));
+            return token.AccessToken;
+        }
+        finally
+        {
+            _tokenLock.Release();
+        }
+    }
+
+    private static PaymentStatus MapStatus(string raw) => raw.ToUpperInvariant() switch
+    {
+        "SUCCESSFUL" or "SUCCESS" or "COMPLETED" => PaymentStatus.Completed,
+        "PENDING" or "ONGOING" => PaymentStatus.Pending,
+        "FAILED" or "REJECTED" => PaymentStatus.Failed,
+        "CANCELLED" or "CANCELED" or "TIMEOUT" => PaymentStatus.Cancelled,
+        _ => PaymentStatus.Pending
+    };
+
+    // ===== MoMo JSON shapes (internal) =====
+
+    private sealed class MTNMoMoOAuthResponse
+    {
+        [JsonPropertyName("access_token")] public string? AccessToken { get; set; }
+        [JsonPropertyName("token_type")] public string? TokenType { get; set; }
+        [JsonPropertyName("expires_in")] public int ExpiresIn { get; set; }
+    }
+
+    private sealed class MTNMoMoCallback
+    {
+        [JsonPropertyName("financialTransactionId")] public string? FinancialTransactionId { get; set; }
+        [JsonPropertyName("externalId")] public string? ExternalId { get; set; }
+        [JsonPropertyName("amount")] public string? Amount { get; set; }
+        [JsonPropertyName("currency")] public string? Currency { get; set; }
+        [JsonPropertyName("status")] public string? Status { get; set; }
+        [JsonPropertyName("reason")] public string? Reason { get; set; }
+    }
+}

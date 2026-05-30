@@ -32,6 +32,20 @@
     <ProjectReference Include="..\Bhengu.Finance.Payments.PayJustNow\Bhengu.Finance.Payments.PayJustNow.csproj" />
     <ProjectReference Include="..\Bhengu.Finance.Payments.Ozow\Bhengu.Finance.Payments.Ozow.csproj" />
     <ProjectReference Include="..\Bhengu.Finance.Payments.PayShap\Bhengu.Finance.Payments.PayShap.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.MPesa\Bhengu.Finance.Payments.MPesa.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.MTNMoMo\Bhengu.Finance.Payments.MTNMoMo.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.AirtelMoney\Bhengu.Finance.Payments.AirtelMoney.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.OrangeMoney\Bhengu.Finance.Payments.OrangeMoney.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Interswitch\Bhengu.Finance.Payments.Interswitch.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.OPay\Bhengu.Finance.Payments.OPay.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Moniepoint\Bhengu.Finance.Payments.Moniepoint.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.ChipperCash\Bhengu.Finance.Payments.ChipperCash.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Cellulant\Bhengu.Finance.Payments.Cellulant.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.EcoCash\Bhengu.Finance.Payments.EcoCash.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Flutterwave\Bhengu.Finance.Payments.Flutterwave.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Wave\Bhengu.Finance.Payments.Wave.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.DPO\Bhengu.Finance.Payments.DPO.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Onafriq\Bhengu.Finance.Payments.Onafriq.csproj" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Http" Version="9.0.6" />

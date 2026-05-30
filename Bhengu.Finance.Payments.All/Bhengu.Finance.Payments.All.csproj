@@ -6,8 +6,8 @@
     <PackageId>Bhengu.Finance.Payments.All</PackageId>
     <Authors>T.M. Bengu</Authors>
     <Company>Bhengu B.V.</Company>
-    <Description>All Bhengu payment providers bundled together. Bhengu.Finance.Payments.PayFast;Bhengu.Finance.Payments.GooglePay;Bhengu.Finance.Payments.ApplePay;Bhengu.Finance.Payments.BricsPay;Bhengu.Finance.Payments.PayShap;Bhengu.Finance.Payments.Stripe;Bhengu.Finance.Payments.Yoco;Bhengu.Finance.Payments.Paystack;Bhengu.Finance.Payments.PayJustNow;Bhengu.Finance.Payments.Ozow</Description>
-    <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;PayFast;GooglePay;ApplePay;BricsPay;PayShap;Stripe;Yoco;Paystack;PayJustNow;Ozow</PackageTags>
+    <Description>All Bhengu payment providers bundled together. Bhengu.Finance.Payments.PayFast;Bhengu.Finance.Payments.GooglePay;Bhengu.Finance.Payments.ApplePay;Bhengu.Finance.Payments.BricsPay;Bhengu.Finance.Payments.PayShap;Bhengu.Finance.Payments.Stripe;Bhengu.Finance.Payments.Yoco;Bhengu.Finance.Payments.Paystack;Bhengu.Finance.Payments.PayJustNow;Bhengu.Finance.Payments.Ozow;Bhengu.Finance.Payments.MPesa;Bhengu.Finance.Payments.MTNMoMo;Bhengu.Finance.Payments.AirtelMoney;Bhengu.Finance.Payments.OrangeMoney;Bhengu.Finance.Payments.Interswitch;Bhengu.Finance.Payments.OPay;Bhengu.Finance.Payments.Moniepoint;Bhengu.Finance.Payments.ChipperCash;Bhengu.Finance.Payments.Wave;Bhengu.Finance.Payments.EcoCash;Bhengu.Finance.Payments.Flutterwave;Bhengu.Finance.Payments.Cellulant;Bhengu.Finance.Payments.DPO;Bhengu.Finance.Payments.Onafriq</Description>
+    <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;PayFast;GooglePay;ApplePay;BricsPay;PayShap;Stripe;Yoco;Paystack;PayJustNow;Ozow;MPesa;MTN;MoMo;AirtelMoney;OrangeMoney;Interswitch;OPay;Moniepoint;ChipperCash;Wave;EcoCash;Flutterwave;Cellulant;DPO;Onafriq;MobileMoney;Africa</PackageTags>
     <RepositoryUrl>https://github.com/bhengubv/Bhengu.Finance.Payments</RepositoryUrl>
   </PropertyGroup>
   <ItemGroup>
@@ -22,5 +22,19 @@
     <PackageReference Include="Bhengu.Finance.Payments.Paystack" Version="2.0.0-preview.1" />
     <PackageReference Include="Bhengu.Finance.Payments.PayJustNow" Version="2.0.0-preview.1" />
     <PackageReference Include="Bhengu.Finance.Payments.Ozow" Version="2.0.0-preview.1" />
+    <PackageReference Include="Bhengu.Finance.Payments.MPesa" Version="2.0.0-preview.1" />
+    <PackageReference Include="Bhengu.Finance.Payments.MTNMoMo" Version="2.0.0-preview.1" />
+    <PackageReference Include="Bhengu.Finance.Payments.AirtelMoney" Version="2.0.0-preview.1" />
+    <PackageReference Include="Bhengu.Finance.Payments.OrangeMoney" Version="2.0.0-preview.1" />
+    <PackageReference Include="Bhengu.Finance.Payments.Interswitch" Version="2.0.0-preview.1" />
+    <PackageReference Include="Bhengu.Finance.Payments.OPay" Version="2.0.0-preview.1" />
+    <PackageReference Include="Bhengu.Finance.Payments.Moniepoint" Version="2.0.0-preview.1" />
+    <PackageReference Include="Bhengu.Finance.Payments.ChipperCash" Version="2.0.0-preview.1" />
+    <PackageReference Include="Bhengu.Finance.Payments.Wave" Version="2.0.0-preview.1" />
+    <PackageReference Include="Bhengu.Finance.Payments.EcoCash" Version="2.0.0-preview.1" />
+    <PackageReference Include="Bhengu.Finance.Payments.Flutterwave" Version="2.0.0-preview.1" />
+    <PackageReference Include="Bhengu.Finance.Payments.Cellulant" Version="2.0.0-preview.1" />
+    <PackageReference Include="Bhengu.Finance.Payments.DPO" Version="2.0.0-preview.1" />
+    <PackageReference Include="Bhengu.Finance.Payments.Onafriq" Version="2.0.0-preview.1" />
   </ItemGroup>
 </Project>
