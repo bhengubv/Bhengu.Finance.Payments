@@ -17,9 +17,9 @@ namespace Bhengu.Finance.Payments.Stripe.Providers;
 /// </summary>
 public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProvider
 {
-    private readonly HttpClient _httpClient;
     private readonly StripeOptions _options;
     private readonly ILogger<StripePaymentProvider> _logger;
+    private readonly IStripeClient _stripeClient;
 
     public string ProviderName => "stripe";
 
@@ -28,14 +28,22 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
         IOptions<StripeOptions> options,
         ILogger<StripePaymentProvider> logger)
     {
-        _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
+        ArgumentNullException.ThrowIfNull(httpClient);
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(StripeOptions.SecretKey)} is required");
 
+        // Build a StripeClient that routes through the injected HttpClient. This is what makes the
+        // provider unit-testable end-to-end (HttpMessageHandler stubs intercept the requests) and
+        // also gives the consumer control over connection pooling, telemetry handlers, etc.
+        // StripeConfiguration.ApiKey is still set as a fallback for any Stripe.net code paths that
+        // bypass the client (e.g. EventUtility, which uses the static config).
         StripeConfiguration.ApiKey = _options.SecretKey;
+        _stripeClient = new StripeClient(
+            apiKey: _options.SecretKey,
+            httpClient: new SystemNetHttpClient(httpClient));
     }
 
     public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
@@ -58,7 +66,7 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
 
         try
         {
-            var service = new PaymentIntentService();
+            var service = new PaymentIntentService(_stripeClient);
             var paymentIntent = await service.CreateAsync(options, cancellationToken: ct).ConfigureAwait(false);
 
             _logger.LogInformation("Stripe PaymentIntent created: {Id} status={Status}",
@@ -99,7 +107,7 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
 
         try
         {
-            var service = new PayoutService();
+            var service = new PayoutService(_stripeClient);
             var payout = await service.CreateAsync(options, cancellationToken: ct).ConfigureAwait(false);
 
             _logger.LogInformation("Stripe Payout created: {Id} status={Status}", payout.Id, payout.Status);
@@ -137,7 +145,7 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
 
         try
         {
-            var service = new RefundService();
+            var service = new RefundService(_stripeClient);
             var refund = await service.CreateAsync(options, cancellationToken: ct).ConfigureAwait(false);
 
             _logger.LogInformation("Stripe Refund created: {Id} for PaymentIntent {PaymentIntent}",
