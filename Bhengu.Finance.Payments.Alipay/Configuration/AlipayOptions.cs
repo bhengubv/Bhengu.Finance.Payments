@@ -42,4 +42,12 @@ public sealed class AlipayOptions
 
     /// <summary>Override the sandbox base URL. Leave null to use https://open-global.alipay.com/api/sandbox.</summary>
     public string? SandboxUrl { get; set; }
+
+    /// <summary>
+    /// Override the traditional (mainland China) Alipay OpenAPI gateway used by
+    /// <see cref="Bhengu.Finance.Payments.Alipay.Providers.AlipayQrCodeProvider"/> for
+    /// <c>alipay.trade.precreate</c> / <c>alipay.trade.query</c>. Leave null to use
+    /// <c>https://openapi.alipay.com/gateway.do</c> (or <c>https://openapi.alipaydev.com/gateway.do</c> in sandbox).
+    /// </summary>
+    public string? OpenApiGatewayUrl { get; set; }
 }

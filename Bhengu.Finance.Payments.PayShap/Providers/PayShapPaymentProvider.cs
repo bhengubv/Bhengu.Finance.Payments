@@ -57,7 +57,8 @@ public sealed class PayShapPaymentProvider : IPaymentGatewayProvider
         ProviderCapabilities.Charge |
         ProviderCapabilities.Webhook |
         ProviderCapabilities.SyncSettlement |
-        ProviderCapabilities.BankTransfer;
+        ProviderCapabilities.BankTransfer |
+        ProviderCapabilities.QrCode;
 
     public PayShapPaymentProvider(
         IPayShapService payShapService,

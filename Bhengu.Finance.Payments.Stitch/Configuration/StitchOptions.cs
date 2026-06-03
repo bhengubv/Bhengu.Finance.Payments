@@ -52,4 +52,18 @@ public sealed class StitchOptions
 
     /// <summary>Sandbox base URL (default https://api-staging.stitch.money).</summary>
     public string? SandboxUrl { get; set; }
+
+    /// <summary>
+    /// OAuth2 token endpoint used by capability providers that require a bearer access_token —
+    /// notably <see cref="Providers.StitchMandateProvider"/> for DebiCheck mandate operations.
+    /// Defaults to <c>https://secure.stitch.money/connect/token</c>.
+    /// </summary>
+    public string? TokenEndpoint { get; set; }
+
+    /// <summary>
+    /// OAuth2 client secret used for the client_credentials grant when exchanging at
+    /// <see cref="TokenEndpoint"/>. Required for mandate operations. Distinct from
+    /// <see cref="ApiKey"/> which the simpler GraphQL flow uses.
+    /// </summary>
+    public string? ClientSecret { get; set; }
 }

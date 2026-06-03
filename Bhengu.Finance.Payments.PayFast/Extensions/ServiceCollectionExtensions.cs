@@ -6,6 +6,7 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.PayFast.Builders;
 using Bhengu.Finance.Payments.PayFast.Configuration;
+using Bhengu.Finance.Payments.PayFast.Internals;
 using Bhengu.Finance.Payments.PayFast.Providers;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -49,6 +50,24 @@ public static class ServiceCollectionExtensions
 
         // Register as keyed service so consumers can resolve by name: [FromKeyedServices(ProviderNames.PayFast)]
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.PayFast, (sp, _) => sp.GetRequiredService<PayFastPaymentProvider>());
+
+        // Optional contracts — Subscriptions and Mandates. PayFast natively supports both via the
+        // tokenisation / recurring billing endpoints. The in-memory plan cache and amount-limit
+        // cache must be singletons to share state across requests.
+        services.AddSingleton<PayFastPlanCache>();
+        services.AddSingleton<PayFastMandateAmountCache>();
+
+        services.AddHttpClient<PayFastSubscriptionProvider>();
+        services.AddTransient<ISubscriptionProvider, PayFastSubscriptionProvider>(sp =>
+            sp.GetRequiredService<PayFastSubscriptionProvider>());
+        services.AddKeyedTransient<ISubscriptionProvider>(ProviderNames.PayFast, (sp, _) =>
+            sp.GetRequiredService<PayFastSubscriptionProvider>());
+
+        services.AddHttpClient<PayFastMandateProvider>();
+        services.AddTransient<IMandateProvider, PayFastMandateProvider>(sp =>
+            sp.GetRequiredService<PayFastMandateProvider>());
+        services.AddKeyedTransient<IMandateProvider>(ProviderNames.PayFast, (sp, _) =>
+            sp.GetRequiredService<PayFastMandateProvider>());
 
         // Eager startup validation — fails the app at startup if config is broken (vs first request)
         services.AddBhenguPaymentStartupValidation();

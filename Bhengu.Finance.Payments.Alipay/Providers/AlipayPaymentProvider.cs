@@ -40,7 +40,8 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         ProviderCapabilities.Payout |
         ProviderCapabilities.Webhook |
         ProviderCapabilities.CrossBorder |
-        ProviderCapabilities.Cards;
+        ProviderCapabilities.Cards |
+        ProviderCapabilities.QrCode;
 
     public AlipayPaymentProvider(
         HttpClient httpClient,

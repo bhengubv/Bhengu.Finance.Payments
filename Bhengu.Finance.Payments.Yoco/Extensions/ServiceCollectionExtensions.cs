@@ -36,6 +36,27 @@ public static class ServiceCollectionExtensions
         // Register as keyed service so consumers can resolve by name: [FromKeyedServices(ProviderNames.Yoco)]
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Yoco, (sp, _) => sp.GetRequiredService<YocoPaymentProvider>());
 
+        // Optional contracts — Tokenisation, Payout, Settlement.
+        services.AddSingleton<YocoTokenCache>();
+
+        services.AddHttpClient<YocoTokenisationProvider>();
+        services.AddTransient<ITokenisationProvider, YocoTokenisationProvider>(sp =>
+            sp.GetRequiredService<YocoTokenisationProvider>());
+        services.AddKeyedTransient<ITokenisationProvider>(ProviderNames.Yoco, (sp, _) =>
+            sp.GetRequiredService<YocoTokenisationProvider>());
+
+        services.AddHttpClient<YocoPayoutProvider>();
+        services.AddTransient<IPayoutProvider, YocoPayoutProvider>(sp =>
+            sp.GetRequiredService<YocoPayoutProvider>());
+        services.AddKeyedTransient<IPayoutProvider>(ProviderNames.Yoco, (sp, _) =>
+            sp.GetRequiredService<YocoPayoutProvider>());
+
+        services.AddHttpClient<YocoSettlementProvider>();
+        services.AddTransient<ISettlementProvider, YocoSettlementProvider>(sp =>
+            sp.GetRequiredService<YocoSettlementProvider>());
+        services.AddKeyedTransient<ISettlementProvider>(ProviderNames.Yoco, (sp, _) =>
+            sp.GetRequiredService<YocoSettlementProvider>());
+
         // Eager startup validation — fails the app at startup if config is broken (vs first request)
         services.AddBhenguPaymentStartupValidation();
 

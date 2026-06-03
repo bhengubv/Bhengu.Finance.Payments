@@ -149,12 +149,19 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        var transactionId = Guid.NewGuid().ToString("N")[..16];
+        if (string.IsNullOrWhiteSpace(request.DestinationToken))
+            throw new PaymentDeclinedException(ProviderName, "invalid_msisdn",
+                "Airtel Money Disbursement requires the recipient MSISDN in PayoutRequest.DestinationToken.");
+
+        var transactionId = !string.IsNullOrWhiteSpace(request.IdempotencyKey)
+            ? request.IdempotencyKey!
+            : Guid.NewGuid().ToString("N")[..16];
+
         var body = new
         {
             payee = new { msisdn = request.DestinationToken },
-            reference = request.Description,
-            pin = string.Empty,
+            reference = transactionId,
+            pin = _options.EncryptedDisbursementPin ?? string.Empty,
             transaction = new
             {
                 amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture),
@@ -221,15 +228,58 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
             if (txn is null || string.IsNullOrEmpty(txn.Id))
                 return Task.FromResult<WebhookEvent?>(null);
 
+            var status = MapStatus(txn.StatusCode);
+            var eventType = (evt!.EventType ?? txn.StatusCode ?? "unknown").ToLowerInvariant();
+            var gatewayReference = txn.AirtelMoneyId ?? txn.Id;
+
             _logger.LogInformation(
-                "Parsed Airtel Money webhook: TransactionId={TransactionId} Status={Status}",
-                txn.Id, txn.StatusCode);
+                "Parsed Airtel Money webhook: TransactionId={TransactionId} Status={Status} EventType={EventType}",
+                txn.Id, txn.StatusCode, eventType);
+
+            // Surface disbursement / payout events as typed records so consumers can switch on the concrete type.
+            // Airtel webhook event_type strings include "disbursement", "payout" or "transfer" for outbound transactions.
+            var isPayout = eventType.Contains("disburs", StringComparison.OrdinalIgnoreCase)
+                || eventType.Contains("payout", StringComparison.OrdinalIgnoreCase)
+                || eventType.Contains("transfer", StringComparison.OrdinalIgnoreCase);
+
+            if (isPayout)
+            {
+                if (status == PaymentStatus.Completed)
+                {
+                    return Task.FromResult<WebhookEvent?>(new Bhengu.Finance.Payments.Core.Models.Webhooks.PayoutCompletedEvent
+                    {
+                        GatewayReference = gatewayReference,
+                        PayoutReference = gatewayReference,
+                        Status = status,
+                        EventType = eventType,
+                        Category = Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.PayoutCompleted,
+                        Amount = 0m,
+                        Currency = _options.Currency
+                    });
+                }
+
+                if (status == PaymentStatus.Failed)
+                {
+                    return Task.FromResult<WebhookEvent?>(new Bhengu.Finance.Payments.Core.Models.Webhooks.PayoutFailedEvent
+                    {
+                        GatewayReference = gatewayReference,
+                        PayoutReference = gatewayReference,
+                        Status = status,
+                        EventType = eventType,
+                        Category = Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.PayoutFailed,
+                        Amount = 0m,
+                        Currency = _options.Currency,
+                        FailureCode = txn.StatusCode,
+                        FailureMessage = txn.Message
+                    });
+                }
+            }
 
             return Task.FromResult<WebhookEvent?>(new WebhookEvent
             {
-                GatewayReference = txn.AirtelMoneyId ?? txn.Id,
-                Status = MapStatus(txn.StatusCode),
-                EventType = (evt!.EventType ?? txn.StatusCode ?? "unknown").ToLowerInvariant()
+                GatewayReference = gatewayReference,
+                Status = status,
+                EventType = eventType
             });
         }
         catch (Exception ex)

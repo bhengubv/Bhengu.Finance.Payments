@@ -31,6 +31,12 @@ public static class ServiceCollectionExtensions
         // Register as keyed service so consumers can resolve by name: [FromKeyedServices(ProviderNames.PayShap)]
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.PayShap, (sp, _) => sp.GetRequiredService<PayShapPaymentProvider>());
 
+        // QR code provider — deep-link payloads for PayShap QR scan-to-pay
+        services.AddTransient<PayShapQrCodeProvider>();
+        services.AddTransient<IQrCodeProvider, PayShapQrCodeProvider>(sp =>
+            sp.GetRequiredService<PayShapQrCodeProvider>());
+        services.AddKeyedTransient<IQrCodeProvider>(ProviderNames.PayShap, (sp, _) => sp.GetRequiredService<PayShapQrCodeProvider>());
+
         // Eager startup validation — fails the app at startup if config is broken (vs first request)
         services.AddBhenguPaymentStartupValidation();
 

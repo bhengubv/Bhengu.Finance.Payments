@@ -28,6 +28,13 @@ public sealed class AirtelMoneyOptions
     /// <summary>HMAC-SHA256 secret used to verify the <c>signature</c> field on inbound callbacks.</summary>
     public string WebhookSecret { get; set; } = string.Empty;
 
+    /// <summary>
+    /// For Disbursements: the initiator PIN encrypted with Airtel's RSA public key and Base64-encoded.
+    /// Must be pre-computed by the caller and rotated whenever the merchant PIN changes. UAT/sandbox
+    /// permits an empty value; production rejects empty PINs with status code <c>DP00800001003</c>.
+    /// </summary>
+    public string? EncryptedDisbursementPin { get; set; }
+
     /// <summary>Use the sandbox base URL when true.</summary>
     public bool UseSandbox { get; set; }
 

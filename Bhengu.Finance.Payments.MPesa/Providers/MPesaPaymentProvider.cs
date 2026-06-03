@@ -181,12 +181,21 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
             throw new ProviderConfigurationException(ProviderName,
                 $"M-Pesa B2C requires {nameof(MPesaOptions.InitiatorName)} and {nameof(MPesaOptions.SecurityCredential)}");
 
+        if (string.IsNullOrWhiteSpace(request.DestinationToken))
+            throw new PaymentDeclinedException(ProviderName, "invalid_msisdn",
+                "M-Pesa B2C requires the recipient MSISDN in PayoutRequest.DestinationToken (e.g. 254712345678).");
+
         var amount = (int)Math.Round(request.Amount, MidpointRounding.AwayFromZero);
+        // OriginatorConversationID is M-Pesa's idempotency knob — caller-supplied value collapses retries server-side.
+        var originatorConversationId = request.IdempotencyKey ?? Guid.NewGuid().ToString();
+        var commandId = request.Metadata?.TryGetValue("command_id", out var cid) == true ? cid : "BusinessPayment";
+
         var body = new
         {
+            OriginatorConversationID = originatorConversationId,
             InitiatorName = _options.InitiatorName,
             SecurityCredential = _options.SecurityCredential,
-            CommandID = "BusinessPayment",
+            CommandID = commandId,
             Amount = amount,
             PartyA = _options.BusinessShortCode,
             PartyB = request.DestinationToken,
@@ -197,19 +206,19 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
         };
 
         var (responseBody, _) = await SendAsync(
-            HttpMethod.Post, "mpesa/b2c/v1/paymentrequest", body, ct, "B2C", requireAuth: true).ConfigureAwait(false);
+            HttpMethod.Post, "mpesa/b2c/v3/paymentrequest", body, ct, "B2C", requireAuth: true).ConfigureAwait(false);
 
         var b2c = JsonSerializer.Deserialize<MPesaB2CResponse>(responseBody);
 
         _logger.LogInformation(
-            "M-Pesa B2C accepted: ConversationID={ConversationId} ResponseCode={ResponseCode}",
-            b2c?.ConversationID, b2c?.ResponseCode);
+            "M-Pesa B2C accepted: OriginatorConversationID={OriginatorConversationId} ConversationID={ConversationId} ResponseCode={ResponseCode}",
+            b2c?.OriginatorConversationID, b2c?.ConversationID, b2c?.ResponseCode);
 
         var status = b2c?.ResponseCode == "0" ? PaymentStatus.Pending : PaymentStatus.Failed;
 
         return new PayoutResponse
         {
-            GatewayReference = b2c?.ConversationID ?? string.Empty,
+            GatewayReference = b2c?.ConversationID ?? originatorConversationId,
             Status = status,
             Amount = request.Amount,
             Currency = request.Currency,
@@ -244,28 +253,99 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
         try
         {
             var envelope = JsonSerializer.Deserialize<MPesaCallbackEnvelope>(payload);
+
+            // STK Push (collection) callback — { "Body": { "stkCallback": { ... } } }
             var stk = envelope?.Body?.StkCallback;
-            if (stk is null || string.IsNullOrEmpty(stk.CheckoutRequestID))
-                return Task.FromResult<WebhookEvent?>(null);
-
-            var status = stk.ResultCode == 0 ? PaymentStatus.Completed : PaymentStatus.Failed;
-
-            _logger.LogInformation(
-                "Parsed M-Pesa callback: CheckoutRequestID={CheckoutRequestId} ResultCode={ResultCode}",
-                stk.CheckoutRequestID, stk.ResultCode);
-
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
+            if (stk is not null && !string.IsNullOrEmpty(stk.CheckoutRequestID))
             {
-                GatewayReference = stk.CheckoutRequestID,
-                Status = status,
-                EventType = stk.ResultCode == 0 ? "stkcallback.success" : "stkcallback.failure"
-            });
+                var status = stk.ResultCode == 0 ? PaymentStatus.Completed : PaymentStatus.Failed;
+
+                _logger.LogInformation(
+                    "Parsed M-Pesa STK callback: CheckoutRequestID={CheckoutRequestId} ResultCode={ResultCode}",
+                    stk.CheckoutRequestID, stk.ResultCode);
+
+                return Task.FromResult<WebhookEvent?>(new WebhookEvent
+                {
+                    GatewayReference = stk.CheckoutRequestID,
+                    Status = status,
+                    EventType = stk.ResultCode == 0 ? "stkcallback.success" : "stkcallback.failure",
+                    Category = stk.ResultCode == 0
+                        ? Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.ChargeSucceeded
+                        : Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.ChargeFailed
+                });
+            }
+
+            // B2C / Reversal Result callback — { "Result": { "ResultCode": 0, "ConversationID": ..., ... } }
+            var result = envelope?.Result;
+            if (result is not null && !string.IsNullOrEmpty(result.ConversationID))
+            {
+                var succeeded = result.ResultCode == 0;
+
+                _logger.LogInformation(
+                    "Parsed M-Pesa Result callback: ConversationID={ConversationId} TransactionID={TransactionId} ResultCode={ResultCode}",
+                    result.ConversationID, result.TransactionID, result.ResultCode);
+
+                // Surface as a typed payout event so consumers can switch on the concrete record.
+                if (succeeded)
+                {
+                    return Task.FromResult<WebhookEvent?>(new Bhengu.Finance.Payments.Core.Models.Webhooks.PayoutCompletedEvent
+                    {
+                        GatewayReference = result.TransactionID ?? result.ConversationID,
+                        PayoutReference = result.TransactionID ?? result.ConversationID,
+                        Status = PaymentStatus.Completed,
+                        EventType = "b2c.result.success",
+                        Category = Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.PayoutCompleted,
+                        Amount = ExtractAmount(result),
+                        Currency = "KES",
+                        DestinationToken = ExtractRecipientMsisdn(result)
+                    });
+                }
+
+                return Task.FromResult<WebhookEvent?>(new Bhengu.Finance.Payments.Core.Models.Webhooks.PayoutFailedEvent
+                {
+                    GatewayReference = result.TransactionID ?? result.ConversationID,
+                    PayoutReference = result.TransactionID ?? result.ConversationID,
+                    Status = PaymentStatus.Failed,
+                    EventType = "b2c.result.failure",
+                    Category = Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.PayoutFailed,
+                    Amount = ExtractAmount(result),
+                    Currency = "KES",
+                    FailureCode = result.ResultCode.ToString(CultureInfo.InvariantCulture),
+                    FailureMessage = result.ResultDesc
+                });
+            }
+
+            return Task.FromResult<WebhookEvent?>(null);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to parse M-Pesa webhook payload");
             return Task.FromResult<WebhookEvent?>(null);
         }
+    }
+
+    private static decimal ExtractAmount(MPesaResultCallback result)
+    {
+        if (result.ResultParameters?.ResultParameter is null) return 0m;
+        foreach (var p in result.ResultParameters.ResultParameter)
+        {
+            if (!string.Equals(p.Key, "TransactionAmount", StringComparison.OrdinalIgnoreCase)) continue;
+            if (p.Value.ValueKind == JsonValueKind.Number && p.Value.TryGetDecimal(out var d)) return d;
+            if (p.Value.ValueKind == JsonValueKind.String
+                && decimal.TryParse(p.Value.GetString(), NumberStyles.Number, CultureInfo.InvariantCulture, out var s)) return s;
+        }
+        return 0m;
+    }
+
+    private static string? ExtractRecipientMsisdn(MPesaResultCallback result)
+    {
+        if (result.ResultParameters?.ResultParameter is null) return null;
+        foreach (var p in result.ResultParameters.ResultParameter)
+        {
+            if (!string.Equals(p.Key, "ReceiverPartyPublicName", StringComparison.OrdinalIgnoreCase)) continue;
+            if (p.Value.ValueKind == JsonValueKind.String) return p.Value.GetString();
+        }
+        return null;
     }
 
     // ===== HTTP plumbing =====
@@ -403,6 +483,9 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
     private sealed class MPesaCallbackEnvelope
     {
         [JsonPropertyName("Body")] public MPesaCallbackBody? Body { get; set; }
+
+        // B2C / Reversal callbacks ship the body at the top level under "Result" — not nested in "Body".
+        [JsonPropertyName("Result")] public MPesaResultCallback? Result { get; set; }
     }
 
     private sealed class MPesaCallbackBody
@@ -416,5 +499,27 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
         [JsonPropertyName("CheckoutRequestID")] public string? CheckoutRequestID { get; set; }
         [JsonPropertyName("ResultCode")] public int ResultCode { get; set; }
         [JsonPropertyName("ResultDesc")] public string? ResultDesc { get; set; }
+    }
+
+    internal sealed class MPesaResultCallback
+    {
+        [JsonPropertyName("ResultType")] public int ResultType { get; set; }
+        [JsonPropertyName("ResultCode")] public int ResultCode { get; set; }
+        [JsonPropertyName("ResultDesc")] public string? ResultDesc { get; set; }
+        [JsonPropertyName("OriginatorConversationID")] public string? OriginatorConversationID { get; set; }
+        [JsonPropertyName("ConversationID")] public string? ConversationID { get; set; }
+        [JsonPropertyName("TransactionID")] public string? TransactionID { get; set; }
+        [JsonPropertyName("ResultParameters")] public MPesaResultParameters? ResultParameters { get; set; }
+    }
+
+    internal sealed class MPesaResultParameters
+    {
+        [JsonPropertyName("ResultParameter")] public List<MPesaResultParameter>? ResultParameter { get; set; }
+    }
+
+    internal sealed class MPesaResultParameter
+    {
+        [JsonPropertyName("Key")] public string Key { get; set; } = string.Empty;
+        [JsonPropertyName("Value")] public JsonElement Value { get; set; }
     }
 }

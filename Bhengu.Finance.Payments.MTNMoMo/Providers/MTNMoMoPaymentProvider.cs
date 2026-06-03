@@ -133,8 +133,16 @@ public sealed class MTNMoMoPaymentProvider : IPaymentGatewayProvider, IPayoutPro
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        var referenceId = Guid.NewGuid().ToString();
-        var externalId = referenceId;
+        if (string.IsNullOrWhiteSpace(request.DestinationToken))
+            throw new PaymentDeclinedException(ProviderName, "invalid_msisdn",
+                "MTN MoMo Transfer requires the payee MSISDN in PayoutRequest.DestinationToken.");
+
+        // X-Reference-Id MUST be a hyphenated v4 UUID per MoMo spec. Honour a caller-supplied
+        // IdempotencyKey when it parses as a Guid (native dedupe); otherwise mint a fresh one.
+        var referenceId = !string.IsNullOrWhiteSpace(request.IdempotencyKey) && Guid.TryParse(request.IdempotencyKey, out var parsed)
+            ? parsed.ToString()
+            : Guid.NewGuid().ToString();
+        var externalId = request.IdempotencyKey ?? referenceId;
 
         var body = new
         {
@@ -151,7 +159,8 @@ public sealed class MTNMoMoPaymentProvider : IPaymentGatewayProvider, IPayoutPro
             product: "disbursement", referenceId: referenceId).ConfigureAwait(false);
 
         _logger.LogInformation(
-            "MTN MoMo Disbursement Transfer accepted: ReferenceId={ReferenceId}", referenceId);
+            "MTN MoMo Disbursement Transfer accepted: ReferenceId={ReferenceId} ExternalId={ExternalId}",
+            referenceId, externalId);
 
         return new PayoutResponse
         {
@@ -191,11 +200,53 @@ public sealed class MTNMoMoPaymentProvider : IPaymentGatewayProvider, IPayoutPro
                 "Parsed MTN MoMo callback: ExternalId={ExternalId} Status={Status}",
                 evt.ExternalId, evt.Status);
 
+            var gatewayReference = evt.FinancialTransactionId ?? evt.ExternalId;
+            var eventType = (evt.Status ?? "unknown").ToLowerInvariant();
+            var amount = decimal.TryParse(evt.Amount, NumberStyles.Number, CultureInfo.InvariantCulture, out var a) ? a : 0m;
+            var currency = (evt.Currency ?? string.Empty).ToUpperInvariant();
+
+            // Disbursement webhooks carry a "payee" block; collection webhooks carry a "payer" block.
+            // When the payload identifies a disbursement, surface a typed payout event so consumers can switch on the concrete record.
+            var isDisbursement = evt.Payee is not null && !string.IsNullOrEmpty(evt.Payee.PartyId);
+            if (isDisbursement)
+            {
+                if (status == PaymentStatus.Completed)
+                {
+                    return Task.FromResult<WebhookEvent?>(new Bhengu.Finance.Payments.Core.Models.Webhooks.PayoutCompletedEvent
+                    {
+                        GatewayReference = gatewayReference,
+                        PayoutReference = gatewayReference,
+                        Status = status,
+                        EventType = eventType,
+                        Category = Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.PayoutCompleted,
+                        Amount = amount,
+                        Currency = currency,
+                        DestinationToken = evt.Payee?.PartyId
+                    });
+                }
+
+                if (status == PaymentStatus.Failed)
+                {
+                    return Task.FromResult<WebhookEvent?>(new Bhengu.Finance.Payments.Core.Models.Webhooks.PayoutFailedEvent
+                    {
+                        GatewayReference = gatewayReference,
+                        PayoutReference = gatewayReference,
+                        Status = status,
+                        EventType = eventType,
+                        Category = Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.PayoutFailed,
+                        Amount = amount,
+                        Currency = currency,
+                        FailureCode = evt.Reason,
+                        FailureMessage = evt.Reason
+                    });
+                }
+            }
+
             return Task.FromResult<WebhookEvent?>(new WebhookEvent
             {
-                GatewayReference = evt.FinancialTransactionId ?? evt.ExternalId,
+                GatewayReference = gatewayReference,
                 Status = status,
-                EventType = (evt.Status ?? "unknown").ToLowerInvariant()
+                EventType = eventType
             });
         }
         catch (Exception ex)
@@ -324,5 +375,13 @@ public sealed class MTNMoMoPaymentProvider : IPaymentGatewayProvider, IPayoutPro
         [JsonPropertyName("currency")] public string? Currency { get; set; }
         [JsonPropertyName("status")] public string? Status { get; set; }
         [JsonPropertyName("reason")] public string? Reason { get; set; }
+        [JsonPropertyName("payee")] public MTNMoMoParty? Payee { get; set; }
+        [JsonPropertyName("payer")] public MTNMoMoParty? Payer { get; set; }
+    }
+
+    private sealed class MTNMoMoParty
+    {
+        [JsonPropertyName("partyIdType")] public string? PartyIdType { get; set; }
+        [JsonPropertyName("partyId")] public string? PartyId { get; set; }
     }
 }

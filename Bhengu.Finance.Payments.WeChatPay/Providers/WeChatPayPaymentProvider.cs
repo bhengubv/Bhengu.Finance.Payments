@@ -40,7 +40,8 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
         ProviderCapabilities.Refund |
         ProviderCapabilities.Payout |
         ProviderCapabilities.Webhook |
-        ProviderCapabilities.Cards;
+        ProviderCapabilities.Cards |
+        ProviderCapabilities.QrCode;
 
     public WeChatPayPaymentProvider(
         HttpClient httpClient,

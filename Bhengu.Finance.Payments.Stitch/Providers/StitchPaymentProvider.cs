@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Stitch.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -40,7 +41,9 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         ProviderCapabilities.Payout |
         ProviderCapabilities.Webhook |
         ProviderCapabilities.RedirectFlow |
-        ProviderCapabilities.BankTransfer;
+        ProviderCapabilities.BankTransfer |
+        ProviderCapabilities.Mandates |
+        ProviderCapabilities.TypedWebhooks;
 
     public StitchPaymentProvider(
         HttpClient httpClient,
@@ -270,35 +273,161 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
             _logger.LogInformation("Parsed Stitch webhook: type={Type} id={Id}",
                 webhookEvent.EventType, webhookEvent.Data?.Id);
 
-            var status = webhookEvent.EventType?.ToLowerInvariant() switch
-            {
-                "paymentinitiationrequest.completed" or "payment.completed" or "payment.settled"
-                    => PaymentStatus.Completed,
-                "paymentinitiationrequest.pending" or "payment.pending" => PaymentStatus.Pending,
-                "paymentinitiationrequest.failed" or "payment.failed" or "payment.rejected"
-                    => PaymentStatus.Failed,
-                "paymentinitiationrequest.cancelled" or "paymentinitiationrequest.canceled"
-                    => PaymentStatus.Cancelled,
-                "payment.refunded" or "refund.completed" => PaymentStatus.Refunded,
-                _ => (PaymentStatus?)null
-            };
-
-            var reference = webhookEvent.Data?.Id;
-            if (status is null || string.IsNullOrEmpty(reference))
-                return Task.FromResult<WebhookEvent?>(null);
-
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
-            {
-                GatewayReference = reference,
-                Status = status.Value,
-                EventType = webhookEvent.EventType
-            });
+            var typed = MapTypedEvent(webhookEvent);
+            return Task.FromResult(typed);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to parse Stitch webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
+    }
+
+    // Map Stitch event name → strongly-typed Bhengu webhook sub-record. Stitch fires events for
+    // pay-by-bank payments (paymentInitiationRequest.*), DebiCheck mandate lifecycle
+    // (paymentInitiation.*), DebiCheck debits (debit.*), refunds, and payouts.
+    // Unrecognised events return null so consumers don't get false signals.
+    private static WebhookEvent? MapTypedEvent(StitchWebhookEvent evt)
+    {
+        var eventName = evt.EventType?.ToLowerInvariant();
+        var data = evt.Data;
+        if (string.IsNullOrEmpty(eventName) || data?.Id is null or "") return null;
+
+        var reference = data.Id;
+        var amount = decimal.TryParse(data.Amount?.Quantity, NumberStyles.Number, CultureInfo.InvariantCulture, out var q) ? q : 0m;
+        var currency = data.Amount?.Currency ?? "ZAR";
+
+        return eventName switch
+        {
+            // Pay-by-bank lifecycle — settled
+            "paymentinitiationrequest.completed" or "payment.completed" or "payment.settled" or "debit.completed"
+                => new ChargeSucceededEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Completed,
+                    EventType = evt.EventType,
+                    Category = WebhookEventCategory.ChargeSucceeded,
+                    Amount = amount,
+                    Currency = currency,
+                    CustomerId = data.Payer?.Reference,
+                    PaymentMethodToken = reference
+                },
+
+            // Pay-by-bank lifecycle — pending
+            "paymentinitiationrequest.pending" or "payment.pending"
+                => new ChargePendingEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Pending,
+                    EventType = evt.EventType,
+                    Category = WebhookEventCategory.ChargePending,
+                    Amount = amount,
+                    Currency = currency
+                },
+
+            // Pay-by-bank lifecycle — failure / decline
+            "paymentinitiationrequest.failed" or "payment.failed" or "payment.rejected" or "debit.failed"
+                => new ChargeFailedEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Failed,
+                    EventType = evt.EventType,
+                    Category = WebhookEventCategory.ChargeFailed,
+                    Amount = amount,
+                    Currency = currency,
+                    FailureCode = data.Status,
+                    FailureMessage = data.Status
+                },
+
+            // Pay-by-bank lifecycle — cancellation
+            "paymentinitiationrequest.cancelled" or "paymentinitiationrequest.canceled"
+                => new WebhookEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Cancelled,
+                    EventType = evt.EventType,
+                    Category = WebhookEventCategory.Unknown
+                },
+
+            // Refund lifecycle
+            "payment.refunded" or "refund.completed"
+                => new RefundSucceededEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Refunded,
+                    EventType = evt.EventType,
+                    Category = WebhookEventCategory.RefundSucceeded,
+                    RefundReference = reference,
+                    Amount = amount,
+                    Currency = currency,
+                    IsPartial = false
+                },
+
+            "refund.failed"
+                => new RefundFailedEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Failed,
+                    EventType = evt.EventType,
+                    Category = WebhookEventCategory.RefundFailed,
+                    Amount = amount,
+                    Currency = currency
+                },
+
+            // DebiCheck mandate lifecycle
+            "paymentinitiation.completed" or "paymentinitiation.authorized" or "paymentinitiation.authorised"
+            or "mandate.activated" or "mandate.authorized"
+                => new MandateActivatedEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Completed,
+                    EventType = evt.EventType,
+                    Category = WebhookEventCategory.MandateActivated,
+                    MandateReference = reference,
+                    AmountLimit = amount == 0m ? null : amount,
+                    Currency = currency
+                },
+
+            "paymentinitiation.cancelled" or "paymentinitiation.canceled"
+            or "mandate.cancelled" or "mandate.canceled"
+                => new MandateCancelledEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Cancelled,
+                    EventType = evt.EventType,
+                    Category = WebhookEventCategory.MandateCancelled,
+                    MandateReference = reference,
+                    CancellationReason = data.Status ?? "cancelled"
+                },
+
+            // Payout lifecycle (clientPayoutInitiationRequest.*)
+            "payoutinitiationrequest.completed" or "payout.completed" or "payout.settled"
+                => new PayoutCompletedEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Completed,
+                    EventType = evt.EventType,
+                    Category = WebhookEventCategory.PayoutCompleted,
+                    PayoutReference = reference,
+                    Amount = amount,
+                    Currency = currency
+                },
+
+            "payoutinitiationrequest.failed" or "payout.failed"
+                => new PayoutFailedEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Failed,
+                    EventType = evt.EventType,
+                    Category = WebhookEventCategory.PayoutFailed,
+                    PayoutReference = reference,
+                    Amount = amount,
+                    Currency = currency,
+                    FailureCode = data.Status
+                },
+
+            _ => null
+        };
     }
 
     private async Task<string> SendGraphqlAsync(string query, object variables, CancellationToken ct, string operation)
@@ -427,5 +556,18 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
     {
         [JsonPropertyName("id")] public string? Id { get; set; }
         [JsonPropertyName("status")] public string? Status { get; set; }
+        [JsonPropertyName("amount")] public StitchWebhookMoney? Amount { get; set; }
+        [JsonPropertyName("payer")] public StitchWebhookPayer? Payer { get; set; }
+    }
+
+    private sealed class StitchWebhookMoney
+    {
+        [JsonPropertyName("quantity")] public string? Quantity { get; set; }
+        [JsonPropertyName("currency")] public string? Currency { get; set; }
+    }
+
+    private sealed class StitchWebhookPayer
+    {
+        [JsonPropertyName("reference")] public string? Reference { get; set; }
     }
 }

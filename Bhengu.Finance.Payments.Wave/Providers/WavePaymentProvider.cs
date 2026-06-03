@@ -89,6 +89,10 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
     {
         ArgumentNullException.ThrowIfNull(request);
 
+        if (string.IsNullOrWhiteSpace(request.DestinationToken))
+            throw new PaymentDeclinedException(ProviderName, "invalid_msisdn",
+                "Wave Payout requires the recipient MSISDN in PayoutRequest.DestinationToken.");
+
         // DestinationToken format: "<countryCode>:<phone>" (e.g. "SN:221761234567") OR raw phone.
         string countryCode = "SN";
         string phone = request.DestinationToken;
@@ -98,6 +102,11 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
             countryCode = request.DestinationToken[..colon];
             phone = request.DestinationToken[(colon + 1)..];
         }
+
+        // Wave natively supports idempotency_key — same key collapses retries server-side.
+        var idempotencyKey = string.IsNullOrWhiteSpace(request.IdempotencyKey)
+            ? $"payout-{Guid.NewGuid():N}"
+            : request.IdempotencyKey!;
 
         var requestBody = new
         {
@@ -109,13 +118,17 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
                 country_code = countryCode
             },
             name = request.Description,
-            client_reference = $"payout-{Guid.NewGuid():N}"
+            payment_reason = request.Description,
+            idempotency_key = idempotencyKey,
+            client_reference = idempotencyKey
         };
 
-        var body = await SendAsync(HttpMethod.Post, "v1/payouts", requestBody, ct, "ProcessPayout").ConfigureAwait(false);
+        var body = await SendAsync(HttpMethod.Post, "v1/payout", requestBody, ct, "ProcessPayout").ConfigureAwait(false);
         var payoutResponse = JsonSerializer.Deserialize<WavePayoutResponse>(body);
 
-        _logger.LogInformation("Wave payout created: {Id} status={Status}", payoutResponse?.Id, payoutResponse?.Status);
+        _logger.LogInformation(
+            "Wave payout created: Id={Id} Status={Status} IdempotencyKey={IdempotencyKey}",
+            payoutResponse?.Id, payoutResponse?.Status, idempotencyKey);
 
         return new PayoutResponse
         {
@@ -203,18 +216,52 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
 
             _logger.LogInformation("Parsed Wave webhook event: {EventType}", webhookEvent.Type);
 
-            var status = webhookEvent.Type?.ToLowerInvariant() switch
+            var lowerType = webhookEvent.Type?.ToLowerInvariant();
+            var status = lowerType switch
             {
                 "checkout.session.completed" or "checkout.session.payment_succeeded" => PaymentStatus.Completed,
                 "checkout.session.payment_failed" => PaymentStatus.Failed,
                 "merchant.payment_refunded" or "checkout.session.refunded" => PaymentStatus.Refunded,
-                "payout.completed" => PaymentStatus.Completed,
+                "payout.completed" or "payout.succeeded" => PaymentStatus.Completed,
                 "payout.failed" => PaymentStatus.Failed,
                 _ => (PaymentStatus?)null
             };
 
             if (status is null || string.IsNullOrEmpty(webhookEvent.Data?.Id))
                 return Task.FromResult<WebhookEvent?>(null);
+
+            // Surface payout events as typed records so consumers can switch on the concrete type.
+            if (lowerType is "payout.completed" or "payout.succeeded")
+            {
+                var amount = decimal.TryParse(webhookEvent.Data?.Amount, System.Globalization.NumberStyles.Number,
+                    System.Globalization.CultureInfo.InvariantCulture, out var a) ? a : 0m;
+                return Task.FromResult<WebhookEvent?>(new Bhengu.Finance.Payments.Core.Models.Webhooks.PayoutCompletedEvent
+                {
+                    GatewayReference = webhookEvent.Data!.Id!,
+                    PayoutReference = webhookEvent.Data.Id!,
+                    Status = status.Value,
+                    EventType = webhookEvent.Type,
+                    Category = Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.PayoutCompleted,
+                    Amount = amount,
+                    Currency = webhookEvent.Data.Currency ?? _options.Currency
+                });
+            }
+
+            if (lowerType == "payout.failed")
+            {
+                var amount = decimal.TryParse(webhookEvent.Data?.Amount, System.Globalization.NumberStyles.Number,
+                    System.Globalization.CultureInfo.InvariantCulture, out var a) ? a : 0m;
+                return Task.FromResult<WebhookEvent?>(new Bhengu.Finance.Payments.Core.Models.Webhooks.PayoutFailedEvent
+                {
+                    GatewayReference = webhookEvent.Data!.Id!,
+                    PayoutReference = webhookEvent.Data.Id!,
+                    Status = status.Value,
+                    EventType = webhookEvent.Type,
+                    Category = Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.PayoutFailed,
+                    Amount = amount,
+                    Currency = webhookEvent.Data.Currency ?? _options.Currency
+                });
+            }
 
             return Task.FromResult<WebhookEvent?>(new WebhookEvent
             {

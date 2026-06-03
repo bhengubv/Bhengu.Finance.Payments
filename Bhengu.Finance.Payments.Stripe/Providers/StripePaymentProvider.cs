@@ -4,6 +4,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Stripe.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -30,7 +31,17 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
         ProviderCapabilities.Payout |
         ProviderCapabilities.Webhook |
         ProviderCapabilities.SyncSettlement |
-        ProviderCapabilities.Cards;
+        ProviderCapabilities.Cards |
+        ProviderCapabilities.Tokenisation |
+        ProviderCapabilities.Subscriptions |
+        ProviderCapabilities.ThreeDSecure |
+        ProviderCapabilities.Disputes |
+        ProviderCapabilities.Settlement |
+        ProviderCapabilities.Mandates |
+        ProviderCapabilities.Marketplace |
+        ProviderCapabilities.Idempotency |
+        ProviderCapabilities.TypedWebhooks |
+        ProviderCapabilities.PartialRefund;
 
     public StripePaymentProvider(
         HttpClient httpClient,
@@ -76,7 +87,7 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
         try
         {
             var service = new PaymentIntentService(_stripeClient);
-            var paymentIntent = await service.CreateAsync(options, cancellationToken: ct).ConfigureAwait(false);
+            var paymentIntent = await service.CreateAsync(options, BuildRequestOptions(request.IdempotencyKey), ct).ConfigureAwait(false);
 
             _logger.LogInformation("Stripe PaymentIntent created: {Id} status={Status}",
                 paymentIntent.Id, paymentIntent.Status);
@@ -117,7 +128,7 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
         try
         {
             var service = new PayoutService(_stripeClient);
-            var payout = await service.CreateAsync(options, cancellationToken: ct).ConfigureAwait(false);
+            var payout = await service.CreateAsync(options, BuildRequestOptions(request.IdempotencyKey), ct).ConfigureAwait(false);
 
             _logger.LogInformation("Stripe Payout created: {Id} status={Status}", payout.Id, payout.Status);
 
@@ -155,7 +166,7 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
         try
         {
             var service = new RefundService(_stripeClient);
-            var refund = await service.CreateAsync(options, cancellationToken: ct).ConfigureAwait(false);
+            var refund = await service.CreateAsync(options, BuildRequestOptions(request.IdempotencyKey), ct).ConfigureAwait(false);
 
             _logger.LogInformation("Stripe Refund created: {Id} for PaymentIntent {PaymentIntent}",
                 refund.Id, request.GatewayReference);
@@ -208,44 +219,13 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
 
         try
         {
-            var stripeEvent = EventUtility.ParseEvent(payload);
+            // throwOnApiVersionMismatch:false lets the SDK keep up across Stripe API minor versions
+            // without forcing every consumer to upgrade Stripe.net the day the new version ships.
+            var stripeEvent = EventUtility.ParseEvent(payload, throwOnApiVersionMismatch: false);
             _logger.LogInformation("Parsed Stripe webhook event: {EventType}", stripeEvent.Type);
 
-            string? gatewayReference = null;
-            PaymentStatus status;
-
-            switch (stripeEvent.Type)
-            {
-                case "payment_intent.succeeded":
-                    gatewayReference = (stripeEvent.Data.Object as PaymentIntent)?.Id;
-                    status = PaymentStatus.Completed;
-                    break;
-                case "payment_intent.payment_failed":
-                    gatewayReference = (stripeEvent.Data.Object as PaymentIntent)?.Id;
-                    status = PaymentStatus.Failed;
-                    break;
-                case "payment_intent.canceled":
-                    gatewayReference = (stripeEvent.Data.Object as PaymentIntent)?.Id;
-                    status = PaymentStatus.Cancelled;
-                    break;
-                case "charge.refunded":
-                    gatewayReference = (stripeEvent.Data.Object as Charge)?.PaymentIntentId
-                        ?? (stripeEvent.Data.Object as Charge)?.Id;
-                    status = PaymentStatus.Refunded;
-                    break;
-                default:
-                    return Task.FromResult<WebhookEvent?>(null);
-            }
-
-            if (string.IsNullOrEmpty(gatewayReference))
-                return Task.FromResult<WebhookEvent?>(null);
-
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
-            {
-                GatewayReference = gatewayReference,
-                Status = status,
-                EventType = stripeEvent.Type
-            });
+            var typed = MapStripeEvent(stripeEvent);
+            return Task.FromResult(typed);
         }
         catch (Exception ex)
         {
@@ -253,6 +233,324 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
+
+    private static WebhookEvent? MapStripeEvent(Event stripeEvent)
+    {
+        switch (stripeEvent.Type)
+        {
+            case "charge.succeeded":
+            {
+                if (stripeEvent.Data.Object is not Charge ch) return null;
+                return new ChargeSucceededEvent
+                {
+                    GatewayReference = ch.PaymentIntentId ?? ch.Id,
+                    Status = PaymentStatus.Completed,
+                    EventType = stripeEvent.Type,
+                    Category = WebhookEventCategory.ChargeSucceeded,
+                    Amount = ch.Amount / 100m,
+                    Currency = (ch.Currency ?? "usd").ToUpperInvariant(),
+                    CustomerId = ch.CustomerId,
+                    PaymentMethodToken = ch.PaymentMethod
+                };
+            }
+            case "charge.failed":
+            {
+                if (stripeEvent.Data.Object is not Charge ch) return null;
+                return new ChargeFailedEvent
+                {
+                    GatewayReference = ch.PaymentIntentId ?? ch.Id,
+                    Status = PaymentStatus.Failed,
+                    EventType = stripeEvent.Type,
+                    Category = WebhookEventCategory.ChargeFailed,
+                    Amount = ch.Amount / 100m,
+                    Currency = (ch.Currency ?? "usd").ToUpperInvariant(),
+                    FailureCode = ch.FailureCode,
+                    FailureMessage = ch.FailureMessage
+                };
+            }
+            case "charge.pending":
+            {
+                if (stripeEvent.Data.Object is not Charge ch) return null;
+                return new ChargePendingEvent
+                {
+                    GatewayReference = ch.PaymentIntentId ?? ch.Id,
+                    Status = PaymentStatus.Pending,
+                    EventType = stripeEvent.Type,
+                    Category = WebhookEventCategory.ChargePending,
+                    Amount = ch.Amount / 100m,
+                    Currency = (ch.Currency ?? "usd").ToUpperInvariant()
+                };
+            }
+            case "payment_intent.succeeded":
+            {
+                if (stripeEvent.Data.Object is not PaymentIntent pi) return null;
+                return new ChargeSucceededEvent
+                {
+                    GatewayReference = pi.Id,
+                    Status = PaymentStatus.Completed,
+                    EventType = stripeEvent.Type,
+                    Category = WebhookEventCategory.ChargeSucceeded,
+                    Amount = pi.Amount / 100m,
+                    Currency = (pi.Currency ?? "usd").ToUpperInvariant(),
+                    CustomerId = pi.CustomerId,
+                    PaymentMethodToken = pi.PaymentMethodId
+                };
+            }
+            case "payment_intent.payment_failed":
+            {
+                if (stripeEvent.Data.Object is not PaymentIntent pi) return null;
+                return new ChargeFailedEvent
+                {
+                    GatewayReference = pi.Id,
+                    Status = PaymentStatus.Failed,
+                    EventType = stripeEvent.Type,
+                    Category = WebhookEventCategory.ChargeFailed,
+                    Amount = pi.Amount / 100m,
+                    Currency = (pi.Currency ?? "usd").ToUpperInvariant(),
+                    FailureCode = pi.LastPaymentError?.Code,
+                    FailureMessage = pi.LastPaymentError?.Message
+                };
+            }
+            case "payment_intent.canceled":
+            {
+                if (stripeEvent.Data.Object is not PaymentIntent pi) return null;
+                return new WebhookEvent
+                {
+                    GatewayReference = pi.Id,
+                    Status = PaymentStatus.Cancelled,
+                    EventType = stripeEvent.Type,
+                    Category = WebhookEventCategory.Unknown
+                };
+            }
+            case "charge.refunded":
+            {
+                if (stripeEvent.Data.Object is not Charge ch) return null;
+                var refund = ch.Refunds?.Data?.LastOrDefault();
+                var isPartial = ch.AmountRefunded < ch.Amount;
+                return new RefundSucceededEvent
+                {
+                    GatewayReference = ch.PaymentIntentId ?? ch.Id,
+                    Status = PaymentStatus.Refunded,
+                    EventType = stripeEvent.Type,
+                    Category = WebhookEventCategory.RefundSucceeded,
+                    RefundReference = refund?.Id ?? ch.Id,
+                    Amount = (refund?.Amount ?? ch.AmountRefunded) / 100m,
+                    Currency = (ch.Currency ?? "usd").ToUpperInvariant(),
+                    IsPartial = isPartial
+                };
+            }
+            case "refund.created":
+            case "refund.updated":
+            {
+                if (stripeEvent.Data.Object is not Refund r) return null;
+                if (r.Status?.Equals("succeeded", StringComparison.OrdinalIgnoreCase) == true)
+                {
+                    return new RefundSucceededEvent
+                    {
+                        GatewayReference = r.PaymentIntentId ?? r.ChargeId ?? r.Id,
+                        Status = PaymentStatus.Refunded,
+                        EventType = stripeEvent.Type,
+                        Category = WebhookEventCategory.RefundSucceeded,
+                        RefundReference = r.Id,
+                        Amount = r.Amount / 100m,
+                        Currency = (r.Currency ?? "usd").ToUpperInvariant(),
+                        IsPartial = false
+                    };
+                }
+                return null;
+            }
+            case "refund.failed":
+            {
+                if (stripeEvent.Data.Object is not Refund r) return null;
+                return new RefundFailedEvent
+                {
+                    GatewayReference = r.PaymentIntentId ?? r.ChargeId ?? r.Id,
+                    Status = PaymentStatus.Failed,
+                    EventType = stripeEvent.Type,
+                    Category = WebhookEventCategory.RefundFailed,
+                    Amount = r.Amount / 100m,
+                    Currency = (r.Currency ?? "usd").ToUpperInvariant(),
+                    FailureCode = r.FailureReason,
+                    FailureMessage = r.FailureReason
+                };
+            }
+            case "charge.dispute.created":
+            {
+                if (stripeEvent.Data.Object is not Dispute d) return null;
+                return new DisputeOpenedEvent
+                {
+                    GatewayReference = d.ChargeId ?? d.PaymentIntentId ?? d.Id,
+                    Status = PaymentStatus.Pending,
+                    EventType = stripeEvent.Type,
+                    Category = WebhookEventCategory.DisputeOpened,
+                    DisputeReference = d.Id,
+                    Amount = d.Amount / 100m,
+                    Currency = (d.Currency ?? "usd").ToUpperInvariant(),
+                    ReasonCode = d.Reason,
+                    EvidenceDueBy = d.EvidenceDetails?.DueBy
+                };
+            }
+            case "charge.dispute.closed":
+            {
+                if (stripeEvent.Data.Object is not Dispute d) return null;
+                if (d.Status?.Equals("won", StringComparison.OrdinalIgnoreCase) == true)
+                {
+                    return new DisputeWonEvent
+                    {
+                        GatewayReference = d.ChargeId ?? d.PaymentIntentId ?? d.Id,
+                        Status = PaymentStatus.Completed,
+                        EventType = stripeEvent.Type,
+                        Category = WebhookEventCategory.DisputeWon,
+                        DisputeReference = d.Id,
+                        Amount = d.Amount / 100m,
+                        Currency = (d.Currency ?? "usd").ToUpperInvariant()
+                    };
+                }
+                if (d.Status?.Equals("lost", StringComparison.OrdinalIgnoreCase) == true)
+                {
+                    return new DisputeLostEvent
+                    {
+                        GatewayReference = d.ChargeId ?? d.PaymentIntentId ?? d.Id,
+                        Status = PaymentStatus.Refunded,
+                        EventType = stripeEvent.Type,
+                        Category = WebhookEventCategory.DisputeLost,
+                        DisputeReference = d.Id,
+                        Amount = d.Amount / 100m,
+                        Currency = (d.Currency ?? "usd").ToUpperInvariant(),
+                        ChargebackFee = d.BalanceTransactions?.FirstOrDefault()?.Fee / 100m
+                    };
+                }
+                return null;
+            }
+            case "customer.subscription.created":
+            {
+                if (stripeEvent.Data.Object is not Subscription sub) return null;
+                return new SubscriptionCreatedEvent
+                {
+                    GatewayReference = sub.Id,
+                    Status = PaymentStatus.Pending,
+                    EventType = stripeEvent.Type,
+                    Category = WebhookEventCategory.SubscriptionCreated,
+                    SubscriptionReference = sub.Id,
+                    PlanReference = sub.Items?.Data?.FirstOrDefault()?.Plan?.Id ?? sub.Items?.Data?.FirstOrDefault()?.Price?.Id ?? string.Empty,
+                    CustomerId = sub.CustomerId,
+                    NextBillingAt = sub.CurrentPeriodEnd == default ? null : sub.CurrentPeriodEnd
+                };
+            }
+            case "customer.subscription.updated":
+            {
+                if (stripeEvent.Data.Object is not Subscription sub) return null;
+                if (sub.Status?.Equals("active", StringComparison.OrdinalIgnoreCase) == true)
+                {
+                    return new SubscriptionRenewedEvent
+                    {
+                        GatewayReference = sub.Id,
+                        Status = PaymentStatus.Completed,
+                        EventType = stripeEvent.Type,
+                        Category = WebhookEventCategory.SubscriptionRenewed,
+                        SubscriptionReference = sub.Id,
+                        Amount = (sub.Items?.Data?.FirstOrDefault()?.Plan?.Amount ?? 0L) / 100m,
+                        Currency = (sub.Currency ?? "usd").ToUpperInvariant(),
+                        NextBillingAt = sub.CurrentPeriodEnd == default ? null : sub.CurrentPeriodEnd
+                    };
+                }
+                return null;
+            }
+            case "customer.subscription.deleted":
+            {
+                if (stripeEvent.Data.Object is not Subscription sub) return null;
+                return new SubscriptionCancelledEvent
+                {
+                    GatewayReference = sub.Id,
+                    Status = PaymentStatus.Cancelled,
+                    EventType = stripeEvent.Type,
+                    Category = WebhookEventCategory.SubscriptionCancelled,
+                    SubscriptionReference = sub.Id,
+                    CancellationReason = sub.CancellationDetails?.Reason
+                };
+            }
+            case "invoice.payment_failed":
+            {
+                if (stripeEvent.Data.Object is not Invoice inv) return null;
+                var subRef = inv.SubscriptionId ?? inv.Id;
+                return new SubscriptionChargeFailedEvent
+                {
+                    GatewayReference = subRef,
+                    Status = PaymentStatus.Failed,
+                    EventType = stripeEvent.Type,
+                    Category = WebhookEventCategory.SubscriptionChargeFailed,
+                    SubscriptionReference = subRef,
+                    Amount = inv.AmountDue / 100m,
+                    Currency = (inv.Currency ?? "usd").ToUpperInvariant(),
+                    FailureCode = inv.LastFinalizationError?.Code,
+                    NextRetryAt = inv.NextPaymentAttempt
+                };
+            }
+            case "payout.paid":
+            {
+                if (stripeEvent.Data.Object is not Payout p) return null;
+                return new PayoutCompletedEvent
+                {
+                    GatewayReference = p.Id,
+                    Status = PaymentStatus.Completed,
+                    EventType = stripeEvent.Type,
+                    Category = WebhookEventCategory.PayoutCompleted,
+                    PayoutReference = p.Id,
+                    Amount = p.Amount / 100m,
+                    Currency = (p.Currency ?? "usd").ToUpperInvariant(),
+                    DestinationToken = p.DestinationId
+                };
+            }
+            case "payout.failed":
+            {
+                if (stripeEvent.Data.Object is not Payout p) return null;
+                return new PayoutFailedEvent
+                {
+                    GatewayReference = p.Id,
+                    Status = PaymentStatus.Failed,
+                    EventType = stripeEvent.Type,
+                    Category = WebhookEventCategory.PayoutFailed,
+                    PayoutReference = p.Id,
+                    Amount = p.Amount / 100m,
+                    Currency = (p.Currency ?? "usd").ToUpperInvariant(),
+                    FailureCode = p.FailureCode,
+                    FailureMessage = p.FailureMessage
+                };
+            }
+            case "mandate.updated":
+            {
+                if (stripeEvent.Data.Object is not Mandate m) return null;
+                if (m.Status?.Equals("active", StringComparison.OrdinalIgnoreCase) == true)
+                {
+                    return new MandateActivatedEvent
+                    {
+                        GatewayReference = m.Id,
+                        Status = PaymentStatus.Completed,
+                        EventType = stripeEvent.Type,
+                        Category = WebhookEventCategory.MandateActivated,
+                        MandateReference = m.Id
+                    };
+                }
+                if (m.Status?.Equals("inactive", StringComparison.OrdinalIgnoreCase) == true)
+                {
+                    return new MandateCancelledEvent
+                    {
+                        GatewayReference = m.Id,
+                        Status = PaymentStatus.Cancelled,
+                        EventType = stripeEvent.Type,
+                        Category = WebhookEventCategory.MandateCancelled,
+                        MandateReference = m.Id
+                    };
+                }
+                return null;
+            }
+            default:
+                return null;
+        }
+    }
+
+    private static RequestOptions? BuildRequestOptions(string? idempotencyKey) =>
+        string.IsNullOrEmpty(idempotencyKey) ? null : new RequestOptions { IdempotencyKey = idempotencyKey };
 
     private BhenguPaymentException TranslateException(StripeException ex, string operation)
     {

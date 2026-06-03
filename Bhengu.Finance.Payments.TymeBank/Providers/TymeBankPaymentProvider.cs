@@ -11,6 +11,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.TymeBank.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -41,7 +42,9 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         ProviderCapabilities.Payout |
         ProviderCapabilities.Webhook |
         ProviderCapabilities.SyncSettlement |
-        ProviderCapabilities.BankTransfer;
+        ProviderCapabilities.BankTransfer |
+        ProviderCapabilities.Mandates |
+        ProviderCapabilities.TypedWebhooks;
 
     public TymeBankPaymentProvider(
         HttpClient httpClient,
@@ -253,31 +256,209 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
             _logger.LogInformation("Parsed TymeBank webhook: type={Type} paymentId={PaymentId}",
                 webhookEvent.EventType, webhookEvent.Data?.PaymentId);
 
-            var status = webhookEvent.EventType?.ToLowerInvariant() switch
-            {
-                "payment.completed" or "payment.succeeded" or "payout.completed" => PaymentStatus.Completed,
-                "payment.pending" or "payout.pending" => PaymentStatus.Pending,
-                "payment.failed" or "payout.failed" => PaymentStatus.Failed,
-                "payment.cancelled" or "payment.canceled" => PaymentStatus.Cancelled,
-                "payment.refunded" or "refund.completed" => PaymentStatus.Refunded,
-                _ => (PaymentStatus?)null
-            };
-
-            var reference = webhookEvent.Data?.PaymentId ?? webhookEvent.Data?.PayoutId;
-            if (status is null || string.IsNullOrEmpty(reference))
-                return Task.FromResult<WebhookEvent?>(null);
-
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
-            {
-                GatewayReference = reference,
-                Status = status.Value,
-                EventType = webhookEvent.EventType
-            });
+            var typed = MapTypedEvent(webhookEvent);
+            return Task.FromResult(typed);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to parse TymeBank webhook event");
             return Task.FromResult<WebhookEvent?>(null);
+        }
+    }
+
+    // Map TymeBank event name → strongly-typed Bhengu webhook sub-record.
+    // Covers pay-by-bank lifecycle (payment.*), debit-order mandates (mandate.*), debits
+    // (mandate.debit.*), payouts (payout.*) and refunds.
+    // Unrecognised events return null so consumers don't get false-positive signals.
+    private static WebhookEvent? MapTypedEvent(TymeBankWebhookEvent evt)
+    {
+        var eventName = evt.EventType?.ToLowerInvariant();
+        var data = evt.Data;
+        if (string.IsNullOrEmpty(eventName) || data is null) return null;
+
+        var amount = decimal.TryParse(data.Amount, NumberStyles.Number, CultureInfo.InvariantCulture, out var a) ? a : 0m;
+        var amountLimit = decimal.TryParse(data.AmountLimit, NumberStyles.Number, CultureInfo.InvariantCulture, out var al) ? al : 0m;
+        var currency = data.Currency ?? "ZAR";
+
+        switch (eventName)
+        {
+            case "payment.completed":
+            case "payment.succeeded":
+            case "mandate.debit.completed":
+            case "mandate.debit.succeeded":
+            {
+                var reference = data.DebitId ?? data.PaymentId;
+                if (string.IsNullOrEmpty(reference)) return null;
+                return new ChargeSucceededEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Completed,
+                    EventType = evt.EventType,
+                    Category = WebhookEventCategory.ChargeSucceeded,
+                    Amount = amount,
+                    Currency = currency,
+                    CustomerId = data.CustomerReference,
+                    PaymentMethodToken = data.MandateId ?? reference
+                };
+            }
+
+            case "payment.pending":
+            {
+                var reference = data.PaymentId;
+                if (string.IsNullOrEmpty(reference)) return null;
+                return new ChargePendingEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Pending,
+                    EventType = evt.EventType,
+                    Category = WebhookEventCategory.ChargePending,
+                    Amount = amount,
+                    Currency = currency
+                };
+            }
+
+            case "payment.failed":
+            case "mandate.debit.failed":
+            {
+                var reference = data.DebitId ?? data.PaymentId;
+                if (string.IsNullOrEmpty(reference)) return null;
+                return new ChargeFailedEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Failed,
+                    EventType = evt.EventType,
+                    Category = WebhookEventCategory.ChargeFailed,
+                    Amount = amount,
+                    Currency = currency,
+                    FailureCode = data.FailureCode ?? data.Status,
+                    FailureMessage = data.FailureReason ?? data.Status
+                };
+            }
+
+            case "payment.cancelled":
+            case "payment.canceled":
+            {
+                var reference = data.PaymentId;
+                if (string.IsNullOrEmpty(reference)) return null;
+                return new WebhookEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Cancelled,
+                    EventType = evt.EventType,
+                    Category = WebhookEventCategory.Unknown
+                };
+            }
+
+            case "payment.refunded":
+            case "refund.completed":
+            case "refund.succeeded":
+            {
+                var refundRef = data.RefundId ?? data.PaymentId;
+                var paymentRef = data.PaymentId ?? data.RefundId;
+                if (string.IsNullOrEmpty(refundRef) || string.IsNullOrEmpty(paymentRef)) return null;
+                return new RefundSucceededEvent
+                {
+                    GatewayReference = paymentRef,
+                    Status = PaymentStatus.Refunded,
+                    EventType = evt.EventType,
+                    Category = WebhookEventCategory.RefundSucceeded,
+                    RefundReference = refundRef,
+                    Amount = amount,
+                    Currency = currency,
+                    IsPartial = false
+                };
+            }
+
+            case "refund.failed":
+            {
+                var reference = data.RefundId ?? data.PaymentId;
+                if (string.IsNullOrEmpty(reference)) return null;
+                return new RefundFailedEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Failed,
+                    EventType = evt.EventType,
+                    Category = WebhookEventCategory.RefundFailed,
+                    Amount = amount,
+                    Currency = currency,
+                    FailureCode = data.FailureCode,
+                    FailureMessage = data.FailureReason
+                };
+            }
+
+            case "payout.completed":
+            case "payout.succeeded":
+            {
+                var reference = data.PayoutId;
+                if (string.IsNullOrEmpty(reference)) return null;
+                return new PayoutCompletedEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Completed,
+                    EventType = evt.EventType,
+                    Category = WebhookEventCategory.PayoutCompleted,
+                    PayoutReference = reference,
+                    Amount = amount,
+                    Currency = currency
+                };
+            }
+
+            case "payout.failed":
+            {
+                var reference = data.PayoutId;
+                if (string.IsNullOrEmpty(reference)) return null;
+                return new PayoutFailedEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Failed,
+                    EventType = evt.EventType,
+                    Category = WebhookEventCategory.PayoutFailed,
+                    PayoutReference = reference,
+                    Amount = amount,
+                    Currency = currency,
+                    FailureCode = data.FailureCode ?? data.Status,
+                    FailureMessage = data.FailureReason
+                };
+            }
+
+            case "mandate.activated":
+            case "mandate.authorized":
+            case "mandate.authorised":
+            {
+                var reference = data.MandateId;
+                if (string.IsNullOrEmpty(reference)) return null;
+                return new MandateActivatedEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Completed,
+                    EventType = evt.EventType,
+                    Category = WebhookEventCategory.MandateActivated,
+                    MandateReference = reference,
+                    AmountLimit = amountLimit == 0m ? null : amountLimit,
+                    Currency = currency
+                };
+            }
+
+            case "mandate.cancelled":
+            case "mandate.canceled":
+            case "mandate.rejected":
+            case "mandate.expired":
+            {
+                var reference = data.MandateId;
+                if (string.IsNullOrEmpty(reference)) return null;
+                return new MandateCancelledEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Cancelled,
+                    EventType = evt.EventType,
+                    Category = WebhookEventCategory.MandateCancelled,
+                    MandateReference = reference,
+                    CancellationReason = eventName.Replace("mandate.", "", StringComparison.Ordinal)
+                };
+            }
+
+            default:
+                return null;
         }
     }
 
@@ -424,6 +605,15 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
     {
         [JsonPropertyName("payment_id")] public string? PaymentId { get; set; }
         [JsonPropertyName("payout_id")] public string? PayoutId { get; set; }
+        [JsonPropertyName("mandate_id")] public string? MandateId { get; set; }
+        [JsonPropertyName("debit_id")] public string? DebitId { get; set; }
+        [JsonPropertyName("refund_id")] public string? RefundId { get; set; }
         [JsonPropertyName("status")] public string? Status { get; set; }
+        [JsonPropertyName("amount")] public string? Amount { get; set; }
+        [JsonPropertyName("amount_limit")] public string? AmountLimit { get; set; }
+        [JsonPropertyName("currency")] public string? Currency { get; set; }
+        [JsonPropertyName("customer_reference")] public string? CustomerReference { get; set; }
+        [JsonPropertyName("failure_code")] public string? FailureCode { get; set; }
+        [JsonPropertyName("failure_reason")] public string? FailureReason { get; set; }
     }
 }

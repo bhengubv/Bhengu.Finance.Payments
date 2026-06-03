@@ -36,6 +36,22 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<MercadoPagoPaymentProvider>());
 
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.MercadoPago, (sp, _) => sp.GetRequiredService<MercadoPagoPaymentProvider>());
+
+        // Recurring billing (Preapproval).
+        services.AddHttpClient<MercadoPagoSubscriptionProvider>();
+        services.AddTransient<ISubscriptionProvider, MercadoPagoSubscriptionProvider>(sp => sp.GetRequiredService<MercadoPagoSubscriptionProvider>());
+        services.AddKeyedTransient<ISubscriptionProvider>(ProviderNames.MercadoPago, (sp, _) => sp.GetRequiredService<MercadoPagoSubscriptionProvider>());
+
+        // PIX QR code generation.
+        services.AddHttpClient<MercadoPagoQrCodeProvider>();
+        services.AddTransient<IQrCodeProvider, MercadoPagoQrCodeProvider>(sp => sp.GetRequiredService<MercadoPagoQrCodeProvider>());
+        services.AddKeyedTransient<IQrCodeProvider>(ProviderNames.MercadoPago, (sp, _) => sp.GetRequiredService<MercadoPagoQrCodeProvider>());
+
+        // Server-side card tokenisation (SAQ-D).
+        services.AddHttpClient<MercadoPagoTokenisationProvider>();
+        services.AddTransient<ITokenisationProvider, MercadoPagoTokenisationProvider>(sp => sp.GetRequiredService<MercadoPagoTokenisationProvider>());
+        services.AddKeyedTransient<ITokenisationProvider>(ProviderNames.MercadoPago, (sp, _) => sp.GetRequiredService<MercadoPagoTokenisationProvider>());
+
         services.AddBhenguPaymentStartupValidation();
 
         return services;

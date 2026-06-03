@@ -36,12 +36,14 @@ public static class ServiceCollectionExtensions
             throw new ProviderConfigurationException("airtelmoney", $"{AirtelMoneyOptions.ConfigSection}:Currency is required");
 
         services.AddHttpClient<AirtelMoneyPaymentProvider>();
+        services.AddHttpClient<AirtelMoneyPayoutProvider>();
         services.AddTransient<IPaymentGatewayProvider, AirtelMoneyPaymentProvider>(sp =>
             sp.GetRequiredService<AirtelMoneyPaymentProvider>());
         services.AddTransient<IPayoutProvider, AirtelMoneyPaymentProvider>(sp =>
             sp.GetRequiredService<AirtelMoneyPaymentProvider>());
 
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.AirtelMoney, (sp, _) => sp.GetRequiredService<AirtelMoneyPaymentProvider>());
+        services.AddKeyedTransient<IPayoutProvider>(ProviderNames.AirtelMoney, (sp, _) => sp.GetRequiredService<AirtelMoneyPayoutProvider>());
         services.AddBhenguPaymentStartupValidation();
 
         return services;

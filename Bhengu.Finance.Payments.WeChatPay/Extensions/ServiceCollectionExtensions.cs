@@ -42,6 +42,13 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<WeChatPayPaymentProvider>());
 
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.WeChatPay, (sp, _) => sp.GetRequiredService<WeChatPayPaymentProvider>());
+
+        // QR code provider — WeChat Pay v3 Native (scan-to-pay)
+        services.AddHttpClient<WeChatPayQrCodeProvider>();
+        services.AddTransient<IQrCodeProvider, WeChatPayQrCodeProvider>(sp =>
+            sp.GetRequiredService<WeChatPayQrCodeProvider>());
+        services.AddKeyedTransient<IQrCodeProvider>(ProviderNames.WeChatPay, (sp, _) => sp.GetRequiredService<WeChatPayQrCodeProvider>());
+
         services.AddBhenguPaymentStartupValidation();
 
         return services;

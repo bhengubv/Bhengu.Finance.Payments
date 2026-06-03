@@ -11,10 +11,14 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace Bhengu.Finance.Payments.Flutterwave.Extensions;
 
+/// <summary>
+/// DI registration helpers for the Flutterwave provider family.
+/// </summary>
 public static class ServiceCollectionExtensions
 {
     /// <summary>
-    /// Register the Flutterwave provider. Reads configuration from <c>Bhengu:Finance:Payments:Flutterwave</c>.
+    /// Register the core Flutterwave payment provider (charge / refund / payout / webhook).
+    /// Reads configuration from <c>Bhengu:Finance:Payments:Flutterwave</c>.
     /// Fails fast at startup if required options (SecretKey) are missing.
     /// </summary>
     public static IServiceCollection AddFlutterwavePayments(this IServiceCollection services, IConfiguration configuration)
@@ -37,6 +41,42 @@ public static class ServiceCollectionExtensions
 
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Flutterwave, (sp, _) => sp.GetRequiredService<FlutterwavePaymentProvider>());
         services.AddBhenguPaymentStartupValidation();
+
+        return services;
+    }
+
+    /// <summary>
+    /// Register the full Flutterwave provider family — payment / payout / tokenisation /
+    /// subscription / settlement / marketplace — plus keyed registrations under
+    /// <see cref="ProviderNames.Flutterwave"/> for every optional contract Flutterwave supports.
+    /// <para>
+    /// Reads configuration from <c>Bhengu:Finance:Payments:Flutterwave</c>. Fails fast at startup
+    /// if <see cref="FlutterwaveOptions.SecretKey"/> is missing.
+    /// </para>
+    /// </summary>
+    public static IServiceCollection AddBhenguFlutterwavePayments(this IServiceCollection services, IConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        // Reuse the core registration so the keyed payment/payout providers are wired up.
+        services.AddFlutterwavePayments(configuration);
+
+        services.AddHttpClient<FlutterwaveTokenisationProvider>();
+        services.AddHttpClient<FlutterwaveSubscriptionProvider>();
+        services.AddHttpClient<FlutterwaveSettlementProvider>();
+        services.AddHttpClient<FlutterwaveMarketplaceProvider>();
+
+        services.AddTransient<ITokenisationProvider>(sp => sp.GetRequiredService<FlutterwaveTokenisationProvider>());
+        services.AddTransient<ISubscriptionProvider>(sp => sp.GetRequiredService<FlutterwaveSubscriptionProvider>());
+        services.AddTransient<ISettlementProvider>(sp => sp.GetRequiredService<FlutterwaveSettlementProvider>());
+        services.AddTransient<IMarketplaceProvider>(sp => sp.GetRequiredService<FlutterwaveMarketplaceProvider>());
+
+        services.AddKeyedTransient<ITokenisationProvider>(ProviderNames.Flutterwave, (sp, _) => sp.GetRequiredService<FlutterwaveTokenisationProvider>());
+        services.AddKeyedTransient<ISubscriptionProvider>(ProviderNames.Flutterwave, (sp, _) => sp.GetRequiredService<FlutterwaveSubscriptionProvider>());
+        services.AddKeyedTransient<ISettlementProvider>(ProviderNames.Flutterwave, (sp, _) => sp.GetRequiredService<FlutterwaveSettlementProvider>());
+        services.AddKeyedTransient<IMarketplaceProvider>(ProviderNames.Flutterwave, (sp, _) => sp.GetRequiredService<FlutterwaveMarketplaceProvider>());
+        services.AddKeyedTransient<IPayoutProvider>(ProviderNames.Flutterwave, (sp, _) => sp.GetRequiredService<FlutterwavePaymentProvider>());
 
         return services;
     }

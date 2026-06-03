@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.PagSeguro.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -35,7 +36,12 @@ public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutP
         ProviderCapabilities.Payout |
         ProviderCapabilities.Webhook |
         ProviderCapabilities.Cards |
-        ProviderCapabilities.BankTransfer;
+        ProviderCapabilities.BankTransfer |
+        ProviderCapabilities.Subscriptions |
+        ProviderCapabilities.QrCode |
+        ProviderCapabilities.Tokenisation |
+        ProviderCapabilities.TypedWebhooks |
+        ProviderCapabilities.PartialRefund;
 
     public PagSeguroPaymentProvider(
         HttpClient httpClient,
@@ -254,39 +260,173 @@ public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutP
             var webhookEvent = JsonSerializer.Deserialize<PagSeguroWebhookEvent>(payload);
             if (webhookEvent is null) return Task.FromResult<WebhookEvent?>(null);
 
-            // PagBank notifications carry an order id plus the first charge's status.
-            // Some events are order-shaped, others are charge-shaped (cancellations come back as a charge object).
-            var firstCharge = webhookEvent.Charges?.FirstOrDefault();
-            var status = (firstCharge?.Status ?? webhookEvent.Status ?? string.Empty).ToUpperInvariant();
-            var reference = webhookEvent.Id ?? firstCharge?.Id;
+            _logger.LogInformation("Parsed PagSeguro webhook: id={Id} event={Event}", webhookEvent.Id, webhookEvent.Event);
 
-            _logger.LogInformation("Parsed PagSeguro webhook: ref={Ref} status={Status}", reference, status);
-
-            var mappedStatus = status switch
-            {
-                "PAID" or "AUTHORIZED" or "CAPTURED" => PaymentStatus.Completed,
-                "WAITING" or "IN_ANALYSIS" or "PENDING" => PaymentStatus.Pending,
-                "DECLINED" or "FAILED" => PaymentStatus.Failed,
-                "CANCELED" or "CANCELLED" or "VOIDED" => PaymentStatus.Cancelled,
-                "REFUNDED" => PaymentStatus.Refunded,
-                _ => (PaymentStatus?)null
-            };
-
-            if (mappedStatus is null || string.IsNullOrEmpty(reference))
-                return Task.FromResult<WebhookEvent?>(null);
-
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
-            {
-                GatewayReference = reference,
-                Status = mappedStatus.Value,
-                EventType = status
-            });
+            var typed = MapTypedEvent(webhookEvent);
+            return Task.FromResult(typed);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to parse PagSeguro webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
+    }
+
+    // Map PagBank event names → strongly-typed Bhengu webhook sub-record. PagBank's <c>event</c> field
+    // carries values like "ORDER.created" / "CHARGE.PAID" / "REFUND.PROCESSED". When the event field
+    // is missing (legacy charge-shaped payloads) we fall back to inferring from the status fields.
+    private static WebhookEvent? MapTypedEvent(PagSeguroWebhookEvent evt)
+    {
+        var firstCharge = evt.Charges?.FirstOrDefault();
+        var statusUpper = (firstCharge?.Status ?? evt.Status ?? string.Empty).ToUpperInvariant();
+        var reference = evt.Id ?? firstCharge?.Id;
+        var amountCents = firstCharge?.Amount?.Value ?? 0L;
+        var currency = firstCharge?.Amount?.Currency ?? "BRL";
+        var amount = amountCents / 100m;
+
+        if (string.IsNullOrEmpty(reference)) return null;
+
+        var eventName = evt.Event?.ToUpperInvariant();
+        if (!string.IsNullOrEmpty(eventName))
+        {
+            switch (eventName)
+            {
+                case "ORDER.CREATED":
+                    return new ChargePendingEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Pending,
+                        EventType = evt.Event,
+                        Category = WebhookEventCategory.ChargePending,
+                        Amount = amount,
+                        Currency = currency
+                    };
+
+                case "CHARGE.PAID":
+                    return new ChargeSucceededEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Completed,
+                        EventType = evt.Event,
+                        Category = WebhookEventCategory.ChargeSucceeded,
+                        Amount = amount,
+                        Currency = currency
+                    };
+
+                case "CHARGE.DECLINED":
+                    return new ChargeFailedEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Failed,
+                        EventType = evt.Event,
+                        Category = WebhookEventCategory.ChargeFailed,
+                        Amount = amount,
+                        Currency = currency,
+                        FailureCode = "declined"
+                    };
+
+                case "CHARGE.CANCELED":
+                case "CHARGE.CANCELLED":
+                    // When the order represents a recurring subscription PagBank emits CHARGE.CANCELED as
+                    // the cancellation signal. Surface a SubscriptionCancelledEvent when the metadata
+                    // indicates a recurring origin (reference_id with the pg_plan_ prefix); otherwise fall
+                    // back to a ChargeFailedEvent so direct one-off charges still get a typed signal.
+                    if ((evt.ReferenceId?.StartsWith("pg_plan_", StringComparison.Ordinal) ?? false)
+                        || (firstCharge?.ReferenceId?.StartsWith("pg_plan_", StringComparison.Ordinal) ?? false))
+                    {
+                        return new SubscriptionCancelledEvent
+                        {
+                            GatewayReference = reference,
+                            Status = PaymentStatus.Cancelled,
+                            EventType = evt.Event,
+                            Category = WebhookEventCategory.SubscriptionCancelled,
+                            SubscriptionReference = reference,
+                            CancellationReason = "cancelled"
+                        };
+                    }
+                    return new ChargeFailedEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Cancelled,
+                        EventType = evt.Event,
+                        Category = WebhookEventCategory.ChargeFailed,
+                        Amount = amount,
+                        Currency = currency,
+                        FailureCode = "cancelled"
+                    };
+
+                case "REFUND.PROCESSED":
+                    return new RefundSucceededEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Refunded,
+                        EventType = evt.Event,
+                        Category = WebhookEventCategory.RefundSucceeded,
+                        RefundReference = firstCharge?.Id ?? reference,
+                        Amount = amount,
+                        Currency = currency,
+                        IsPartial = false
+                    };
+
+                default:
+                    return null;
+            }
+        }
+
+        // Legacy charge-shaped fallback for callers still hitting the older webhook contract.
+        return statusUpper switch
+        {
+            "PAID" or "AUTHORIZED" or "CAPTURED" => new ChargeSucceededEvent
+            {
+                GatewayReference = reference,
+                Status = PaymentStatus.Completed,
+                EventType = statusUpper,
+                Category = WebhookEventCategory.ChargeSucceeded,
+                Amount = amount,
+                Currency = currency
+            },
+            "WAITING" or "IN_ANALYSIS" or "PENDING" => new ChargePendingEvent
+            {
+                GatewayReference = reference,
+                Status = PaymentStatus.Pending,
+                EventType = statusUpper,
+                Category = WebhookEventCategory.ChargePending,
+                Amount = amount,
+                Currency = currency
+            },
+            "DECLINED" or "FAILED" => new ChargeFailedEvent
+            {
+                GatewayReference = reference,
+                Status = PaymentStatus.Failed,
+                EventType = statusUpper,
+                Category = WebhookEventCategory.ChargeFailed,
+                Amount = amount,
+                Currency = currency,
+                FailureCode = statusUpper.ToLowerInvariant()
+            },
+            "CANCELED" or "CANCELLED" or "VOIDED" => new ChargeFailedEvent
+            {
+                GatewayReference = reference,
+                Status = PaymentStatus.Cancelled,
+                EventType = statusUpper,
+                Category = WebhookEventCategory.ChargeFailed,
+                Amount = amount,
+                Currency = currency,
+                FailureCode = "cancelled"
+            },
+            "REFUNDED" => new RefundSucceededEvent
+            {
+                GatewayReference = reference,
+                Status = PaymentStatus.Refunded,
+                EventType = statusUpper,
+                Category = WebhookEventCategory.RefundSucceeded,
+                RefundReference = firstCharge?.Id ?? reference,
+                Amount = amount,
+                Currency = currency,
+                IsPartial = false
+            },
+            _ => null
+        };
     }
 
     private async Task<(string Body, HttpResponseMessage Response)> SendAsync(
@@ -378,6 +518,7 @@ public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutP
         [JsonPropertyName("id")] public string? Id { get; set; }
         [JsonPropertyName("reference_id")] public string? ReferenceId { get; set; }
         [JsonPropertyName("status")] public string? Status { get; set; }
+        [JsonPropertyName("event")] public string? Event { get; set; }
         [JsonPropertyName("charges")] public PagSeguroChargeResponse[]? Charges { get; set; }
     }
 }

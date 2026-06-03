@@ -14,4 +14,11 @@ public sealed class StripeOptions
 
     /// <summary>Stripe webhook signing secret (whsec_...). Used to verify webhook payloads.</summary>
     public string WebhookSecret { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Optional Stripe Connect <c>client_id</c> (ca_...). Required by Marketplace flows that issue
+    /// OAuth links for Standard Connect accounts. Express / Custom flows that use account links
+    /// only need <see cref="SecretKey"/>.
+    /// </summary>
+    public string ConnectClientId { get; set; } = string.Empty;
 }

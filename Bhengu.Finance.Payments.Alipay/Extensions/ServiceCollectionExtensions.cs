@@ -38,6 +38,13 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<AlipayPaymentProvider>());
 
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Alipay, (sp, _) => sp.GetRequiredService<AlipayPaymentProvider>());
+
+        // QR code provider — alipay.trade.precreate / alipay.trade.query (mainland OpenAPI)
+        services.AddHttpClient<AlipayQrCodeProvider>();
+        services.AddTransient<IQrCodeProvider, AlipayQrCodeProvider>(sp =>
+            sp.GetRequiredService<AlipayQrCodeProvider>());
+        services.AddKeyedTransient<IQrCodeProvider>(ProviderNames.Alipay, (sp, _) => sp.GetRequiredService<AlipayQrCodeProvider>());
+
         services.AddBhenguPaymentStartupValidation();
 
         return services;

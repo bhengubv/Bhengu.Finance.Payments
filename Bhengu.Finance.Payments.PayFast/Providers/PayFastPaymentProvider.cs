@@ -1,7 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using System.Collections.Concurrent;
 using System.Net;
-using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.PayFast.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -29,12 +30,17 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
 
     public string ProviderName => ProviderNames.PayFast;
 
+    /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
         ProviderCapabilities.Refund |
+        ProviderCapabilities.PartialRefund |
         ProviderCapabilities.Webhook |
+        ProviderCapabilities.TypedWebhooks |
         ProviderCapabilities.RedirectFlow |
-        ProviderCapabilities.Cards;
+        ProviderCapabilities.Cards |
+        ProviderCapabilities.Subscriptions |
+        ProviderCapabilities.Mandates;
 
     public PayFastPaymentProvider(
         HttpClient httpClient,
@@ -193,6 +199,22 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
         }
     }
 
+    /// <summary>
+    /// Parse a PayFast ITN payload into a typed <see cref="WebhookEvent"/> sub-record.
+    /// </summary>
+    /// <remarks>
+    /// Mapping rules (PayFast IPN <c>payment_status</c>):
+    /// <list type="bullet">
+    /// <item><description><c>COMPLETE</c> + token field present (first time) → <see cref="SubscriptionCreatedEvent"/>.</description></item>
+    /// <item><description><c>COMPLETE</c> + token field present (seen before) → <see cref="SubscriptionRenewedEvent"/>.</description></item>
+    /// <item><description><c>COMPLETE</c> without token → <see cref="ChargeSucceededEvent"/>.</description></item>
+    /// <item><description><c>FAILED</c> → <see cref="ChargeFailedEvent"/>.</description></item>
+    /// <item><description><c>PENDING</c> → <see cref="ChargePendingEvent"/>.</description></item>
+    /// <item><description><c>CANCELLED</c> + token field present → <see cref="SubscriptionCancelledEvent"/>.</description></item>
+    /// </list>
+    /// Subscription-token dedup is tracked in a process-local set; for production deployments
+    /// (multi-instance, restart-safe), wrap with an external idempotency layer keyed on token+pf_payment_id.
+    /// </remarks>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -203,18 +225,95 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
 
             var pfPaymentId = parameters.GetValueOrDefault("pf_payment_id", string.Empty);
             var paymentStatus = parameters.GetValueOrDefault("payment_status", string.Empty);
+            var token = parameters.GetValueOrDefault("token", string.Empty);
+            var amountGross = decimal.TryParse(parameters.GetValueOrDefault("amount_gross", "0"),
+                System.Globalization.NumberStyles.Number, System.Globalization.CultureInfo.InvariantCulture, out var ag) ? ag : 0m;
             var status = MapStatus(paymentStatus);
+            var hasToken = !string.IsNullOrEmpty(token);
 
-            _logger.LogInformation("PayFast ITN parsed: gatewayReference={PfPaymentId} status={Status}",
-                pfPaymentId, status);
+            _logger.LogInformation("PayFast ITN parsed: gatewayReference={PfPaymentId} status={Status} hasToken={HasToken}",
+                pfPaymentId, status, hasToken);
 
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
+            // Typed sub-records by (payment_status, hasToken).
+            WebhookEvent? typed = (paymentStatus.ToUpperInvariant(), hasToken) switch
             {
-                GatewayReference = pfPaymentId,
-                Status = status,
-                EventType = "payfast.itn",
-                RawPayload = parameters
-            });
+                ("COMPLETE", true) when _seenSubscriptionTokens.TryAdd(token, 0) => new SubscriptionCreatedEvent
+                {
+                    GatewayReference = pfPaymentId,
+                    Status = status,
+                    EventType = "payfast.itn.subscription.created",
+                    Category = WebhookEventCategory.SubscriptionCreated,
+                    RawPayload = parameters,
+                    SubscriptionReference = token,
+                    PlanReference = parameters.GetValueOrDefault("custom_str2", string.Empty),
+                    CustomerId = parameters.GetValueOrDefault("custom_str1")
+                },
+                ("COMPLETE", true) => new SubscriptionRenewedEvent
+                {
+                    GatewayReference = pfPaymentId,
+                    Status = status,
+                    EventType = "payfast.itn.subscription.renewed",
+                    Category = WebhookEventCategory.SubscriptionRenewed,
+                    RawPayload = parameters,
+                    SubscriptionReference = token,
+                    Amount = amountGross,
+                    Currency = parameters.GetValueOrDefault("amount_currency", "ZAR")
+                },
+                ("COMPLETE", false) => new ChargeSucceededEvent
+                {
+                    GatewayReference = pfPaymentId,
+                    Status = status,
+                    EventType = "payfast.itn",
+                    Category = WebhookEventCategory.ChargeSucceeded,
+                    RawPayload = parameters,
+                    Amount = amountGross,
+                    Currency = parameters.GetValueOrDefault("amount_currency", "ZAR"),
+                    CustomerId = parameters.GetValueOrDefault("custom_str1"),
+                    PaymentMethodToken = null
+                },
+                ("FAILED", _) => new ChargeFailedEvent
+                {
+                    GatewayReference = pfPaymentId,
+                    Status = status,
+                    EventType = "payfast.itn",
+                    Category = WebhookEventCategory.ChargeFailed,
+                    RawPayload = parameters,
+                    Amount = amountGross,
+                    Currency = parameters.GetValueOrDefault("amount_currency", "ZAR"),
+                    FailureCode = parameters.GetValueOrDefault("reason_code"),
+                    FailureMessage = parameters.GetValueOrDefault("reason")
+                },
+                ("PENDING", _) => new ChargePendingEvent
+                {
+                    GatewayReference = pfPaymentId,
+                    Status = status,
+                    EventType = "payfast.itn",
+                    Category = WebhookEventCategory.ChargePending,
+                    RawPayload = parameters,
+                    Amount = amountGross,
+                    Currency = parameters.GetValueOrDefault("amount_currency", "ZAR")
+                },
+                ("CANCELLED" or "CANCELED", true) => new SubscriptionCancelledEvent
+                {
+                    GatewayReference = pfPaymentId,
+                    Status = status,
+                    EventType = "payfast.itn.subscription.cancelled",
+                    Category = WebhookEventCategory.SubscriptionCancelled,
+                    RawPayload = parameters,
+                    SubscriptionReference = token,
+                    CancellationReason = parameters.GetValueOrDefault("reason")
+                },
+                _ => new WebhookEvent
+                {
+                    GatewayReference = pfPaymentId,
+                    Status = status,
+                    EventType = "payfast.itn",
+                    Category = WebhookEventCategory.Unknown,
+                    RawPayload = parameters
+                }
+            };
+
+            return Task.FromResult<WebhookEvent?>(typed);
         }
         catch (Exception ex)
         {
@@ -222,6 +321,11 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
+
+    // Process-local set used to differentiate first-time subscription IPNs (SubscriptionCreated)
+    // from subsequent ones (SubscriptionRenewed). Production deployments should externalise this
+    // to a persistent store keyed on token (Redis / DB) to survive restarts.
+    private static readonly ConcurrentDictionary<string, byte> _seenSubscriptionTokens = new(StringComparer.Ordinal);
 
     // === PayFast-specific extensions (not on IPaymentGatewayProvider) ===
 
@@ -307,12 +411,15 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
 
     private static Dictionary<string, string> ParseFormUrlEncoded(string formData)
     {
+        // PayFast ITN is application/x-www-form-urlencoded — '+' represents a literal space.
+        // Uri.UnescapeDataString does NOT translate '+' → ' ', so we use WebUtility.UrlDecode
+        // which does. This matches the de-facto IPN parsing every PayFast SDK ships with.
         var result = new Dictionary<string, string>();
         foreach (var pair in formData.Split('&'))
         {
             var kv = pair.Split('=', 2);
             if (kv.Length == 2)
-                result[Uri.UnescapeDataString(kv[0])] = Uri.UnescapeDataString(kv[1]);
+                result[WebUtility.UrlDecode(kv[0])] = WebUtility.UrlDecode(kv[1]);
         }
         return result;
     }

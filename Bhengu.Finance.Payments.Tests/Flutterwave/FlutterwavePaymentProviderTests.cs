@@ -204,12 +204,16 @@ public class FlutterwavePaymentProviderTests
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsNull_ForUnknownEventType()
+    public async Task ParseWebhookAsync_ReturnsUnknownCategoryEvent_ForUnknownEventType()
     {
+        // Contract change: providers with TypedWebhooks capability now return a base WebhookEvent
+        // with Category=Unknown for events they don't classify, rather than null.
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
-        Assert.Null(await provider.ParseWebhookAsync("""
+        var evt = await provider.ParseWebhookAsync("""
             {"event":"unknown.event","data":{"tx_ref":"x"}}
-            """));
+            """);
+        Assert.NotNull(evt);
+        Assert.Equal(Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.Unknown, evt!.Category);
     }
 
     [Fact]

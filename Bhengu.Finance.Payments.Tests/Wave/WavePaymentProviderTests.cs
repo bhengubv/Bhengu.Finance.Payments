@@ -109,7 +109,7 @@ public class WavePaymentProviderTests
     {
         var handler = new StubHttpMessageHandler((req, _) =>
         {
-            Assert.Contains("v1/payouts", req.RequestUri!.PathAndQuery);
+            Assert.Contains("v1/payout", req.RequestUri!.PathAndQuery);
             return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
                 {"id":"po-wave-1","status":"processing","receive_amount":"2500","currency":"XOF"}
                 """);

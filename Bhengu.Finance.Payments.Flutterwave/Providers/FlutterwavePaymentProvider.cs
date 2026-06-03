@@ -10,7 +10,9 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Flutterwave.Configuration;
+using Bhengu.Finance.Payments.Flutterwave.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -27,20 +29,35 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
     private readonly HttpClient _httpClient;
     private readonly FlutterwaveOptions _options;
     private readonly ILogger<FlutterwavePaymentProvider> _logger;
+    private readonly FlutterwaveIdempotencyCache _idempotencyCache;
 
+    /// <inheritdoc/>
     public string ProviderName => ProviderNames.Flutterwave;
 
+    /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
         ProviderCapabilities.Refund |
+        ProviderCapabilities.PartialRefund |
         ProviderCapabilities.Payout |
         ProviderCapabilities.Webhook |
+        ProviderCapabilities.TypedWebhooks |
         ProviderCapabilities.RedirectFlow |
         ProviderCapabilities.Cards |
         ProviderCapabilities.MobileMoney |
         ProviderCapabilities.BankTransfer |
-        ProviderCapabilities.CrossBorder;
+        ProviderCapabilities.CrossBorder |
+        ProviderCapabilities.Tokenisation |
+        ProviderCapabilities.Subscriptions |
+        ProviderCapabilities.Settlement |
+        ProviderCapabilities.Marketplace |
+        ProviderCapabilities.Idempotency;
 
+    /// <summary>
+    /// Construct a Flutterwave provider bound to the supplied <paramref name="httpClient"/>.
+    /// Sets the bearer-token Authorization header and the base address (defaults to
+    /// <c>https://api.flutterwave.com/</c>) if not already populated.
+    /// </summary>
     public FlutterwavePaymentProvider(
         HttpClient httpClient,
         IOptions<FlutterwaveOptions> options,
@@ -49,6 +66,7 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _idempotencyCache = new FlutterwaveIdempotencyCache();
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(FlutterwaveOptions.SecretKey)} is required");
@@ -59,10 +77,16 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
         _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _options.SecretKey);
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
 
+        return _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, () => ProcessPaymentCoreAsync(request, ct));
+    }
+
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+    {
         var email = request.Metadata?.GetValueOrDefault("email");
         if (string.IsNullOrWhiteSpace(email))
             throw new PaymentDeclinedException(ProviderName, "missing_email",
@@ -71,23 +95,28 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
         var name = request.Metadata?.GetValueOrDefault("name") ?? email;
         var phone = request.Metadata?.GetValueOrDefault("phonenumber");
 
-        var requestBody = new
+        // Optional metadata-driven extensions: payment_plan (subscription binding), subaccounts (splits).
+        var paymentPlan = request.Metadata?.GetValueOrDefault("payment_plan");
+
+        var requestBody = new Dictionary<string, object?>
         {
-            tx_ref = request.PaymentMethodToken,
-            amount = request.Amount.ToString("F2", System.Globalization.CultureInfo.InvariantCulture),
-            currency = request.Currency.ToUpperInvariant(),
-            redirect_url = _options.RedirectUrl,
-            customer = new
+            ["tx_ref"] = request.PaymentMethodToken,
+            ["amount"] = request.Amount.ToString("F2", System.Globalization.CultureInfo.InvariantCulture),
+            ["currency"] = request.Currency.ToUpperInvariant(),
+            ["redirect_url"] = _options.RedirectUrl,
+            ["customer"] = new
             {
                 email,
                 name,
                 phonenumber = phone
             },
-            customizations = new
+            ["customizations"] = new
             {
                 title = request.Description
             }
         };
+        if (!string.IsNullOrWhiteSpace(paymentPlan))
+            requestBody["payment_plan"] = paymentPlan;
 
         var body = await SendAsync(HttpMethod.Post, "v3/payments", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
         var fwResponse = JsonSerializer.Deserialize<FlutterwavePaymentResponse>(body);
@@ -107,10 +136,16 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
         };
     }
 
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
 
+        return _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, () => ProcessPayoutCoreAsync(request, ct));
+    }
+
+    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+    {
         // DestinationToken format: "<bankCode>:<accountNumber>" (e.g. "044:0690000040").
         var colon = request.DestinationToken.IndexOf(':');
         if (colon <= 0)
@@ -148,10 +183,16 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
         };
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
 
+        return _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, () => ProcessRefundCoreAsync(request, ct));
+    }
+
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
         var requestBody = new
         {
             amount = request.Amount.ToString("F2", System.Globalization.CultureInfo.InvariantCulture)
@@ -201,6 +242,20 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
         }
     }
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Returns a strongly-typed sub-record where the Flutterwave event maps cleanly onto one of the
+    /// SDK's <see cref="WebhookEventCategory"/> values. Mapping table:
+    /// <list type="bullet">
+    /// <item><c>charge.completed</c> + <c>status=successful</c> → <see cref="ChargeSucceededEvent"/></item>
+    /// <item><c>charge.completed</c> + <c>status=failed</c>     → <see cref="ChargeFailedEvent"/></item>
+    /// <item><c>transfer.completed</c> + <c>status=SUCCESSFUL</c> → <see cref="PayoutCompletedEvent"/></item>
+    /// <item><c>transfer.completed</c> + <c>status=FAILED</c>    → <see cref="PayoutFailedEvent"/></item>
+    /// <item><c>subscription.cancelled</c> → <see cref="SubscriptionCancelledEvent"/></item>
+    /// </list>
+    /// Anything else returns the base <see cref="WebhookEvent"/> with
+    /// <see cref="WebhookEventCategory.Unknown"/>. Returns null only when the payload is unparseable.
+    /// </remarks>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -212,25 +267,104 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
 
             _logger.LogInformation("Parsed Flutterwave webhook event: {EventType}", webhookEvent.Event);
 
-            var status = webhookEvent.Event?.ToLowerInvariant() switch
-            {
-                "charge.completed" or "charge.complete" => PaymentStatus.Completed,
-                "transfer.completed" => PaymentStatus.Completed,
-                "charge.failed" or "transfer.failed" => PaymentStatus.Failed,
-                "refund.completed" or "refund.created" => PaymentStatus.Refunded,
-                _ => (PaymentStatus?)null
-            };
-
             var reference = webhookEvent.Data?.TxRef ?? webhookEvent.Data?.Reference;
-            if (status is null || string.IsNullOrEmpty(reference))
+            if (string.IsNullOrEmpty(reference))
                 return Task.FromResult<WebhookEvent?>(null);
 
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
+            var eventName = webhookEvent.Event?.ToLowerInvariant();
+            var innerStatus = webhookEvent.Data?.Status?.ToLowerInvariant();
+            var currency = webhookEvent.Data?.Currency ?? string.Empty;
+            var amount = webhookEvent.Data?.Amount ?? 0m;
+
+            WebhookEvent? mapped = (eventName, innerStatus) switch
             {
-                GatewayReference = reference,
-                Status = status.Value,
-                EventType = webhookEvent.Event
-            });
+                ("charge.completed" or "charge.complete", "successful" or "success" or "completed") =>
+                    new ChargeSucceededEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Completed,
+                        EventType = webhookEvent.Event,
+                        Category = WebhookEventCategory.ChargeSucceeded,
+                        Amount = amount,
+                        Currency = currency,
+                        CustomerId = webhookEvent.Data?.Customer?.Email,
+                        PaymentMethodToken = webhookEvent.Data?.Card?.Token
+                    },
+
+                ("charge.completed" or "charge.complete", "failed" or "abandoned") =>
+                    new ChargeFailedEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Failed,
+                        EventType = webhookEvent.Event,
+                        Category = WebhookEventCategory.ChargeFailed,
+                        Amount = amount,
+                        Currency = currency,
+                        FailureCode = webhookEvent.Data?.ProcessorResponse,
+                        FailureMessage = webhookEvent.Data?.Narration
+                    },
+
+                ("charge.failed", _) =>
+                    new ChargeFailedEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Failed,
+                        EventType = webhookEvent.Event,
+                        Category = WebhookEventCategory.ChargeFailed,
+                        Amount = amount,
+                        Currency = currency,
+                        FailureCode = webhookEvent.Data?.ProcessorResponse,
+                        FailureMessage = webhookEvent.Data?.Narration
+                    },
+
+                ("transfer.completed", "successful" or "success") =>
+                    new PayoutCompletedEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Completed,
+                        EventType = webhookEvent.Event,
+                        Category = WebhookEventCategory.PayoutCompleted,
+                        PayoutReference = reference,
+                        Amount = amount,
+                        Currency = currency,
+                        DestinationToken = webhookEvent.Data?.AccountNumber
+                    },
+
+                ("transfer.completed", "failed") or ("transfer.failed", _) =>
+                    new PayoutFailedEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Failed,
+                        EventType = webhookEvent.Event,
+                        Category = WebhookEventCategory.PayoutFailed,
+                        PayoutReference = reference,
+                        Amount = amount,
+                        Currency = currency,
+                        FailureCode = webhookEvent.Data?.CompleteMessage,
+                        FailureMessage = webhookEvent.Data?.Narration
+                    },
+
+                ("subscription.cancelled", _) =>
+                    new SubscriptionCancelledEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Cancelled,
+                        EventType = webhookEvent.Event,
+                        Category = WebhookEventCategory.SubscriptionCancelled,
+                        SubscriptionReference = reference,
+                        CancellationReason = webhookEvent.Data?.Status
+                    },
+
+                _ => new WebhookEvent
+                {
+                    GatewayReference = reference,
+                    Status = MapStatus(innerStatus ?? "pending"),
+                    EventType = webhookEvent.Event,
+                    Category = WebhookEventCategory.Unknown
+                }
+            };
+
+            return Task.FromResult<WebhookEvent?>(mapped);
         }
         catch (Exception ex)
         {
@@ -342,5 +476,28 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
         [JsonPropertyName("reference")] public string? Reference { get; set; }
         [JsonPropertyName("status")] public string? Status { get; set; }
         [JsonPropertyName("amount")] public decimal Amount { get; set; }
+        [JsonPropertyName("currency")] public string? Currency { get; set; }
+        [JsonPropertyName("processor_response")] public string? ProcessorResponse { get; set; }
+        [JsonPropertyName("narration")] public string? Narration { get; set; }
+        [JsonPropertyName("complete_message")] public string? CompleteMessage { get; set; }
+        [JsonPropertyName("account_number")] public string? AccountNumber { get; set; }
+        [JsonPropertyName("customer")] public FlutterwaveWebhookCustomer? Customer { get; set; }
+        [JsonPropertyName("card")] public FlutterwaveWebhookCard? Card { get; set; }
+    }
+
+    private sealed class FlutterwaveWebhookCustomer
+    {
+        [JsonPropertyName("id")] public long Id { get; set; }
+        [JsonPropertyName("email")] public string? Email { get; set; }
+        [JsonPropertyName("name")] public string? Name { get; set; }
+    }
+
+    private sealed class FlutterwaveWebhookCard
+    {
+        [JsonPropertyName("token")] public string? Token { get; set; }
+        [JsonPropertyName("first_6digits")] public string? First6Digits { get; set; }
+        [JsonPropertyName("last_4digits")] public string? Last4Digits { get; set; }
+        [JsonPropertyName("type")] public string? Type { get; set; }
+        [JsonPropertyName("expiry")] public string? Expiry { get; set; }
     }
 }

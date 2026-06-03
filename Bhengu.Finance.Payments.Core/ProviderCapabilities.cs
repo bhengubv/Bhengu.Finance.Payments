@@ -44,5 +44,38 @@ public enum ProviderCapabilities
     Cards = 1 << 9,
 
     /// <summary>Supports bank account-to-account transfers (EFT / instant clearing / open banking).</summary>
-    BankTransfer = 1 << 10
+    BankTransfer = 1 << 10,
+
+    /// <summary>Implements <c>ITokenisationProvider</c> — can vault card / payment-method details for re-use.</summary>
+    Tokenisation = 1 << 11,
+
+    /// <summary>Implements <c>ISubscriptionProvider</c> — supports plans and recurring billing cycles.</summary>
+    Subscriptions = 1 << 12,
+
+    /// <summary>Implements <c>IThreeDSecureProvider</c> — exposes a 3DS / SCA challenge step-up flow.</summary>
+    ThreeDSecure = 1 << 13,
+
+    /// <summary>Implements <c>IDisputeProvider</c> — exposes chargeback / dispute lifecycle.</summary>
+    Disputes = 1 << 14,
+
+    /// <summary>Implements <c>ISettlementProvider</c> — exposes settlement batches / reconciliation feeds.</summary>
+    Settlement = 1 << 15,
+
+    /// <summary>Implements <c>IQrCodeProvider</c> — can generate static or dynamic QR payment codes.</summary>
+    QrCode = 1 << 16,
+
+    /// <summary>Implements <c>IMandateProvider</c> — supports debit-order / pull-payment mandates.</summary>
+    Mandates = 1 << 17,
+
+    /// <summary>Implements <c>IMarketplaceProvider</c> — supports split payments and sub-merchant accounts.</summary>
+    Marketplace = 1 << 18,
+
+    /// <summary>Honours per-request <c>IdempotencyKey</c> — safe to retry on transient failure.</summary>
+    Idempotency = 1 << 19,
+
+    /// <summary>Returns strongly-typed <see cref="Models.Webhooks.WebhookEventCategory"/> events from <c>ParseWebhookAsync</c>.</summary>
+    TypedWebhooks = 1 << 20,
+
+    /// <summary>Accepts partial refunds where the refund amount is less than the original charge.</summary>
+    PartialRefund = 1 << 21
 }

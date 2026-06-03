@@ -36,12 +36,14 @@ public static class ServiceCollectionExtensions
             throw new ProviderConfigurationException("mpesa", $"{MPesaOptions.ConfigSection}:Passkey is required");
 
         services.AddHttpClient<MPesaPaymentProvider>();
+        services.AddHttpClient<MPesaPayoutProvider>();
         services.AddTransient<IPaymentGatewayProvider, MPesaPaymentProvider>(sp =>
             sp.GetRequiredService<MPesaPaymentProvider>());
         services.AddTransient<IPayoutProvider, MPesaPaymentProvider>(sp =>
             sp.GetRequiredService<MPesaPaymentProvider>());
 
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.MPesa, (sp, _) => sp.GetRequiredService<MPesaPaymentProvider>());
+        services.AddKeyedTransient<IPayoutProvider>(ProviderNames.MPesa, (sp, _) => sp.GetRequiredService<MPesaPayoutProvider>());
         services.AddBhenguPaymentStartupValidation();
 
         return services;

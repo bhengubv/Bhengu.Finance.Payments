@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.MercadoPago.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -35,7 +36,13 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
         ProviderCapabilities.Payout |
         ProviderCapabilities.Webhook |
         ProviderCapabilities.Cards |
-        ProviderCapabilities.BankTransfer;
+        ProviderCapabilities.BankTransfer |
+        ProviderCapabilities.Subscriptions |
+        ProviderCapabilities.QrCode |
+        ProviderCapabilities.Tokenisation |
+        ProviderCapabilities.TypedWebhooks |
+        ProviderCapabilities.PartialRefund |
+        ProviderCapabilities.Idempotency;
 
     public MercadoPagoPaymentProvider(
         HttpClient httpClient,
@@ -229,31 +236,173 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
             _logger.LogInformation("Parsed Mercado Pago webhook event: {Type} action={Action}",
                 webhookEvent.Type, webhookEvent.Action);
 
-            var status = (webhookEvent.Type?.ToLowerInvariant(), webhookEvent.Action?.ToLowerInvariant()) switch
-            {
-                ("payment", "payment.created") or ("payment", "payment.updated") => PaymentStatus.Pending,
-                ("payment", "payment.approved") => PaymentStatus.Completed,
-                ("payment", "payment.failed") or ("payment", "payment.rejected") => PaymentStatus.Failed,
-                ("payment", "payment.cancelled") => PaymentStatus.Cancelled,
-                ("refund", _) => PaymentStatus.Refunded,
-                _ => (PaymentStatus?)null
-            };
-
-            if (status is null || string.IsNullOrEmpty(webhookEvent.Data?.Id))
-                return Task.FromResult<WebhookEvent?>(null);
-
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
-            {
-                GatewayReference = webhookEvent.Data.Id,
-                Status = status.Value,
-                EventType = webhookEvent.Action ?? webhookEvent.Type
-            });
+            var typed = MapTypedEvent(webhookEvent);
+            return Task.FromResult(typed);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to parse Mercado Pago webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
+    }
+
+    // Map Mercado Pago (topic, action) → strongly-typed Bhengu webhook sub-record. Returns the
+    // base WebhookEvent for legacy "payment.approved" topic shapes so existing consumers don't regress.
+    private static WebhookEvent? MapTypedEvent(MercadoPagoWebhookEvent evt)
+    {
+        var topic = evt.Type?.ToLowerInvariant();
+        var action = evt.Action?.ToLowerInvariant();
+        var dataId = evt.Data?.Id;
+        var status = evt.Data?.Status?.ToLowerInvariant();
+        var amount = evt.Data?.TransactionAmount ?? 0m;
+        var currency = evt.Data?.CurrencyId ?? "BRL";
+
+        if (string.IsNullOrEmpty(dataId))
+            return null;
+
+        switch (topic)
+        {
+            case "payment":
+                if (action == "payment.created")
+                    return new ChargePendingEvent
+                    {
+                        GatewayReference = dataId,
+                        Status = PaymentStatus.Pending,
+                        EventType = evt.Action,
+                        Category = WebhookEventCategory.ChargePending,
+                        Amount = amount,
+                        Currency = currency
+                    };
+
+                if (action == "payment.updated" || action == "payment.approved")
+                {
+                    // payment.approved is its own terminal signal regardless of whether the body
+                    // carries a status field (older webhook contract did not).
+                    if (action == "payment.approved" || status == "approved")
+                        return new ChargeSucceededEvent
+                        {
+                            GatewayReference = dataId,
+                            Status = PaymentStatus.Completed,
+                            EventType = evt.Action,
+                            Category = WebhookEventCategory.ChargeSucceeded,
+                            Amount = amount,
+                            Currency = currency
+                        };
+
+                    if (status == "rejected" || status == "failed")
+                        return new ChargeFailedEvent
+                        {
+                            GatewayReference = dataId,
+                            Status = PaymentStatus.Failed,
+                            EventType = evt.Action,
+                            Category = WebhookEventCategory.ChargeFailed,
+                            Amount = amount,
+                            Currency = currency,
+                            FailureCode = evt.Data?.StatusDetail
+                        };
+
+                    if (status == "refunded" || status == "charged_back")
+                        return new RefundSucceededEvent
+                        {
+                            GatewayReference = dataId,
+                            Status = PaymentStatus.Refunded,
+                            EventType = evt.Action,
+                            Category = WebhookEventCategory.RefundSucceeded,
+                            RefundReference = dataId,
+                            Amount = amount,
+                            Currency = currency,
+                            IsPartial = false
+                        };
+
+                    // Fallback: payment.updated with an unmapped status — still surface the event.
+                    return new WebhookEvent
+                    {
+                        GatewayReference = dataId,
+                        Status = MapStatus(status ?? string.Empty),
+                        EventType = evt.Action,
+                        Category = WebhookEventCategory.Unknown
+                    };
+                }
+
+                if (action == "payment.cancelled")
+                    return new ChargeFailedEvent
+                    {
+                        GatewayReference = dataId,
+                        Status = PaymentStatus.Cancelled,
+                        EventType = evt.Action,
+                        Category = WebhookEventCategory.ChargeFailed,
+                        Amount = amount,
+                        Currency = currency,
+                        FailureCode = "cancelled"
+                    };
+                break;
+
+            case "refund":
+                return new RefundSucceededEvent
+                {
+                    GatewayReference = dataId,
+                    Status = PaymentStatus.Refunded,
+                    EventType = evt.Action,
+                    Category = WebhookEventCategory.RefundSucceeded,
+                    RefundReference = dataId,
+                    Amount = amount,
+                    Currency = currency,
+                    IsPartial = false
+                };
+
+            case "preapproval":
+                if (action == "updated" || action == "preapproval.updated")
+                {
+                    if (status == "cancelled" || status == "canceled")
+                        return new SubscriptionCancelledEvent
+                        {
+                            GatewayReference = dataId,
+                            Status = PaymentStatus.Cancelled,
+                            EventType = evt.Action,
+                            Category = WebhookEventCategory.SubscriptionCancelled,
+                            SubscriptionReference = dataId,
+                            CancellationReason = "cancelled"
+                        };
+
+                    if (status == "paused")
+                        return new SubscriptionCancelledEvent
+                        {
+                            GatewayReference = dataId,
+                            Status = PaymentStatus.Cancelled,
+                            EventType = evt.Action,
+                            Category = WebhookEventCategory.SubscriptionCancelled,
+                            SubscriptionReference = dataId,
+                            CancellationReason = "paused"
+                        };
+                }
+                break;
+
+            case "subscription_authorized_payment":
+                return new SubscriptionRenewedEvent
+                {
+                    GatewayReference = dataId,
+                    Status = PaymentStatus.Completed,
+                    EventType = evt.Action ?? evt.Type,
+                    Category = WebhookEventCategory.SubscriptionRenewed,
+                    SubscriptionReference = dataId,
+                    Amount = amount,
+                    Currency = currency
+                };
+        }
+
+        // Legacy approved-only topic shape kept for callers that have been relying on it.
+        if (topic == "payment" && action == "payment.approved")
+            return new ChargeSucceededEvent
+            {
+                GatewayReference = dataId,
+                Status = PaymentStatus.Completed,
+                EventType = evt.Action,
+                Category = WebhookEventCategory.ChargeSucceeded,
+                Amount = amount,
+                Currency = currency
+            };
+
+        return null;
     }
 
     private async Task<(string Body, HttpResponseMessage Response)> SendAsync(
@@ -351,5 +500,9 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
     private sealed class MercadoPagoWebhookData
     {
         [JsonPropertyName("id")] public string? Id { get; set; }
+        [JsonPropertyName("status")] public string? Status { get; set; }
+        [JsonPropertyName("status_detail")] public string? StatusDetail { get; set; }
+        [JsonPropertyName("transaction_amount")] public decimal? TransactionAmount { get; set; }
+        [JsonPropertyName("currency_id")] public string? CurrencyId { get; set; }
     }
 }

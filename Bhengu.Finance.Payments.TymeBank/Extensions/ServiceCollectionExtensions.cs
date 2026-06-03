@@ -40,6 +40,11 @@ public static class ServiceCollectionExtensions
         // Register as keyed service so consumers can resolve by name: [FromKeyedServices(ProviderNames.TymeBank)]
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.TymeBank, (sp, _) => sp.GetRequiredService<TymeBankPaymentProvider>());
 
+        // Debit-order mandate provider — uses the same OAuth2 credentials as the payment provider.
+        services.AddHttpClient<TymeBankMandateProvider>();
+        services.AddTransient<IMandateProvider, TymeBankMandateProvider>(sp => sp.GetRequiredService<TymeBankMandateProvider>());
+        services.AddKeyedTransient<IMandateProvider>(ProviderNames.TymeBank, (sp, _) => sp.GetRequiredService<TymeBankMandateProvider>());
+
         // Eager startup validation — fails the app at startup if config is broken (vs first request)
         services.AddBhenguPaymentStartupValidation();
 

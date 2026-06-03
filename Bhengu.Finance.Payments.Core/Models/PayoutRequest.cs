@@ -18,4 +18,13 @@ public sealed record PayoutRequest
 
     /// <summary>Human-readable description.</summary>
     public required string Description { get; init; }
+
+    /// <summary>
+    /// Caller-supplied idempotency key. Providers that support <see cref="ProviderCapabilities.Idempotency"/>
+    /// dedupe retries so a network blip won't pay out twice. Use a UUID per logical disbursement decision.
+    /// </summary>
+    public string? IdempotencyKey { get; init; }
+
+    /// <summary>Provider-specific extension fields (e.g. narrative, beneficiary reference).</summary>
+    public IReadOnlyDictionary<string, string>? Metadata { get; init; }
 }

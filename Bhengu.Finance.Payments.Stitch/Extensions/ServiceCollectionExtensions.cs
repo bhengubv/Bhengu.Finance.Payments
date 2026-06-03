@@ -41,6 +41,16 @@ public static class ServiceCollectionExtensions
         // Register as keyed service so consumers can resolve by name: [FromKeyedServices(ProviderNames.Stitch)]
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Stitch, (sp, _) => sp.GetRequiredService<StitchPaymentProvider>());
 
+        // DebiCheck mandate provider — only registered when the OAuth2 client_secret is set, since
+        // mandate operations require the full client_credentials grant (the simpler X-API-Key
+        // shortcut works for pay-by-bank but DebiCheck needs the scoped bearer token).
+        if (!string.IsNullOrWhiteSpace(probe.ClientSecret))
+        {
+            services.AddHttpClient<StitchMandateProvider>();
+            services.AddTransient<IMandateProvider, StitchMandateProvider>(sp => sp.GetRequiredService<StitchMandateProvider>());
+            services.AddKeyedTransient<IMandateProvider>(ProviderNames.Stitch, (sp, _) => sp.GetRequiredService<StitchMandateProvider>());
+        }
+
         // Eager startup validation — fails the app at startup if config is broken (vs first request)
         services.AddBhenguPaymentStartupValidation();
 

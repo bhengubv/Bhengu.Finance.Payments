@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Yoco.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -29,12 +30,18 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
 
     public string ProviderName => ProviderNames.Yoco;
 
+    /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
         ProviderCapabilities.Refund |
+        ProviderCapabilities.PartialRefund |
         ProviderCapabilities.Webhook |
+        ProviderCapabilities.TypedWebhooks |
         ProviderCapabilities.SyncSettlement |
-        ProviderCapabilities.Cards;
+        ProviderCapabilities.Cards |
+        ProviderCapabilities.Tokenisation |
+        ProviderCapabilities.Payout |
+        ProviderCapabilities.Settlement;
 
     public YocoPaymentProvider(
         HttpClient httpClient,
@@ -140,6 +147,20 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
         }
     }
 
+    /// <summary>
+    /// Parse a Yoco webhook payload into a typed <see cref="WebhookEvent"/> sub-record.
+    /// </summary>
+    /// <remarks>
+    /// Mapping rules (Yoco webhook <c>type</c>):
+    /// <list type="bullet">
+    /// <item><description><c>payment.succeeded</c> / <c>charge.succeeded</c> → <see cref="ChargeSucceededEvent"/>.</description></item>
+    /// <item><description><c>payment.failed</c> / <c>charge.failed</c> → <see cref="ChargeFailedEvent"/>.</description></item>
+    /// <item><description><c>refund.succeeded</c> → <see cref="RefundSucceededEvent"/>.</description></item>
+    /// <item><description><c>refund.failed</c> → <see cref="RefundFailedEvent"/>.</description></item>
+    /// <item><description><c>payout.completed</c> → <see cref="PayoutCompletedEvent"/>.</description></item>
+    /// <item><description><c>payout.failed</c> → <see cref="PayoutFailedEvent"/>.</description></item>
+    /// </list>
+    /// </remarks>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -147,27 +168,89 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
         try
         {
             var webhookEvent = JsonSerializer.Deserialize<YocoWebhookEvent>(payload);
-            if (webhookEvent is null) return Task.FromResult<WebhookEvent?>(null);
+            if (webhookEvent is null || string.IsNullOrEmpty(webhookEvent.Payload?.Id))
+                return Task.FromResult<WebhookEvent?>(null);
 
             _logger.LogInformation("Parsed Yoco webhook event: {EventType}", webhookEvent.Type);
 
-            var status = webhookEvent.Type?.ToLowerInvariant() switch
+            var type = webhookEvent.Type?.ToLowerInvariant() ?? string.Empty;
+            var id = webhookEvent.Payload.Id;
+            var amount = webhookEvent.Payload.AmountInCents / 100m;
+            var currency = (webhookEvent.Payload.Currency ?? "ZAR").ToUpperInvariant();
+
+            WebhookEvent? typed = type switch
             {
-                "payment.succeeded" => PaymentStatus.Completed,
-                "payment.failed" => PaymentStatus.Failed,
-                "refund.succeeded" => PaymentStatus.Refunded,
-                _ => (PaymentStatus?)null
+                "payment.succeeded" or "charge.succeeded" => new ChargeSucceededEvent
+                {
+                    GatewayReference = id,
+                    Status = PaymentStatus.Completed,
+                    EventType = webhookEvent.Type,
+                    Category = WebhookEventCategory.ChargeSucceeded,
+                    Amount = amount,
+                    Currency = currency,
+                    CustomerId = webhookEvent.Payload.CustomerId,
+                    PaymentMethodToken = webhookEvent.Payload.CardId
+                },
+                "payment.failed" or "charge.failed" => new ChargeFailedEvent
+                {
+                    GatewayReference = id,
+                    Status = PaymentStatus.Failed,
+                    EventType = webhookEvent.Type,
+                    Category = WebhookEventCategory.ChargeFailed,
+                    Amount = amount,
+                    Currency = currency,
+                    FailureCode = webhookEvent.Payload.FailureCode,
+                    FailureMessage = webhookEvent.Payload.FailureMessage
+                },
+                "refund.succeeded" => new RefundSucceededEvent
+                {
+                    GatewayReference = webhookEvent.Payload.ChargeId ?? id,
+                    Status = PaymentStatus.Refunded,
+                    EventType = webhookEvent.Type,
+                    Category = WebhookEventCategory.RefundSucceeded,
+                    RefundReference = id,
+                    Amount = amount,
+                    Currency = currency,
+                    IsPartial = webhookEvent.Payload.IsPartial
+                },
+                "refund.failed" => new RefundFailedEvent
+                {
+                    GatewayReference = webhookEvent.Payload.ChargeId ?? id,
+                    Status = PaymentStatus.Failed,
+                    EventType = webhookEvent.Type,
+                    Category = WebhookEventCategory.RefundFailed,
+                    Amount = amount,
+                    Currency = currency,
+                    FailureCode = webhookEvent.Payload.FailureCode,
+                    FailureMessage = webhookEvent.Payload.FailureMessage
+                },
+                "payout.completed" => new PayoutCompletedEvent
+                {
+                    GatewayReference = id,
+                    Status = PaymentStatus.Completed,
+                    EventType = webhookEvent.Type,
+                    Category = WebhookEventCategory.PayoutCompleted,
+                    PayoutReference = id,
+                    Amount = amount,
+                    Currency = currency,
+                    DestinationToken = webhookEvent.Payload.BankAccountId
+                },
+                "payout.failed" => new PayoutFailedEvent
+                {
+                    GatewayReference = id,
+                    Status = PaymentStatus.Failed,
+                    EventType = webhookEvent.Type,
+                    Category = WebhookEventCategory.PayoutFailed,
+                    PayoutReference = id,
+                    Amount = amount,
+                    Currency = currency,
+                    FailureCode = webhookEvent.Payload.FailureCode,
+                    FailureMessage = webhookEvent.Payload.FailureMessage
+                },
+                _ => null
             };
 
-            if (status is null || string.IsNullOrEmpty(webhookEvent.Payload?.Id))
-                return Task.FromResult<WebhookEvent?>(null);
-
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
-            {
-                GatewayReference = webhookEvent.Payload.Id,
-                Status = status.Value,
-                EventType = webhookEvent.Type
-            });
+            return Task.FromResult(typed);
         }
         catch (Exception ex)
         {
@@ -245,6 +328,21 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
     private sealed class YocoWebhookEvent
     {
         [JsonPropertyName("type")] public string? Type { get; set; }
-        [JsonPropertyName("payload")] public YocoChargeResponse? Payload { get; set; }
+        [JsonPropertyName("payload")] public YocoWebhookPayload? Payload { get; set; }
+    }
+
+    private sealed class YocoWebhookPayload
+    {
+        [JsonPropertyName("id")] public string? Id { get; set; }
+        [JsonPropertyName("chargeId")] public string? ChargeId { get; set; }
+        [JsonPropertyName("status")] public string? Status { get; set; }
+        [JsonPropertyName("amountInCents")] public int AmountInCents { get; set; }
+        [JsonPropertyName("currency")] public string? Currency { get; set; }
+        [JsonPropertyName("customerId")] public string? CustomerId { get; set; }
+        [JsonPropertyName("cardId")] public string? CardId { get; set; }
+        [JsonPropertyName("bankAccountId")] public string? BankAccountId { get; set; }
+        [JsonPropertyName("failureCode")] public string? FailureCode { get; set; }
+        [JsonPropertyName("failureMessage")] public string? FailureMessage { get; set; }
+        [JsonPropertyName("isPartial")] public bool IsPartial { get; set; }
     }
 }

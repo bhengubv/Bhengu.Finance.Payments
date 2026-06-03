@@ -36,12 +36,14 @@ public static class ServiceCollectionExtensions
             throw new ProviderConfigurationException("mtnmomo", $"{MTNMoMoOptions.ConfigSection}:TargetEnvironment is required");
 
         services.AddHttpClient<MTNMoMoPaymentProvider>();
+        services.AddHttpClient<MTNMoMoPayoutProvider>();
         services.AddTransient<IPaymentGatewayProvider, MTNMoMoPaymentProvider>(sp =>
             sp.GetRequiredService<MTNMoMoPaymentProvider>());
         services.AddTransient<IPayoutProvider, MTNMoMoPaymentProvider>(sp =>
             sp.GetRequiredService<MTNMoMoPaymentProvider>());
 
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.MTNMoMo, (sp, _) => sp.GetRequiredService<MTNMoMoPaymentProvider>());
+        services.AddKeyedTransient<IPayoutProvider>(ProviderNames.MTNMoMo, (sp, _) => sp.GetRequiredService<MTNMoMoPayoutProvider>());
         services.AddBhenguPaymentStartupValidation();
 
         return services;

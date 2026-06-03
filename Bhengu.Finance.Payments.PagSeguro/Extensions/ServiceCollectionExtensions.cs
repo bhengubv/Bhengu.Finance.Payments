@@ -36,6 +36,22 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<PagSeguroPaymentProvider>());
 
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.PagSeguro, (sp, _) => sp.GetRequiredService<PagSeguroPaymentProvider>());
+
+        // Recurring billing (PagBank /recurring/orders).
+        services.AddHttpClient<PagSeguroSubscriptionProvider>();
+        services.AddTransient<ISubscriptionProvider, PagSeguroSubscriptionProvider>(sp => sp.GetRequiredService<PagSeguroSubscriptionProvider>());
+        services.AddKeyedTransient<ISubscriptionProvider>(ProviderNames.PagSeguro, (sp, _) => sp.GetRequiredService<PagSeguroSubscriptionProvider>());
+
+        // PIX QR code generation.
+        services.AddHttpClient<PagSeguroQrCodeProvider>();
+        services.AddTransient<IQrCodeProvider, PagSeguroQrCodeProvider>(sp => sp.GetRequiredService<PagSeguroQrCodeProvider>());
+        services.AddKeyedTransient<IQrCodeProvider>(ProviderNames.PagSeguro, (sp, _) => sp.GetRequiredService<PagSeguroQrCodeProvider>());
+
+        // Server-side card tokenisation (SAQ-D).
+        services.AddHttpClient<PagSeguroTokenisationProvider>();
+        services.AddTransient<ITokenisationProvider, PagSeguroTokenisationProvider>(sp => sp.GetRequiredService<PagSeguroTokenisationProvider>());
+        services.AddKeyedTransient<ITokenisationProvider>(ProviderNames.PagSeguro, (sp, _) => sp.GetRequiredService<PagSeguroTokenisationProvider>());
+
         services.AddBhenguPaymentStartupValidation();
 
         return services;

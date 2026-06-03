@@ -30,12 +30,14 @@ public static class ServiceCollectionExtensions
             throw new ProviderConfigurationException("wave", $"{WaveOptions.ConfigSection}:ApiKey is required");
 
         services.AddHttpClient<WavePaymentProvider>();
+        services.AddHttpClient<WavePayoutProvider>();
         services.AddTransient<IPaymentGatewayProvider, WavePaymentProvider>(sp =>
             sp.GetRequiredService<WavePaymentProvider>());
         services.AddTransient<IPayoutProvider, WavePaymentProvider>(sp =>
             sp.GetRequiredService<WavePaymentProvider>());
 
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Wave, (sp, _) => sp.GetRequiredService<WavePaymentProvider>());
+        services.AddKeyedTransient<IPayoutProvider>(ProviderNames.Wave, (sp, _) => sp.GetRequiredService<WavePayoutProvider>());
         services.AddBhenguPaymentStartupValidation();
 
         return services;

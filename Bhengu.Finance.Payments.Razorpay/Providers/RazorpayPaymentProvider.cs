@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Razorpay.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -42,7 +43,16 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         ProviderCapabilities.Payout |
         ProviderCapabilities.Webhook |
         ProviderCapabilities.Cards |
-        ProviderCapabilities.BankTransfer;
+        ProviderCapabilities.BankTransfer |
+        ProviderCapabilities.Tokenisation |
+        ProviderCapabilities.Subscriptions |
+        ProviderCapabilities.Settlement |
+        ProviderCapabilities.Mandates |
+        ProviderCapabilities.Marketplace |
+        ProviderCapabilities.Idempotency |
+        ProviderCapabilities.TypedWebhooks |
+        ProviderCapabilities.PartialRefund |
+        ProviderCapabilities.Disputes;
 
     public RazorpayPaymentProvider(
         HttpClient httpClient,
@@ -89,7 +99,7 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
                 partial_payment = false
             };
 
-            var orderRaw = await SendAsync(HttpMethod.Post, "v1/orders", orderBody, ct, "CreateOrder").ConfigureAwait(false);
+            var orderRaw = await SendAsync(HttpMethod.Post, "v1/orders", orderBody, ct, "CreateOrder", request.IdempotencyKey).ConfigureAwait(false);
             var order = JsonSerializer.Deserialize<RazorpayOrderResponse>(orderRaw);
 
             _logger.LogInformation("Razorpay order created: {OrderId} status={Status}", order?.Id, order?.Status);
@@ -115,7 +125,7 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         var raw = await SendAsync(
             HttpMethod.Post,
             $"v1/payments/{Uri.EscapeDataString(request.PaymentMethodToken)}/capture",
-            captureBody, ct, "CapturePayment").ConfigureAwait(false);
+            captureBody, ct, "CapturePayment", request.IdempotencyKey).ConfigureAwait(false);
         var payment = JsonSerializer.Deserialize<RazorpayPaymentResponse>(raw);
 
         _logger.LogInformation("Razorpay payment captured: {PaymentId} status={Status}", payment?.Id, payment?.Status);
@@ -146,7 +156,7 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         var raw = await SendAsync(
             HttpMethod.Post,
             $"v1/payments/{Uri.EscapeDataString(request.GatewayReference)}/refund",
-            refundBody, ct, "ProcessRefund").ConfigureAwait(false);
+            refundBody, ct, "ProcessRefund", request.IdempotencyKey).ConfigureAwait(false);
         var refund = JsonSerializer.Deserialize<RazorpayRefundResponse>(raw);
 
         _logger.LogInformation("Razorpay refund created: {RefundId} for payment {PaymentId}",
@@ -188,7 +198,7 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
             narration = request.Description ?? "Bhengu payout"
         };
 
-        var raw = await SendAsync(HttpMethod.Post, "v1/payouts", payoutBody, ct, "ProcessPayout").ConfigureAwait(false);
+        var raw = await SendAsync(HttpMethod.Post, "v1/payouts", payoutBody, ct, "ProcessPayout", request.IdempotencyKey).ConfigureAwait(false);
         var payout = JsonSerializer.Deserialize<RazorpayPayoutResponse>(raw);
 
         _logger.LogInformation("Razorpay payout created: {PayoutId} status={Status}", payout?.Id, payout?.Status);
@@ -242,29 +252,8 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
 
             _logger.LogInformation("Parsed Razorpay webhook event: {EventType}", webhookEvent.Event);
 
-            var status = webhookEvent.Event?.ToLowerInvariant() switch
-            {
-                "payment.captured" or "payment.authorized" or "order.paid" => PaymentStatus.Completed,
-                "payment.failed" => PaymentStatus.Failed,
-                "refund.created" or "refund.processed" => PaymentStatus.Refunded,
-                "payout.processed" => PaymentStatus.Completed,
-                _ => (PaymentStatus?)null
-            };
-
-            var reference = webhookEvent.Payload?.Payment?.Entity?.Id
-                ?? webhookEvent.Payload?.Refund?.Entity?.Id
-                ?? webhookEvent.Payload?.Order?.Entity?.Id
-                ?? webhookEvent.Payload?.Payout?.Entity?.Id;
-
-            if (status is null || string.IsNullOrEmpty(reference))
-                return Task.FromResult<WebhookEvent?>(null);
-
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
-            {
-                GatewayReference = reference,
-                Status = status.Value,
-                EventType = webhookEvent.Event
-            });
+            var typed = MapTypedEvent(webhookEvent);
+            return Task.FromResult(typed);
         }
         catch (Exception ex)
         {
@@ -273,13 +262,279 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         }
     }
 
-    private async Task<string> SendAsync(HttpMethod method, string path, object body, CancellationToken ct, string operation)
+    // Map Razorpay event name → strongly-typed Bhengu webhook sub-record.
+    // Unrecognised events return null so callers don't get false-positive signals.
+    private static WebhookEvent? MapTypedEvent(RazorpayWebhookEvent evt)
+    {
+        var eventName = evt.Event?.ToLowerInvariant();
+        var payment = evt.Payload?.Payment?.Entity;
+        var refund = evt.Payload?.Refund?.Entity;
+        var payout = evt.Payload?.Payout?.Entity;
+        var subscription = evt.Payload?.Subscription?.Entity;
+        var settlement = evt.Payload?.Settlement?.Entity;
+        var token = evt.Payload?.Token?.Entity;
+        var dispute = evt.Payload?.Dispute?.Entity;
+
+        switch (eventName)
+        {
+            case "payment.captured":
+                if (payment is null) return null;
+                return new ChargeSucceededEvent
+                {
+                    GatewayReference = payment.Id ?? string.Empty,
+                    Status = PaymentStatus.Completed,
+                    EventType = evt.Event,
+                    Category = WebhookEventCategory.ChargeSucceeded,
+                    Amount = payment.Amount / 100m,
+                    Currency = payment.Currency ?? "INR",
+                    CustomerId = payment.CustomerId,
+                    PaymentMethodToken = payment.TokenId ?? payment.Id
+                };
+
+            case "payment.failed":
+                if (payment is null) return null;
+                return new ChargeFailedEvent
+                {
+                    GatewayReference = payment.Id ?? string.Empty,
+                    Status = PaymentStatus.Failed,
+                    EventType = evt.Event,
+                    Category = WebhookEventCategory.ChargeFailed,
+                    Amount = payment.Amount / 100m,
+                    Currency = payment.Currency ?? "INR",
+                    FailureCode = payment.ErrorCode,
+                    FailureMessage = payment.ErrorDescription
+                };
+
+            case "payment.authorized":
+                if (payment is null) return null;
+                return new ChargePendingEvent
+                {
+                    GatewayReference = payment.Id ?? string.Empty,
+                    Status = PaymentStatus.Pending,
+                    EventType = evt.Event,
+                    Category = WebhookEventCategory.ChargePending,
+                    Amount = payment.Amount / 100m,
+                    Currency = payment.Currency ?? "INR"
+                };
+
+            case "refund.processed":
+                if (refund is null) return null;
+                return new RefundSucceededEvent
+                {
+                    GatewayReference = refund.PaymentId ?? string.Empty,
+                    Status = PaymentStatus.Refunded,
+                    EventType = evt.Event,
+                    Category = WebhookEventCategory.RefundSucceeded,
+                    RefundReference = refund.Id ?? string.Empty,
+                    Amount = refund.Amount / 100m,
+                    Currency = refund.Currency ?? "INR",
+                    IsPartial = false
+                };
+
+            case "refund.failed":
+                if (refund is null) return null;
+                return new RefundFailedEvent
+                {
+                    GatewayReference = refund.PaymentId ?? string.Empty,
+                    Status = PaymentStatus.Failed,
+                    EventType = evt.Event,
+                    Category = WebhookEventCategory.RefundFailed,
+                    Amount = refund.Amount / 100m,
+                    Currency = refund.Currency ?? "INR"
+                };
+
+            case "subscription.activated":
+                if (subscription is null) return null;
+                return new SubscriptionCreatedEvent
+                {
+                    GatewayReference = subscription.Id ?? string.Empty,
+                    Status = PaymentStatus.Completed,
+                    EventType = evt.Event,
+                    Category = WebhookEventCategory.SubscriptionCreated,
+                    SubscriptionReference = subscription.Id ?? string.Empty,
+                    PlanReference = subscription.PlanId ?? string.Empty,
+                    CustomerId = subscription.CustomerId,
+                    NextBillingAt = subscription.ChargeAt is > 0 ? DateTimeOffset.FromUnixTimeSeconds(subscription.ChargeAt.Value).UtcDateTime : null
+                };
+
+            case "subscription.charged":
+                if (subscription is null) return null;
+                return new SubscriptionRenewedEvent
+                {
+                    GatewayReference = subscription.Id ?? string.Empty,
+                    Status = PaymentStatus.Completed,
+                    EventType = evt.Event,
+                    Category = WebhookEventCategory.SubscriptionRenewed,
+                    SubscriptionReference = subscription.Id ?? string.Empty,
+                    Amount = payment?.Amount / 100m ?? 0m,
+                    Currency = payment?.Currency ?? "INR",
+                    NextBillingAt = subscription.ChargeAt is > 0 ? DateTimeOffset.FromUnixTimeSeconds(subscription.ChargeAt.Value).UtcDateTime : null
+                };
+
+            case "subscription.completed":
+            case "subscription.cancelled":
+            case "subscription.halted":
+                if (subscription is null) return null;
+                return new SubscriptionCancelledEvent
+                {
+                    GatewayReference = subscription.Id ?? string.Empty,
+                    Status = PaymentStatus.Cancelled,
+                    EventType = evt.Event,
+                    Category = WebhookEventCategory.SubscriptionCancelled,
+                    SubscriptionReference = subscription.Id ?? string.Empty,
+                    CancellationReason = eventName
+                };
+
+            case "subscription.pending":
+                if (subscription is null) return null;
+                return new SubscriptionChargeFailedEvent
+                {
+                    GatewayReference = subscription.Id ?? string.Empty,
+                    Status = PaymentStatus.Failed,
+                    EventType = evt.Event,
+                    Category = WebhookEventCategory.SubscriptionChargeFailed,
+                    SubscriptionReference = subscription.Id ?? string.Empty,
+                    Amount = 0m,
+                    Currency = "INR"
+                };
+
+            case "payout.processed":
+                if (payout is null) return null;
+                return new PayoutCompletedEvent
+                {
+                    GatewayReference = payout.Id ?? string.Empty,
+                    Status = PaymentStatus.Completed,
+                    EventType = evt.Event,
+                    Category = WebhookEventCategory.PayoutCompleted,
+                    PayoutReference = payout.Id ?? string.Empty,
+                    Amount = payout.Amount / 100m,
+                    Currency = payout.Currency ?? "INR"
+                };
+
+            case "payout.failed":
+            case "payout.reversed":
+                if (payout is null) return null;
+                return new PayoutFailedEvent
+                {
+                    GatewayReference = payout.Id ?? string.Empty,
+                    Status = PaymentStatus.Failed,
+                    EventType = evt.Event,
+                    Category = WebhookEventCategory.PayoutFailed,
+                    PayoutReference = payout.Id ?? string.Empty,
+                    Amount = payout.Amount / 100m,
+                    Currency = payout.Currency ?? "INR",
+                    FailureCode = eventName == "payout.reversed" ? "reversed" : payout.FailureReason
+                };
+
+            case "settlement.processed":
+                if (settlement is null) return null;
+                return new SettlementCompletedEvent
+                {
+                    GatewayReference = settlement.Id ?? string.Empty,
+                    Status = PaymentStatus.Completed,
+                    EventType = evt.Event,
+                    Category = WebhookEventCategory.SettlementCompleted,
+                    SettlementReference = settlement.Id ?? string.Empty,
+                    NetAmount = settlement.Amount / 100m,
+                    Currency = "INR",
+                    Fees = (settlement.Fees + settlement.Tax) / 100m
+                };
+
+            case "token.confirmed":
+                if (token is null) return null;
+                return new MandateActivatedEvent
+                {
+                    GatewayReference = token.Id ?? string.Empty,
+                    Status = PaymentStatus.Completed,
+                    EventType = evt.Event,
+                    Category = WebhookEventCategory.MandateActivated,
+                    MandateReference = token.Id ?? string.Empty,
+                    AmountLimit = token.MaxAmount / 100m,
+                    Currency = "INR"
+                };
+
+            case "token.cancelled":
+                if (token is null) return null;
+                return new MandateCancelledEvent
+                {
+                    GatewayReference = token.Id ?? string.Empty,
+                    Status = PaymentStatus.Cancelled,
+                    EventType = evt.Event,
+                    Category = WebhookEventCategory.MandateCancelled,
+                    MandateReference = token.Id ?? string.Empty,
+                    CancellationReason = "cancelled"
+                };
+
+            case "dispute.created":
+                if (dispute is null) return null;
+                return new DisputeOpenedEvent
+                {
+                    GatewayReference = dispute.PaymentId ?? string.Empty,
+                    Status = PaymentStatus.Pending,
+                    EventType = evt.Event,
+                    Category = WebhookEventCategory.DisputeOpened,
+                    DisputeReference = dispute.Id ?? string.Empty,
+                    Amount = dispute.Amount / 100m,
+                    Currency = dispute.Currency ?? "INR",
+                    ReasonCode = dispute.ReasonCode,
+                    EvidenceDueBy = dispute.RespondBy is > 0 ? DateTimeOffset.FromUnixTimeSeconds(dispute.RespondBy.Value).UtcDateTime : null
+                };
+
+            case "dispute.won":
+                if (dispute is null) return null;
+                return new DisputeWonEvent
+                {
+                    GatewayReference = dispute.PaymentId ?? string.Empty,
+                    Status = PaymentStatus.Completed,
+                    EventType = evt.Event,
+                    Category = WebhookEventCategory.DisputeWon,
+                    DisputeReference = dispute.Id ?? string.Empty,
+                    Amount = dispute.Amount / 100m,
+                    Currency = dispute.Currency ?? "INR"
+                };
+
+            case "dispute.lost":
+                if (dispute is null) return null;
+                return new DisputeLostEvent
+                {
+                    GatewayReference = dispute.PaymentId ?? string.Empty,
+                    Status = PaymentStatus.Failed,
+                    EventType = evt.Event,
+                    Category = WebhookEventCategory.DisputeLost,
+                    DisputeReference = dispute.Id ?? string.Empty,
+                    Amount = dispute.Amount / 100m,
+                    Currency = dispute.Currency ?? "INR"
+                };
+
+            // legacy aliases preserved so existing consumers don't regress
+            case "order.paid":
+            case "refund.created":
+                var fallbackRef = payment?.Id ?? refund?.PaymentId ?? evt.Payload?.Order?.Entity?.Id;
+                if (string.IsNullOrEmpty(fallbackRef)) return null;
+                return new WebhookEvent
+                {
+                    GatewayReference = fallbackRef,
+                    Status = eventName == "order.paid" ? PaymentStatus.Completed : PaymentStatus.Refunded,
+                    EventType = evt.Event,
+                    Category = eventName == "order.paid" ? WebhookEventCategory.ChargeSucceeded : WebhookEventCategory.RefundSucceeded
+                };
+
+            default:
+                return null;
+        }
+    }
+
+    private async Task<string> SendAsync(HttpMethod method, string path, object body, CancellationToken ct, string operation, string? idempotencyKey = null)
     {
         var json = JsonSerializer.Serialize(body);
         using var req = new HttpRequestMessage(method, path)
         {
             Content = new StringContent(json, Encoding.UTF8, "application/json")
         };
+
+        // Razorpay accepts a custom header for POST idempotency. Honour the caller's key when supplied.
+        if (!string.IsNullOrWhiteSpace(idempotencyKey))
+            req.Headers.TryAddWithoutValidation("X-Razorpay-IdempotencyKey", idempotencyKey);
 
         HttpResponseMessage response;
         try
@@ -341,6 +596,10 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         [JsonPropertyName("status")] public string? Status { get; set; }
         [JsonPropertyName("order_id")] public string? OrderId { get; set; }
         [JsonPropertyName("method")] public string? Method { get; set; }
+        [JsonPropertyName("customer_id")] public string? CustomerId { get; set; }
+        [JsonPropertyName("token_id")] public string? TokenId { get; set; }
+        [JsonPropertyName("error_code")] public string? ErrorCode { get; set; }
+        [JsonPropertyName("error_description")] public string? ErrorDescription { get; set; }
     }
 
     private sealed class RazorpayRefundResponse
@@ -361,6 +620,61 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         [JsonPropertyName("currency")] public string? Currency { get; set; }
         [JsonPropertyName("status")] public string? Status { get; set; }
         [JsonPropertyName("mode")] public string? Mode { get; set; }
+        [JsonPropertyName("failure_reason")] public string? FailureReason { get; set; }
+    }
+
+    private sealed class RazorpayWebhookSubscriptionEntity
+    {
+        [JsonPropertyName("id")] public string? Id { get; set; }
+        [JsonPropertyName("plan_id")] public string? PlanId { get; set; }
+        [JsonPropertyName("customer_id")] public string? CustomerId { get; set; }
+        [JsonPropertyName("status")] public string? Status { get; set; }
+        [JsonPropertyName("charge_at")] public long? ChargeAt { get; set; }
+    }
+
+    private sealed class RazorpayWebhookSubscriptionWrapper
+    {
+        [JsonPropertyName("entity")] public RazorpayWebhookSubscriptionEntity? Entity { get; set; }
+    }
+
+    private sealed class RazorpayWebhookSettlementEntity
+    {
+        [JsonPropertyName("id")] public string? Id { get; set; }
+        [JsonPropertyName("amount")] public long Amount { get; set; }
+        [JsonPropertyName("fees")] public long Fees { get; set; }
+        [JsonPropertyName("tax")] public long Tax { get; set; }
+    }
+
+    private sealed class RazorpayWebhookSettlementWrapper
+    {
+        [JsonPropertyName("entity")] public RazorpayWebhookSettlementEntity? Entity { get; set; }
+    }
+
+    private sealed class RazorpayWebhookTokenEntity
+    {
+        [JsonPropertyName("id")] public string? Id { get; set; }
+        [JsonPropertyName("max_amount")] public long MaxAmount { get; set; }
+        [JsonPropertyName("recurring_status")] public string? Status { get; set; }
+    }
+
+    private sealed class RazorpayWebhookTokenWrapper
+    {
+        [JsonPropertyName("entity")] public RazorpayWebhookTokenEntity? Entity { get; set; }
+    }
+
+    private sealed class RazorpayWebhookDisputeEntity
+    {
+        [JsonPropertyName("id")] public string? Id { get; set; }
+        [JsonPropertyName("payment_id")] public string? PaymentId { get; set; }
+        [JsonPropertyName("amount")] public long Amount { get; set; }
+        [JsonPropertyName("currency")] public string? Currency { get; set; }
+        [JsonPropertyName("reason_code")] public string? ReasonCode { get; set; }
+        [JsonPropertyName("respond_by")] public long? RespondBy { get; set; }
+    }
+
+    private sealed class RazorpayWebhookDisputeWrapper
+    {
+        [JsonPropertyName("entity")] public RazorpayWebhookDisputeEntity? Entity { get; set; }
     }
 
     private sealed class RazorpayWebhookEvent
@@ -375,6 +689,10 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         [JsonPropertyName("refund")] public RazorpayWebhookRefundWrapper? Refund { get; set; }
         [JsonPropertyName("order")] public RazorpayWebhookOrderWrapper? Order { get; set; }
         [JsonPropertyName("payout")] public RazorpayWebhookPayoutWrapper? Payout { get; set; }
+        [JsonPropertyName("subscription")] public RazorpayWebhookSubscriptionWrapper? Subscription { get; set; }
+        [JsonPropertyName("settlement")] public RazorpayWebhookSettlementWrapper? Settlement { get; set; }
+        [JsonPropertyName("token")] public RazorpayWebhookTokenWrapper? Token { get; set; }
+        [JsonPropertyName("dispute")] public RazorpayWebhookDisputeWrapper? Dispute { get; set; }
     }
 
     private sealed class RazorpayWebhookPaymentWrapper
