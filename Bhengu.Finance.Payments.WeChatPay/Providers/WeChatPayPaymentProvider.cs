@@ -370,7 +370,11 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
         // and a bare SubjectPublicKeyInfo. Try cert first.
         try
         {
+#if NET9_0_OR_GREATER
             var cert = X509CertificateLoader.LoadCertificate(keyBytes);
+#else
+            var cert = new X509Certificate2(keyBytes);
+#endif
             var rsa = cert.GetRSAPublicKey();
             if (rsa is not null) return rsa;
         }

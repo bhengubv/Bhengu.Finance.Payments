@@ -8,23 +8,42 @@
     <PackageLicenseFile></PackageLicenseFile>
     <RepositoryUrl>https://github.com/bhengubv/Bhengu.Finance.Payments</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <PackageTags>Payments;Gateway;PayFast;GooglePay;ApplePay;BricsPay;PayShap</PackageTags>
 
     <!-- 📦 Display -->
     <PackageIcon>icon.png</PackageIcon>
     <PackageIconFullPath>$(MSBuildThisFileDirectory)assets\icon.png</PackageIconFullPath>
+    <PackageReadmeFile Condition="Exists('$(MSBuildProjectDirectory)\README.md')">README.md</PackageReadmeFile>
 
     <!-- 🛠 Build Configuration -->
     <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WarningsAsErrors />
+    <WarningsNotAsErrors>CS1591;NU1510</WarningsNotAsErrors>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+
+    <!-- 🔗 SourceLink + deterministic builds — debuggable stack traces, supply-chain integrity -->
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true' OR '$(TF_BUILD)' == 'true'">true</ContinuousIntegrationBuild>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <DebugType>embedded</DebugType>
   </PropertyGroup>
 
   <ItemGroup>
     <None Include="$(PackageIconFullPath)" Pack="true" PackagePath="\" Condition="Exists('$(PackageIconFullPath)')">
       <Visible>false</Visible>
     </None>
+    <None Include="$(MSBuildProjectDirectory)\README.md" Pack="true" PackagePath="\" Condition="Exists('$(MSBuildProjectDirectory)\README.md')" />
+  </ItemGroup>
+
+  <!-- SourceLink for GitHub-hosted repos. Pulled only when packing so test/host projects don't take the dependency. -->
+  <ItemGroup Condition="'$(IsPackable)' == 'true'">
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
   </ItemGroup>
 
   <Target Name="ValidateIconAsset" BeforeTargets="Pack">

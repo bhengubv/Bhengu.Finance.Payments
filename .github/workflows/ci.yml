@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build + Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # for SourceLink
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/Directory.Build.props') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      - name: Restore
+        run: dotnet restore Bhengu.Finance.Payments.Tests/Bhengu.Finance.Payments.Tests.csproj
+
+      - name: Build (Debug)
+        run: dotnet build Bhengu.Finance.Payments.Tests/Bhengu.Finance.Payments.Tests.csproj --no-restore --configuration Debug -warnaserror
+
+      - name: Test
+        run: dotnet test Bhengu.Finance.Payments.Tests/Bhengu.Finance.Payments.Tests.csproj --no-build --configuration Debug --logger "trx;LogFileName=test-results.trx" --logger "console;verbosity=normal"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: '**/TestResults/test-results.trx'
+
+  build-multi-target:
+    name: Build providers (net8.0 + net10.0)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Restore Core
+        run: dotnet restore Bhengu.Finance.Payments.Core/Bhengu.Finance.Payments.Core.csproj
+
+      - name: Build Core (both frameworks)
+        run: dotnet build Bhengu.Finance.Payments.Core/Bhengu.Finance.Payments.Core.csproj --no-restore --configuration Release -warnaserror
+
+      - name: Build all packable providers
+        shell: bash
+        run: |
+          set -euo pipefail
+          for proj in $(find . -name "Bhengu.Finance.Payments.*.csproj" \
+                       ! -path "*/Bhengu.Finance.Payments.Tests/*" \
+                       ! -path "*/Bhengu.Finance.Payments.IntegrationTests/*" \
+                       ! -path "*/Bhengu.Finance.Payments.ApiHost/*" \
+                       ! -path "*/Bhengu.Finance.Payments.All/*"); do
+            echo "::group::$proj"
+            dotnet build "$proj" --configuration Release -warnaserror
+            echo "::endgroup::"
+          done

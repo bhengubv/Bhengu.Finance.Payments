@@ -1,8 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
     <IsPackable>true</IsPackable>
-    <Version>2.0.0-preview.2</Version>
+    <Version>2.0.0-preview.3</Version>
     <PackageId>Bhengu.Finance.Payments.All</PackageId>
     <Authors>T.M. Bengu</Authors>
     <Company>Bhengu B.V.</Company>
@@ -11,52 +11,52 @@
     <RepositoryUrl>https://github.com/bhengubv/Bhengu.Finance.Payments</RepositoryUrl>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="Bhengu.Finance.Payments.Core" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.PayFast" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Google" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.ApplePay" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.BricsPay" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.PayShap" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Stripe" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Yoco" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Paystack" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.PayJustNow" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Ozow" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.MPesa" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.MTNMoMo" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.AirtelMoney" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.OrangeMoney" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Interswitch" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.OPay" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Moniepoint" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.ChipperCash" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Wave" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.EcoCash" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Flutterwave" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Cellulant" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.DPO" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Onafriq" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Fawry" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Paymob" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Kashier" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.CMI" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Remita" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Mukuru" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.TymeBank" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Stitch" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Pesapal" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.IPay" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.JamboPay" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Hubtel" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.ExpressPay" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Slydepay" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.MercadoPago" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.PagSeguro" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Alipay" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.WeChatPay" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.UnionPay" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Razorpay" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.PayUIndia" Version="2.0.0-preview.2" />
-    <PackageReference Include="Bhengu.Finance.Payments.Paytm" Version="2.0.0-preview.2" />
+    <PackageReference Include="Bhengu.Finance.Payments.Core" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.PayFast" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Google" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.ApplePay" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.BricsPay" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.PayShap" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Stripe" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Yoco" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Paystack" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.PayJustNow" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Ozow" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.MPesa" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.MTNMoMo" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.AirtelMoney" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.OrangeMoney" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Interswitch" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.OPay" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Moniepoint" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.ChipperCash" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Wave" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.EcoCash" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Flutterwave" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Cellulant" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.DPO" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Onafriq" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Fawry" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Paymob" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Kashier" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.CMI" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Remita" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Mukuru" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.TymeBank" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Stitch" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Pesapal" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.IPay" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.JamboPay" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Hubtel" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.ExpressPay" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Slydepay" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.MercadoPago" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.PagSeguro" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Alipay" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.WeChatPay" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.UnionPay" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Razorpay" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.PayUIndia" Version="2.0.0-preview.3" />
+    <PackageReference Include="Bhengu.Finance.Payments.Paytm" Version="2.0.0-preview.3" />
   </ItemGroup>
 </Project>

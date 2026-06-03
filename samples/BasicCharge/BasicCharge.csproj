@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <UserSecretsId>bhengu-payments-sample-basic</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Bhengu.Finance.Payments.Core\Bhengu.Finance.Payments.Core.csproj" />
+    <ProjectReference Include="..\..\Bhengu.Finance.Payments.PayFast\Bhengu.Finance.Payments.PayFast.csproj" />
+    <ProjectReference Include="..\..\Bhengu.Finance.Payments.Stripe\Bhengu.Finance.Payments.Stripe.csproj" />
+  </ItemGroup>
+</Project>
