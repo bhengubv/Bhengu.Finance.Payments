@@ -2,7 +2,6 @@
 
 using System.Net;
 using System.Net.Http.Headers;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -11,8 +10,9 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.PagSeguro.Configuration;
-using Bhengu.Finance.Payments.PagSeguro.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -23,13 +23,12 @@ namespace Bhengu.Finance.Payments.PagSeguro.Providers;
 /// for card, PIX, boleto and wallet payments, refunds and bank-transfer payouts.
 /// PagBank models payments as <c>orders</c> with one-or-more <c>charges</c>.
 /// </summary>
-public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class PagSeguroPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PagSeguroOptions _options;
-    private readonly ILogger<PagSeguroPaymentProvider> _logger;
 
-    public string ProviderName => ProviderNames.PagSeguro;
+    public override string ProviderName => ProviderNames.PagSeguro;
 
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
@@ -48,10 +47,10 @@ public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutP
         HttpClient httpClient,
         IOptions<PagSeguroOptions> options,
         ILogger<PagSeguroPaymentProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ApiToken))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PagSeguroOptions.ApiToken)} is required");
@@ -71,7 +70,7 @@ public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutP
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return PagSeguroObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+        return RunChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct), ct);
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
@@ -137,7 +136,7 @@ public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutP
         var orderResponse = JsonSerializer.Deserialize<PagSeguroOrderResponse>(body);
 
         var firstCharge = orderResponse?.Charges?.FirstOrDefault();
-        _logger.LogInformation("PagSeguro order created: {OrderId} chargeStatus={Status}",
+        Logger.LogInformation("PagSeguro order created: {OrderId} chargeStatus={Status}",
             orderResponse?.Id, firstCharge?.Status);
 
         return new PaymentResponse
@@ -155,7 +154,7 @@ public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutP
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return PagSeguroObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+        return RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct), ct);
     }
 
     private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
@@ -176,7 +175,7 @@ public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutP
 
         var refundResponse = JsonSerializer.Deserialize<PagSeguroChargeResponse>(body);
 
-        _logger.LogInformation("PagSeguro charge cancelled: {ChargeId} status={Status}",
+        Logger.LogInformation("PagSeguro charge cancelled: {ChargeId} status={Status}",
             refundResponse?.Id, refundResponse?.Status);
 
         return new RefundResponse
@@ -193,7 +192,7 @@ public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutP
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return PagSeguroObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+        return RunPayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct), ct);
     }
 
     private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
@@ -226,7 +225,7 @@ public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutP
         var (body, _) = await SendAsync(HttpMethod.Post, "/transfers", requestBody, ct, "ProcessPayout").ConfigureAwait(false);
         var payoutResponse = JsonSerializer.Deserialize<PagSeguroTransferResponse>(body);
 
-        _logger.LogInformation("PagSeguro transfer created: {TransferId} status={Status}",
+        Logger.LogInformation("PagSeguro transfer created: {TransferId} status={Status}",
             payoutResponse?.Id, payoutResponse?.Status);
 
         return new PayoutResponse
@@ -247,36 +246,18 @@ public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutP
 
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
-            _logger.LogWarning("PagSeguro WebhookSecret not configured — signature verification cannot succeed.");
-            PagSeguroObservability.RecordWebhookVerification(false);
-            return false;
+            Logger.LogWarning("PagSeguro WebhookSecret not configured — signature verification cannot succeed.");
+            return RunWebhookVerify(() => false);
         }
 
-        bool verified;
-        try
-        {
-            using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
-            var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
-            var computedHex = Convert.ToHexString(computedHash).ToLowerInvariant();
-
-            verified = CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
-                Encoding.UTF8.GetBytes(computedHex));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "PagSeguro webhook signature verification raised");
-            verified = false;
-        }
-        PagSeguroObservability.RecordWebhookVerification(verified);
-        return verified;
+        return RunWebhookVerify(() => SignatureHelpers.VerifyHmacSha256(payload, signature, _options.WebhookSecret));
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        return PagSeguroObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+        return RunOperationAsync("parse_webhook", () => ParseWebhookCoreAsync(payload, ct), ct);
     }
 
     private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
@@ -286,14 +267,14 @@ public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutP
             var webhookEvent = JsonSerializer.Deserialize<PagSeguroWebhookEvent>(payload);
             if (webhookEvent is null) return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed PagSeguro webhook: id={Id} event={Event}", webhookEvent.Id, webhookEvent.Event);
+            Logger.LogInformation("Parsed PagSeguro webhook: id={Id} event={Event}", webhookEvent.Id, webhookEvent.Event);
 
             var typed = MapTypedEvent(webhookEvent);
             return Task.FromResult(typed);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse PagSeguro webhook event");
+            Logger.LogError(ex, "Failed to parse PagSeguro webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -468,16 +449,8 @@ public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutP
             Content = new StringContent(json, Encoding.UTF8, "application/json")
         };
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to PagSeguro failed", ex);
-        }
-
+        // HttpRequestException is auto-translated to ProviderUnavailableException by BhenguProviderBase.
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -488,7 +461,7 @@ public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutP
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("PagSeguro {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("PagSeguro {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

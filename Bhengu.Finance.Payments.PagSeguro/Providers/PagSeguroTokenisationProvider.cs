@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Vault;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.PagSeguro.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -34,7 +35,7 @@ namespace Bhengu.Finance.Payments.PagSeguro.Providers;
 /// release the SDK is calling against.
 /// </para>
 /// </remarks>
-public sealed class PagSeguroTokenisationProvider : ITokenisationProvider
+public sealed class PagSeguroTokenisationProvider : BhenguProviderBase, ITokenisationProvider
 {
     internal static readonly JsonSerializerOptions WriteOptions = new()
     {
@@ -43,20 +44,19 @@ public sealed class PagSeguroTokenisationProvider : ITokenisationProvider
 
     private readonly HttpClient _httpClient;
     private readonly PagSeguroOptions _options;
-    private readonly ILogger<PagSeguroTokenisationProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.PagSeguro;
+    public override string ProviderName => ProviderNames.PagSeguro;
 
     /// <summary>Create a new PagSeguro tokenisation provider bound to the supplied HTTP client and options.</summary>
     public PagSeguroTokenisationProvider(
         HttpClient httpClient,
         IOptions<PagSeguroOptions> options,
         ILogger<PagSeguroTokenisationProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ApiToken))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PagSeguroOptions.ApiToken)} is required");
@@ -80,7 +80,7 @@ public sealed class PagSeguroTokenisationProvider : ITokenisationProvider
 
         try
         {
-            var raw = await PagSeguroHttp.SendAsync(_httpClient, _logger, ProviderName, HttpMethod.Get, $"/tokens/{Uri.EscapeDataString(token)}", body: null, ct, "GetToken").ConfigureAwait(false);
+            var raw = await PagSeguroHttp.SendAsync(_httpClient, Logger, ProviderName, HttpMethod.Get, $"/tokens/{Uri.EscapeDataString(token)}", body: null, ct, "GetToken").ConfigureAwait(false);
             var t = DeserialiseOrThrow<PagSeguroToken>(raw, "GetToken");
             return MapToken(t, customerId: null, displayName: null, isDefault: false);
         }
@@ -99,7 +99,7 @@ public sealed class PagSeguroTokenisationProvider : ITokenisationProvider
         // PagBank's public v4 API does not currently expose a "list tokens by customer" endpoint.
         // Merchants persist their own (customerId, tokenId) mapping. Yield nothing rather than
         // throwing so consumers can swap providers without their UI breaking.
-        _logger.LogWarning(
+        Logger.LogWarning(
             "PagSeguro does not expose a list-by-customer endpoint. ListPaymentMethodsAsync yields no items; track (customer, token) mapping in your own datastore.");
         yield break;
     }
@@ -112,7 +112,7 @@ public sealed class PagSeguroTokenisationProvider : ITokenisationProvider
 
         try
         {
-            await PagSeguroHttp.SendAsync(_httpClient, _logger, ProviderName, HttpMethod.Delete, $"/tokens/{Uri.EscapeDataString(token)}", body: null, ct, "DeleteToken").ConfigureAwait(false);
+            await PagSeguroHttp.SendAsync(_httpClient, Logger, ProviderName, HttpMethod.Delete, $"/tokens/{Uri.EscapeDataString(token)}", body: null, ct, "DeleteToken").ConfigureAwait(false);
             return true;
         }
         catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
@@ -222,24 +222,23 @@ internal static class PagSeguroHttp
 /// PCI-DSS SAQ-D-scope PagSeguro tokenisation. Sends raw PAN to <c>/tokens</c> and returns a
 /// reusable card token. Strongly prefer PagBank's client-side JavaScript SDK where possible.
 /// </summary>
-public sealed class PagSeguroRawCardTokenisationProvider : IRawCardTokenisationProvider
+public sealed class PagSeguroRawCardTokenisationProvider : BhenguProviderBase, IRawCardTokenisationProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PagSeguroOptions _options;
-    private readonly ILogger<PagSeguroRawCardTokenisationProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.PagSeguro;
+    public override string ProviderName => ProviderNames.PagSeguro;
 
     /// <summary>Create a new PagSeguro raw-card tokenisation provider.</summary>
     public PagSeguroRawCardTokenisationProvider(
         HttpClient httpClient,
         IOptions<PagSeguroOptions> options,
         ILogger<PagSeguroRawCardTokenisationProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ApiToken))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PagSeguroOptions.ApiToken)} is required");
@@ -277,10 +276,10 @@ public sealed class PagSeguroRawCardTokenisationProvider : IRawCardTokenisationP
             }
         };
 
-        var raw = await PagSeguroHttp.SendAsync(_httpClient, _logger, ProviderName, HttpMethod.Post, "/tokens", body, ct, "Tokenise").ConfigureAwait(false);
+        var raw = await PagSeguroHttp.SendAsync(_httpClient, Logger, ProviderName, HttpMethod.Post, "/tokens", body, ct, "Tokenise").ConfigureAwait(false);
         var token = PagSeguroTokenisationProvider.DeserialiseOrThrow<PagSeguroTokenisationProvider.PagSeguroToken>(raw, "Tokenise");
 
-        _logger.LogInformation("PagSeguro token created: {Id}", token.Id);
+        Logger.LogInformation("PagSeguro token created: {Id}", token.Id);
         return PagSeguroTokenisationProvider.MapToken(token, request.CustomerId, request.DisplayName, request.SetAsDefault);
     }
 }

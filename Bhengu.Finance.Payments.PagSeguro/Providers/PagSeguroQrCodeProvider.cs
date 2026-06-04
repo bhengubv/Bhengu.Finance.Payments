@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.QrCode;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.PagSeguro.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -29,7 +30,7 @@ namespace Bhengu.Finance.Payments.PagSeguro.Providers;
 /// yourself, or request <see cref="QrFormat.Png"/> to have this provider download the PNG bytes
 /// from the URL the order response returned.
 /// </remarks>
-public sealed class PagSeguroQrCodeProvider : IQrCodeProvider
+public sealed class PagSeguroQrCodeProvider : BhenguProviderBase, IQrCodeProvider
 {
     private static readonly JsonSerializerOptions WriteOptions = new()
     {
@@ -38,20 +39,19 @@ public sealed class PagSeguroQrCodeProvider : IQrCodeProvider
 
     private readonly HttpClient _httpClient;
     private readonly PagSeguroOptions _options;
-    private readonly ILogger<PagSeguroQrCodeProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.PagSeguro;
+    public override string ProviderName => ProviderNames.PagSeguro;
 
     /// <summary>Create a new PagSeguro PIX QR provider bound to the supplied HTTP client and options.</summary>
     public PagSeguroQrCodeProvider(
         HttpClient httpClient,
         IOptions<PagSeguroOptions> options,
         ILogger<PagSeguroQrCodeProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ApiToken))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PagSeguroOptions.ApiToken)} is required");
@@ -109,7 +109,7 @@ public sealed class PagSeguroQrCodeProvider : IQrCodeProvider
         if (string.IsNullOrEmpty(qr.Text))
             throw new BhenguPaymentException(ProviderName, "PagSeguro PIX response did not contain a QR text payload");
 
-        _logger.LogInformation("PagSeguro PIX QR generated: orderId={Id} reference={Ref} amount={Amount}",
+        Logger.LogInformation("PagSeguro PIX QR generated: orderId={Id} reference={Ref} amount={Amount}",
             order.Id, request.MerchantReference, request.Amount);
 
         byte[]? bytes = null;
@@ -204,7 +204,7 @@ public sealed class PagSeguroQrCodeProvider : IQrCodeProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("PagSeguro {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("PagSeguro {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(System.Globalization.CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

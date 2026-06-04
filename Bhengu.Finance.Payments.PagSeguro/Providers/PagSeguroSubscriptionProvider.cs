@@ -10,8 +10,8 @@ using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Subscription;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.PagSeguro.Configuration;
-using Bhengu.Finance.Payments.PagSeguro.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -31,7 +31,7 @@ namespace Bhengu.Finance.Payments.PagSeguro.Providers;
 /// via <c>POST /recurring/orders/{id}/cancel</c> and is one-way.
 /// </para>
 /// </remarks>
-public sealed class PagSeguroSubscriptionProvider : ISubscriptionProvider
+public sealed class PagSeguroSubscriptionProvider : BhenguProviderBase, ISubscriptionProvider
 {
     private const string PlanKeyPrefix = "pagseguro:plan:";
     private static readonly TimeSpan PlanTtl = TimeSpan.FromDays(365);
@@ -43,11 +43,10 @@ public sealed class PagSeguroSubscriptionProvider : ISubscriptionProvider
 
     private readonly HttpClient _httpClient;
     private readonly PagSeguroOptions _options;
-    private readonly ILogger<PagSeguroSubscriptionProvider> _logger;
     private readonly IBhenguDistributedCache _cache;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.PagSeguro;
+    public override string ProviderName => ProviderNames.PagSeguro;
 
     /// <summary>Create a new PagSeguro subscription provider bound to the supplied HTTP client, options, and distributed cache.</summary>
     public PagSeguroSubscriptionProvider(
@@ -55,10 +54,10 @@ public sealed class PagSeguroSubscriptionProvider : ISubscriptionProvider
         IOptions<PagSeguroOptions> options,
         ILogger<PagSeguroSubscriptionProvider> logger,
         IBhenguDistributedCache cache)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _cache = cache ?? throw new ArgumentNullException(nameof(cache));
 
         if (string.IsNullOrWhiteSpace(_options.ApiToken))
@@ -89,7 +88,7 @@ public sealed class PagSeguroSubscriptionProvider : ISubscriptionProvider
     public Task<Plan> CreatePlanAsync(PlanRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return PagSeguroObservability.ObserveAsync("create_plan", () => CreatePlanCoreAsync(request, ct));
+        return RunOperationAsync("create_plan", () => CreatePlanCoreAsync(request, ct), ct);
     }
 
     private async Task<Plan> CreatePlanCoreAsync(PlanRequest request, CancellationToken ct)
@@ -107,7 +106,7 @@ public sealed class PagSeguroSubscriptionProvider : ISubscriptionProvider
         };
 
         await _cache.SetAsync(PlanKeyPrefix + reference, plan, PlanTtl, ct).ConfigureAwait(false);
-        _logger.LogInformation("PagSeguro plan cached: {Reference} name={Name}", reference, request.Name);
+        Logger.LogInformation("PagSeguro plan cached: {Reference} name={Name}", reference, request.Name);
 
         return plan;
     }
@@ -116,15 +115,16 @@ public sealed class PagSeguroSubscriptionProvider : ISubscriptionProvider
     public Task<Plan?> GetPlanAsync(string planReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(planReference);
-        return PagSeguroObservability.ObserveAsync("get_plan", () =>
-            _cache.GetAsync<Plan>(PlanKeyPrefix + planReference, ct));
+        return RunOperationAsync("get_plan",
+            () => _cache.GetAsync<Plan>(PlanKeyPrefix + planReference, ct),
+            ct);
     }
 
     /// <inheritdoc />
     public Task<Subscription> CreateSubscriptionAsync(SubscriptionRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return PagSeguroObservability.ObserveAsync("create_subscription", () => CreateSubscriptionCoreAsync(request, ct));
+        return RunOperationAsync("create_subscription", () => CreateSubscriptionCoreAsync(request, ct), ct);
     }
 
     private async Task<Subscription> CreateSubscriptionCoreAsync(SubscriptionRequest request, CancellationToken ct)
@@ -179,7 +179,7 @@ public sealed class PagSeguroSubscriptionProvider : ISubscriptionProvider
         var raw = await SendAsync(HttpMethod.Post, "/recurring/orders", body, ct, "CreateSubscription").ConfigureAwait(false);
         var order = DeserialiseOrThrow<PagSeguroRecurringOrder>(raw, "CreateSubscription");
 
-        _logger.LogInformation("PagSeguro recurring order created: {Id} status={Status}", order.Id, order.Status);
+        Logger.LogInformation("PagSeguro recurring order created: {Id} status={Status}", order.Id, order.Status);
         return MapSubscription(order, request.CustomerId, request.PlanReference);
     }
 
@@ -187,7 +187,7 @@ public sealed class PagSeguroSubscriptionProvider : ISubscriptionProvider
     public Task<Subscription?> GetSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(subscriptionReference);
-        return PagSeguroObservability.ObserveAsync("get_subscription", () => GetSubscriptionCoreAsync(subscriptionReference, ct));
+        return RunOperationAsync("get_subscription", () => GetSubscriptionCoreAsync(subscriptionReference, ct), ct);
     }
 
     private async Task<Subscription?> GetSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
@@ -208,7 +208,7 @@ public sealed class PagSeguroSubscriptionProvider : ISubscriptionProvider
     public Task<Subscription> CancelSubscriptionAsync(string subscriptionReference, bool immediately = false, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(subscriptionReference);
-        return PagSeguroObservability.ObserveAsync("cancel_subscription", () => CancelSubscriptionCoreAsync(subscriptionReference, immediately, ct));
+        return RunOperationAsync("cancel_subscription", () => CancelSubscriptionCoreAsync(subscriptionReference, immediately, ct), ct);
     }
 
     private async Task<Subscription> CancelSubscriptionCoreAsync(string subscriptionReference, bool immediately, CancellationToken ct)
@@ -231,19 +231,21 @@ public sealed class PagSeguroSubscriptionProvider : ISubscriptionProvider
 
     /// <inheritdoc />
     public Task<Subscription> PauseSubscriptionAsync(string subscriptionReference, CancellationToken ct = default) =>
-        PagSeguroObservability.ObserveAsync<Subscription>("pause_subscription", () =>
+        RunOperationAsync<Subscription>("pause_subscription", () =>
             throw new BhenguPaymentException(
                 ProviderName,
                 "PagBank does not support pausing recurring orders; cancel and re-create when the customer is ready.",
-                providerErrorCode: "pause_not_supported"));
+                providerErrorCode: "pause_not_supported"),
+            ct);
 
     /// <inheritdoc />
     public Task<Subscription> ResumeSubscriptionAsync(string subscriptionReference, CancellationToken ct = default) =>
-        PagSeguroObservability.ObserveAsync<Subscription>("resume_subscription", () =>
+        RunOperationAsync<Subscription>("resume_subscription", () =>
             throw new BhenguPaymentException(
                 ProviderName,
                 "PagBank does not support resuming recurring orders; pause is unsupported, so resume is unsupported.",
-                providerErrorCode: "resume_not_supported"));
+                providerErrorCode: "resume_not_supported"),
+            ct);
 
     // === Helpers ===
 
@@ -321,7 +323,7 @@ public sealed class PagSeguroSubscriptionProvider : ISubscriptionProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("PagSeguro {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("PagSeguro {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(System.Globalization.CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
