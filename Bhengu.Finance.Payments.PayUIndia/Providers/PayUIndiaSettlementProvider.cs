@@ -104,44 +104,38 @@ public sealed class PayUIndiaSettlementProvider : BhenguProviderBase, ISettlemen
     }
 
     /// <inheritdoc />
-    public async Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
+    public Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(settlementReference);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.get");
-        try
+        return RunOperationAsync<Settlement?>("get_settlement", async () =>
         {
-            const string command = "get_settlement";
-            var hashInput = string.Join("|", _options.MerchantKey, command, settlementReference, _options.Salt);
-            var hash = Sha512Hex(hashInput);
-
-            var form = new Dictionary<string, string>
+            try
             {
-                ["key"] = _options.MerchantKey,
-                ["command"] = command,
-                ["var1"] = settlementReference,
-                ["hash"] = hash
-            };
+                const string command = "get_settlement";
+                var hashInput = string.Join("|", _options.MerchantKey, command, settlementReference, _options.Salt);
+                var hash = Sha512Hex(hashInput);
 
-            var raw = await PostFormAsync("merchant/postservice.php?form=2", form, ct, "GetSettlement").ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<PayUIndiaSettlementResponse>(raw, DeserializeOptions);
+                var form = new Dictionary<string, string>
+                {
+                    ["key"] = _options.MerchantKey,
+                    ["command"] = command,
+                    ["var1"] = settlementReference,
+                    ["hash"] = hash
+                };
 
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+                var raw = await PostFormAsync("merchant/postservice.php?form=2", form, ct, "GetSettlement").ConfigureAwait(false);
+                var response = JsonSerializer.Deserialize<PayUIndiaSettlementResponse>(raw, DeserializeOptions);
 
-            if (response is null || string.IsNullOrEmpty(response.SettlementId))
+                if (response is null || string.IsNullOrEmpty(response.SettlementId))
+                    return null;
+
+                return MapSettlement(response);
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
                 return null;
-
-            return MapSettlement(response);
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            return null;
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+            }
+        }, ct);
     }
 
     /// <inheritdoc />

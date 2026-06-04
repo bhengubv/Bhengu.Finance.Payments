@@ -68,12 +68,10 @@ public sealed class PayUIndiaThreeDSecureProvider : BhenguProviderBase, IThreeDS
     }
 
     /// <inheritdoc />
-    public async Task<ThreeDSecureChallenge> StartAuthenticationAsync(PaymentRequest chargeIntent, CancellationToken ct = default)
+    public Task<ThreeDSecureChallenge> StartAuthenticationAsync(PaymentRequest chargeIntent, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(chargeIntent);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "three_d_secure.start");
-        try
+        return RunOperationAsync("start_3ds_authentication", async () =>
         {
             var txnid = chargeIntent.Metadata?.GetValueOrDefault("txnid") ?? $"3ds-{Guid.NewGuid():N}";
             var amount = chargeIntent.Amount.ToString("F2", CultureInfo.InvariantCulture);
@@ -126,10 +124,6 @@ public sealed class PayUIndiaThreeDSecureProvider : BhenguProviderBase, IThreeDS
                 _ => ThreeDSecureStatus.ChallengeRequired
             };
 
-            activity.SetOutcome(threeDsStatus == ThreeDSecureStatus.Failed
-                ? BhenguPaymentDiagnostics.Outcomes.Declined
-                : BhenguPaymentDiagnostics.Outcomes.Success);
-
             return new ThreeDSecureChallenge
             {
                 Status = threeDsStatus,
@@ -139,21 +133,14 @@ public sealed class PayUIndiaThreeDSecureProvider : BhenguProviderBase, IThreeDS
                 ProtocolVersion = response?.MetaData?.ThreeDsVersion ?? "2.2.0",
                 DsTransactionId = response?.MetaData?.DsTransactionId
             };
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+        }, ct);
     }
 
     /// <inheritdoc />
-    public async Task<ThreeDSecureChallenge> GetChallengeAsync(string challengeReference, CancellationToken ct = default)
+    public Task<ThreeDSecureChallenge> GetChallengeAsync(string challengeReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(challengeReference);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "three_d_secure.get");
-        try
+        return RunOperationAsync("get_3ds_challenge", async () =>
         {
             // PayU India "verify_payment" against the merchant_postservice endpoint returns the
             // current authentication status for a given mihpayid / txnid.
@@ -181,8 +168,6 @@ public sealed class PayUIndiaThreeDSecureProvider : BhenguProviderBase, IThreeDS
                 _ => ThreeDSecureStatus.Failed
             };
 
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-
             return new ThreeDSecureChallenge
             {
                 Status = threeDsStatus,
@@ -190,12 +175,7 @@ public sealed class PayUIndiaThreeDSecureProvider : BhenguProviderBase, IThreeDS
                 ProtocolVersion = response?.MetaData?.ThreeDsVersion ?? "2.2.0",
                 DsTransactionId = response?.MetaData?.DsTransactionId
             };
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+        }, ct);
     }
 
     private async Task<string> PostFormAsync(string path, IDictionary<string, string> form, CancellationToken ct, string operation)

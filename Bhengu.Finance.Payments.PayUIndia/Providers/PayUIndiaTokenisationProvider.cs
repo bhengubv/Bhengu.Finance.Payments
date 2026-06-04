@@ -59,54 +59,48 @@ public sealed class PayUIndiaTokenisationProvider : BhenguProviderBase, ITokenis
     }
 
     /// <inheritdoc />
-    public async Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
+    public Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(token);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise.get");
-        try
+        return RunOperationAsync<PaymentMethod?>("get_payment_method", async () =>
         {
-            const string command = "get_user_cards";
-            var hashInput = string.Join("|", _options.MerchantKey, command, token, _options.Salt);
-            var hash = Sha512Hex(hashInput);
-
-            var form = new Dictionary<string, string>
+            try
             {
-                ["key"] = _options.MerchantKey,
-                ["command"] = command,
-                ["var1"] = token,
-                ["hash"] = hash
-            };
+                const string command = "get_user_cards";
+                var hashInput = string.Join("|", _options.MerchantKey, command, token, _options.Salt);
+                var hash = Sha512Hex(hashInput);
 
-            var raw = await PayUIndiaHttp.PostFormAsync(_httpClient, Logger, ProviderName, "merchant/postservice.php?form=2", form, ct, "GetCard").ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<PayUIndiaCardResponse>(raw, DeserializeOptions);
+                var form = new Dictionary<string, string>
+                {
+                    ["key"] = _options.MerchantKey,
+                    ["command"] = command,
+                    ["var1"] = token,
+                    ["hash"] = hash
+                };
 
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+                var raw = await PayUIndiaHttp.PostFormAsync(_httpClient, Logger, ProviderName, "merchant/postservice.php?form=2", form, ct, "GetCard").ConfigureAwait(false);
+                var response = JsonSerializer.Deserialize<PayUIndiaCardResponse>(raw, DeserializeOptions);
 
-            if (response is null || string.IsNullOrEmpty(response.CardToken))
+                if (response is null || string.IsNullOrEmpty(response.CardToken))
+                    return null;
+
+                return new PaymentMethod
+                {
+                    Token = response.CardToken,
+                    CustomerId = response.UserCredentials,
+                    Kind = PaymentMethodKind.Card,
+                    Brand = response.CardMode,
+                    Last4 = response.CardNumberMasked is { Length: >= 4 } pan ? pan[^4..] : null,
+                    ExpiryMonth = response.ExpiryMonth,
+                    ExpiryYear = response.ExpiryYear,
+                    CreatedAt = DateTime.UtcNow
+                };
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
                 return null;
-
-            return new PaymentMethod
-            {
-                Token = response.CardToken,
-                CustomerId = response.UserCredentials,
-                Kind = PaymentMethodKind.Card,
-                Brand = response.CardMode,
-                Last4 = response.CardNumberMasked is { Length: >= 4 } pan ? pan[^4..] : null,
-                ExpiryMonth = response.ExpiryMonth,
-                ExpiryYear = response.ExpiryYear,
-                CreatedAt = DateTime.UtcNow
-            };
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            return null;
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+            }
+        }, ct);
     }
 
     /// <inheritdoc />
@@ -163,42 +157,36 @@ public sealed class PayUIndiaTokenisationProvider : BhenguProviderBase, ITokenis
     }
 
     /// <inheritdoc />
-    public async Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
+    public Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(token);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise.delete");
-        try
+        return RunOperationAsync("delete_payment_method", async () =>
         {
-            const string command = "delete_user_card";
-            var hashInput = string.Join("|", _options.MerchantKey, command, token, _options.Salt);
-            var hash = Sha512Hex(hashInput);
-
-            var form = new Dictionary<string, string>
+            try
             {
-                ["key"] = _options.MerchantKey,
-                ["command"] = command,
-                ["var1"] = token,
-                ["hash"] = hash
-            };
+                const string command = "delete_user_card";
+                var hashInput = string.Join("|", _options.MerchantKey, command, token, _options.Salt);
+                var hash = Sha512Hex(hashInput);
 
-            var raw = await PayUIndiaHttp.PostFormAsync(_httpClient, Logger, ProviderName, "merchant/postservice.php?form=2", form, ct, "DeleteCard").ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<PayUIndiaCardResponse>(raw, DeserializeOptions);
+                var form = new Dictionary<string, string>
+                {
+                    ["key"] = _options.MerchantKey,
+                    ["command"] = command,
+                    ["var1"] = token,
+                    ["hash"] = hash
+                };
 
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+                var raw = await PayUIndiaHttp.PostFormAsync(_httpClient, Logger, ProviderName, "merchant/postservice.php?form=2", form, ct, "DeleteCard").ConfigureAwait(false);
+                var response = JsonSerializer.Deserialize<PayUIndiaCardResponse>(raw, DeserializeOptions);
 
-            return string.Equals(response?.Status, "1", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(response?.Status, "success", StringComparison.OrdinalIgnoreCase);
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            return false;
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+                return string.Equals(response?.Status, "1", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(response?.Status, "success", StringComparison.OrdinalIgnoreCase);
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return false;
+            }
+        }, ct);
     }
 
     internal static string Sha512Hex(string input)
@@ -296,12 +284,10 @@ public sealed class PayUIndiaRawCardTokenisationProvider : BhenguProviderBase, I
     }
 
     /// <inheritdoc />
-    public async Task<PaymentMethod> TokeniseAsync(TokeniseRequest request, CancellationToken ct = default)
+    public Task<PaymentMethod> TokeniseAsync(TokeniseRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise");
-        try
+        return RunOperationAsync("tokenise_card", async () =>
         {
             const string command = "save_user_card";
             var userCredentials = request.CustomerId ?? $"{_options.MerchantKey}:{request.Card.CardholderName}";
@@ -330,8 +316,6 @@ public sealed class PayUIndiaRawCardTokenisationProvider : BhenguProviderBase, I
             Logger.LogInformation("PayU India card vaulted: token={Token} customerId={CustomerId} status={Status}",
                 response?.CardToken ?? cardToken, userCredentials, response?.Status);
 
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-
             var last4 = request.Card.CardNumber.Length >= 4
                 ? request.Card.CardNumber[^4..]
                 : request.Card.CardNumber;
@@ -349,11 +333,6 @@ public sealed class PayUIndiaRawCardTokenisationProvider : BhenguProviderBase, I
                 IsDefault = request.SetAsDefault,
                 CreatedAt = DateTime.UtcNow
             };
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+        }, ct);
     }
 }
