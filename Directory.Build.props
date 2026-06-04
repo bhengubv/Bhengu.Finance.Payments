@@ -35,7 +35,7 @@
 
     <!-- Shared version for the whole family. Used by .All meta-package; individual provider csprojs
          can still override Version locally if they need to ship out-of-band. -->
-    <BhenguPaymentsVersion>2.0.0-preview.6</BhenguPaymentsVersion>
+    <BhenguPaymentsVersion>2.0.0-preview.7</BhenguPaymentsVersion>
   </PropertyGroup>
 
   <ItemGroup>
