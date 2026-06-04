@@ -12,7 +12,6 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
-using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Fawry.Configuration;
 using Bhengu.Finance.Payments.Fawry.Internals;
 using Microsoft.Extensions.Logging;
@@ -87,12 +86,8 @@ public sealed class FawryPaymentProvider : BhenguProviderBase, IPaymentGatewayPr
                 () => ProcessPaymentCoreAsync(request, ct), ct);
     }
 
-    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
-    {
-        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
-        try
+    private Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+        => RunChargeAsync(request.Currency, async () =>
         {
             var merchantRefNum = request.Metadata?.GetValueOrDefault("merchantRefNum")
                 ?? request.IdempotencyKey
@@ -134,12 +129,6 @@ public sealed class FawryPaymentProvider : BhenguProviderBase, IPaymentGatewayPr
                 ?? fawryResponse?.MerchantRefNumber
                 ?? merchantRefNum;
             var status = MapStatus(fawryResponse?.OrderStatus, fawryResponse?.StatusCode);
-            outcome = status switch
-            {
-                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
-                _ => BhenguPaymentDiagnostics.Outcomes.Declined
-            };
 
             return new PaymentResponse
             {
@@ -150,19 +139,7 @@ public sealed class FawryPaymentProvider : BhenguProviderBase, IPaymentGatewayPr
                 ProcessedAt = DateTime.UtcNow,
                 Message = fawryResponse?.StatusDescription ?? fawryResponse?.OrderStatus
             };
-        }
-        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
-        finally
-        {
-            activity?.SetOutcome(outcome);
-            sw.Stop();
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
-            BhenguPaymentDiagnostics.ChargeDurationMs.Record(sw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
-        }
-    }
+        }, ct);
 
     /// <inheritdoc />
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
@@ -174,11 +151,8 @@ public sealed class FawryPaymentProvider : BhenguProviderBase, IPaymentGatewayPr
                 () => ProcessRefundCoreAsync(request, ct), ct);
     }
 
-    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
-    {
-        using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
-        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
-        try
+    private Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+        => RunRefundAsync(request.GatewayReference, async () =>
         {
             var refundAmount = request.Amount.ToString("0.00", CultureInfo.InvariantCulture);
             var signature = ComputeRefundSignature(
@@ -200,12 +174,6 @@ public sealed class FawryPaymentProvider : BhenguProviderBase, IPaymentGatewayPr
                 request.GatewayReference, refundResponse?.StatusCode);
 
             var status = MapRefundStatus(refundResponse?.StatusCode);
-            outcome = status switch
-            {
-                PaymentStatus.Refunded or PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
-                _ => BhenguPaymentDiagnostics.Outcomes.Declined
-            };
 
             return new RefundResponse
             {
@@ -215,17 +183,7 @@ public sealed class FawryPaymentProvider : BhenguProviderBase, IPaymentGatewayPr
                 ProcessedAt = DateTime.UtcNow,
                 Message = refundResponse?.StatusDescription
             };
-        }
-        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
-        finally
-        {
-            activity?.SetOutcome(outcome);
-            BhenguPaymentDiagnostics.RefundsTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
-        }
-    }
+        }, ct);
 
     /// <inheritdoc />
     public bool VerifyWebhookSignature(string payload, string signature)
@@ -233,62 +191,58 @@ public sealed class FawryPaymentProvider : BhenguProviderBase, IPaymentGatewayPr
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        var valid = false;
-        try
+        return RunWebhookVerify(() =>
         {
-            if (string.IsNullOrWhiteSpace(_options.SecurityKey))
+            try
             {
-                Logger.LogWarning("Fawry SecurityKey not configured — webhook signature verification cannot succeed.");
+                if (string.IsNullOrWhiteSpace(_options.SecurityKey))
+                {
+                    Logger.LogWarning("Fawry SecurityKey not configured — webhook signature verification cannot succeed.");
+                    return false;
+                }
+
+                // Fawry concatenates webhook fields in a documented order then SHA-256 hex-lowercase.
+                // The caller is responsible for supplying the already-concatenated payload that matches
+                // Fawry's notification spec: fawryRefNumber + merchantRefNum + paymentAmount + orderAmount +
+                //   orderStatus + paymentMethod + paymentReferenceNumber + securityKey.
+                // We hash that string and compare to the supplied signature.
+                var canonical = payload + _options.SecurityKey;
+                var computed = Sha256Hex(canonical);
+
+                return CryptographicOperations.FixedTimeEquals(
+                    Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
+                    Encoding.UTF8.GetBytes(computed));
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Fawry webhook signature verification raised");
                 return false;
             }
-
-            // Fawry concatenates webhook fields in a documented order then SHA-256 hex-lowercase.
-            // The caller is responsible for supplying the already-concatenated payload that matches
-            // Fawry's notification spec: fawryRefNumber + merchantRefNum + paymentAmount + orderAmount +
-            //   orderStatus + paymentMethod + paymentReferenceNumber + securityKey.
-            // We hash that string and compare to the supplied signature.
-            var canonical = payload + _options.SecurityKey;
-            var computed = Sha256Hex(canonical);
-
-            valid = CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
-                Encoding.UTF8.GetBytes(computed));
-            return valid;
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Fawry webhook signature verification raised");
-            return false;
-        }
-        finally
-        {
-            BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("valid", valid));
-        }
+        });
     }
 
     /// <inheritdoc />
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-
-        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
-        try
+        return RunOperationAsync("parse_webhook", () =>
         {
-            var notification = JsonSerializer.Deserialize<FawryNotification>(payload);
-            if (notification is null) return Task.FromResult<WebhookEvent?>(null);
+            try
+            {
+                var notification = JsonSerializer.Deserialize<FawryNotification>(payload);
+                if (notification is null) return Task.FromResult<WebhookEvent?>(null);
 
-            Logger.LogInformation("Parsed Fawry notification: status={Status} ref={Ref}",
-                notification.OrderStatus, notification.FawryRefNumber);
+                Logger.LogInformation("Parsed Fawry notification: status={Status} ref={Ref}",
+                    notification.OrderStatus, notification.FawryRefNumber);
 
-            return Task.FromResult(MapWebhookEvent(notification));
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Failed to parse Fawry notification");
-            return Task.FromResult<WebhookEvent?>(null);
-        }
+                return Task.FromResult(MapWebhookEvent(notification));
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Failed to parse Fawry notification");
+                return Task.FromResult<WebhookEvent?>(null);
+            }
+        }, ct);
     }
 
     private static WebhookEvent? MapWebhookEvent(FawryNotification n)

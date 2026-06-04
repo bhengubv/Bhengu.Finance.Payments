@@ -77,23 +77,23 @@ public sealed class FawrySettlementProvider : BhenguProviderBase, ISettlementPro
     }
 
     /// <inheritdoc />
-    public async Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
+    public Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "get_settlement");
-        try
+        return RunOperationAsync<Settlement?>("get_settlement", async () =>
         {
-            var path = $"reports/settlements/{Uri.EscapeDataString(settlementReference)}?merchantCode={Uri.EscapeDataString(_options.MerchantCode)}";
-            var body = await _http.SendAsync(HttpMethod.Get, path, null, "GetSettlement", ct).ConfigureAwait(false);
-            var resp = JsonSerializer.Deserialize<FawrySettlementData>(body, FawryHttpClient.Json);
-            activity?.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return resp is null || string.IsNullOrEmpty(resp.SettlementId) ? null : MapSettlement(resp);
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            activity?.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return null;
-        }
+            try
+            {
+                var path = $"reports/settlements/{Uri.EscapeDataString(settlementReference)}?merchantCode={Uri.EscapeDataString(_options.MerchantCode)}";
+                var body = await _http.SendAsync(HttpMethod.Get, path, null, "GetSettlement", ct).ConfigureAwait(false);
+                var resp = JsonSerializer.Deserialize<FawrySettlementData>(body, FawryHttpClient.Json);
+                return resp is null || string.IsNullOrEmpty(resp.SettlementId) ? null : MapSettlement(resp);
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return null;
+            }
+        }, ct);
     }
 
     /// <inheritdoc />
