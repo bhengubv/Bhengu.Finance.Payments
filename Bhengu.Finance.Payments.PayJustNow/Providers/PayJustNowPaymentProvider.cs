@@ -1,8 +1,5 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
-using System.Diagnostics;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
@@ -10,7 +7,8 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
-using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.PayJustNow.Configuration;
 using Bhengu.Finance.Payments.PayJustNow.Internals;
 using Microsoft.Extensions.Logging;
@@ -28,15 +26,14 @@ namespace Bhengu.Finance.Payments.PayJustNow.Providers;
 /// schedule maps to <see cref="ISubscriptionProvider"/>, and the underlying debit-order
 /// authorisation maps to <see cref="IMandateProvider"/>.
 /// </remarks>
-public sealed class PayJustNowPaymentProvider : IPaymentGatewayProvider
+public sealed class PayJustNowPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PayJustNowOptions _options;
-    private readonly ILogger<PayJustNowPaymentProvider> _logger;
     private readonly PayJustNowIdempotencyCache _idempotency;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.PayJustNow;
+    public override string ProviderName => ProviderNames.PayJustNow;
 
     /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
@@ -57,10 +54,10 @@ public sealed class PayJustNowPaymentProvider : IPaymentGatewayProvider
         IOptions<PayJustNowOptions> options,
         ILogger<PayJustNowPaymentProvider> logger,
         PayJustNowIdempotencyCache idempotency)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotency = idempotency ?? throw new ArgumentNullException(nameof(idempotency));
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
@@ -75,13 +72,13 @@ public sealed class PayJustNowPaymentProvider : IPaymentGatewayProvider
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPaymentCoreAsync(request, ct), ct);
+        return RunChargeAsync(request.Currency,
+            () => _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPaymentCoreAsync(request, ct), ct),
+            ct);
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
     {
-        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
-        var sw = Stopwatch.StartNew();
         var amountInCents = (int)(request.Amount * 100);
 
         var requestBody = new
@@ -97,62 +94,36 @@ public sealed class PayJustNowPaymentProvider : IPaymentGatewayProvider
             metadata = request.Metadata ?? new Dictionary<string, string>().AsReadOnly() as IReadOnlyDictionary<string, string>
         };
 
-        try
-        {
-            var body = await PayJustNowHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Post, "orders", requestBody, "ProcessPayment", ct, request.IdempotencyKey).ConfigureAwait(false);
-            var pjnResponse = JsonSerializer.Deserialize<PjnOrderResponse>(body, PayJustNowHttpClient.Json);
+        var body = await PayJustNowHttpClient.SendAsync(
+            _httpClient, Logger, HttpMethod.Post, "orders", requestBody, "ProcessPayment", ct, request.IdempotencyKey).ConfigureAwait(false);
+        var pjnResponse = JsonSerializer.Deserialize<PjnOrderResponse>(body, PayJustNowHttpClient.Json);
 
-            _logger.LogInformation("PayJustNow order created: {OrderId} status={Status}",
-                pjnResponse?.OrderId, pjnResponse?.Status);
+        Logger.LogInformation("PayJustNow order created: {OrderId} status={Status}",
+            pjnResponse?.OrderId, pjnResponse?.Status);
 
-            var status = MapStatus(pjnResponse?.Status ?? "pending");
-            activity.SetOutcome(status switch
-            {
-                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Failed => BhenguPaymentDiagnostics.Outcomes.Declined,
-                _ => BhenguPaymentDiagnostics.Outcomes.Pending
-            });
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", status.ToString().ToLowerInvariant()));
-
-            return new PaymentResponse
-            {
-                GatewayReference = pjnResponse?.OrderId ?? string.Empty,
-                Status = status,
-                Amount = request.Amount,
-                Currency = request.Currency,
-                ProcessedAt = DateTime.UtcNow,
-                RedirectUrl = pjnResponse?.CheckoutUrl is { Length: > 0 } url ? url : null,
-                Message = "BNPL plan created"
-            };
-        }
-        catch (Exception)
+        return new PaymentResponse
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", BhenguPaymentDiagnostics.Outcomes.Error));
-            throw;
-        }
-        finally
-        {
-            BhenguPaymentDiagnostics.ChargeDurationMs.Record(sw.Elapsed.TotalMilliseconds,
-                new KeyValuePair<string, object?>("provider", ProviderName));
-        }
+            GatewayReference = pjnResponse?.OrderId ?? string.Empty,
+            Status = MapStatus(pjnResponse?.Status ?? "pending"),
+            Amount = request.Amount,
+            Currency = request.Currency,
+            ProcessedAt = DateTime.UtcNow,
+            RedirectUrl = pjnResponse?.CheckoutUrl is { Length: > 0 } url ? url : null,
+            Message = "BNPL plan created"
+        };
     }
 
     /// <inheritdoc/>
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessRefundCoreAsync(request, ct), ct);
+        return RunRefundAsync(request.GatewayReference,
+            () => _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessRefundCoreAsync(request, ct), ct),
+            ct);
     }
 
     private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
     {
-        using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
         var amountInCents = (int)(request.Amount * 100);
         var requestBody = new
         {
@@ -162,22 +133,17 @@ public sealed class PayJustNowPaymentProvider : IPaymentGatewayProvider
         };
 
         var body = await PayJustNowHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, "refunds", requestBody, "ProcessRefund", ct, request.IdempotencyKey).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Post, "refunds", requestBody, "ProcessRefund", ct, request.IdempotencyKey).ConfigureAwait(false);
         var refundResponse = JsonSerializer.Deserialize<PjnRefundResponse>(body, PayJustNowHttpClient.Json);
 
-        _logger.LogInformation("PayJustNow refund created: {RefundId} for order {OrderId}",
+        Logger.LogInformation("PayJustNow refund created: {RefundId} for order {OrderId}",
             refundResponse?.RefundId, request.GatewayReference);
-
-        var status = MapStatus(refundResponse?.Status ?? "pending");
-        BhenguPaymentDiagnostics.RefundsTotal.Add(1,
-            new KeyValuePair<string, object?>("provider", ProviderName),
-            new KeyValuePair<string, object?>("outcome", status == PaymentStatus.Refunded ? BhenguPaymentDiagnostics.Outcomes.Success : BhenguPaymentDiagnostics.Outcomes.Pending));
 
         return new RefundResponse
         {
             GatewayReference = refundResponse?.RefundId ?? string.Empty,
             Amount = request.Amount,
-            Status = status,
+            Status = MapStatus(refundResponse?.Status ?? "pending"),
             ProcessedAt = DateTime.UtcNow,
             Message = refundResponse?.Status
         };
@@ -189,49 +155,30 @@ public sealed class PayJustNowPaymentProvider : IPaymentGatewayProvider
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        bool valid;
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
         {
-            _logger.LogWarning("PayJustNow SecretKey not configured — signature verification cannot succeed.");
-            valid = false;
-        }
-        else
-        {
-            try
-            {
-                using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.SecretKey));
-                var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
-                var computedSignature = Convert.ToHexString(computedHash).ToLowerInvariant();
-
-                valid = CryptographicOperations.FixedTimeEquals(
-                    Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
-                    Encoding.UTF8.GetBytes(computedSignature));
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "PayJustNow webhook signature verification raised");
-                valid = false;
-            }
+            Logger.LogWarning("PayJustNow SecretKey not configured — signature verification cannot succeed.");
+            return RunWebhookVerify(() => false);
         }
 
-        BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
-            new KeyValuePair<string, object?>("provider", ProviderName),
-            new KeyValuePair<string, object?>("valid", valid));
-        return valid;
+        return RunWebhookVerify(() => SignatureHelpers.VerifyHmacSha256(payload, signature, _options.SecretKey));
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+        return RunOperationAsync("parse_webhook", () => ParseWebhookCoreAsync(payload), ct);
+    }
 
-        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload)
+    {
         try
         {
             var webhookEvent = JsonSerializer.Deserialize<PjnWebhookEvent>(payload, PayJustNowHttpClient.Json);
             if (webhookEvent is null) return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed PayJustNow webhook event: {EventType} for order {OrderId}",
+            Logger.LogInformation("Parsed PayJustNow webhook event: {EventType} for order {OrderId}",
                 webhookEvent.EventType, webhookEvent.OrderId);
 
             var reference = webhookEvent.OrderId;
@@ -322,7 +269,7 @@ public sealed class PayJustNowPaymentProvider : IPaymentGatewayProvider
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse PayJustNow webhook event");
+            Logger.LogError(ex, "Failed to parse PayJustNow webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }

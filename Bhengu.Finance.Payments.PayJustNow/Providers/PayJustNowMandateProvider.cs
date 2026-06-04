@@ -8,7 +8,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Mandate;
-using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.PayJustNow.Configuration;
 using Bhengu.Finance.Payments.PayJustNow.Internals;
 using Microsoft.Extensions.Logging;
@@ -23,15 +23,14 @@ namespace Bhengu.Finance.Payments.PayJustNow.Providers;
 /// provider exposes the agreement lifecycle and per-instalment pull-debit endpoint as a
 /// normalised mandate.
 /// </summary>
-public sealed class PayJustNowMandateProvider : IMandateProvider
+public sealed class PayJustNowMandateProvider : BhenguProviderBase, IMandateProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PayJustNowOptions _options;
-    private readonly ILogger<PayJustNowMandateProvider> _logger;
     private readonly PayJustNowIdempotencyCache _idempotency;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.PayJustNow;
+    public override string ProviderName => ProviderNames.PayJustNow;
 
     /// <summary>Construct the provider. Designed to be registered via DI.</summary>
     public PayJustNowMandateProvider(
@@ -39,10 +38,10 @@ public sealed class PayJustNowMandateProvider : IMandateProvider
         IOptions<PayJustNowOptions> options,
         ILogger<PayJustNowMandateProvider> logger,
         PayJustNowIdempotencyCache idempotency)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotency = idempotency ?? throw new ArgumentNullException(nameof(idempotency));
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
@@ -55,12 +54,13 @@ public sealed class PayJustNowMandateProvider : IMandateProvider
     public Task<Mandate> CreateMandateAsync(MandateRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreateMandateCoreAsync(request, ct), ct);
+        return RunOperationAsync("create_mandate",
+            () => _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreateMandateCoreAsync(request, ct), ct),
+            ct);
     }
 
     private async Task<Mandate> CreateMandateCoreAsync(MandateRequest request, CancellationToken ct)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "mandate.create");
         var body = new
         {
             shopper_reference = request.CustomerId,
@@ -73,7 +73,7 @@ public sealed class PayJustNowMandateProvider : IMandateProvider
         };
 
         var responseBody = await PayJustNowHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, "agreements", body, "CreateMandate", ct, request.IdempotencyKey).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Post, "agreements", body, "CreateMandate", ct, request.IdempotencyKey).ConfigureAwait(false);
         var mandate = JsonSerializer.Deserialize<PjnAgreement>(responseBody, PayJustNowHttpClient.Json)
             ?? throw new BhenguPaymentException(ProviderName, "PayJustNow agreement create returned no payload", "no_mandate_data");
 
@@ -81,13 +81,18 @@ public sealed class PayJustNowMandateProvider : IMandateProvider
     }
 
     /// <inheritdoc/>
-    public async Task<Mandate?> GetMandateAsync(string mandateReference, CancellationToken ct = default)
+    public Task<Mandate?> GetMandateAsync(string mandateReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(mandateReference);
+        return RunOperationAsync("get_mandate", () => GetMandateCoreAsync(mandateReference, ct), ct);
+    }
+
+    private async Task<Mandate?> GetMandateCoreAsync(string mandateReference, CancellationToken ct)
+    {
         try
         {
             var responseBody = await PayJustNowHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get, $"agreements/{Uri.EscapeDataString(mandateReference)}", null, "GetMandate", ct).ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Get, $"agreements/{Uri.EscapeDataString(mandateReference)}", null, "GetMandate", ct).ConfigureAwait(false);
             var mandate = JsonSerializer.Deserialize<PjnAgreement>(responseBody, PayJustNowHttpClient.Json);
             return mandate is null ? null : MapMandate(mandate, null);
         }
@@ -98,14 +103,18 @@ public sealed class PayJustNowMandateProvider : IMandateProvider
     }
 
     /// <inheritdoc/>
-    public async Task<Mandate> CancelMandateAsync(string mandateReference, CancellationToken ct = default)
+    public Task<Mandate> CancelMandateAsync(string mandateReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(mandateReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "mandate.cancel");
+        return RunOperationAsync("cancel_mandate", () => CancelMandateCoreAsync(mandateReference, ct), ct);
+    }
+
+    private async Task<Mandate> CancelMandateCoreAsync(string mandateReference, CancellationToken ct)
+    {
         try
         {
             var responseBody = await PayJustNowHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Post, $"agreements/{Uri.EscapeDataString(mandateReference)}/cancel",
+                _httpClient, Logger, HttpMethod.Post, $"agreements/{Uri.EscapeDataString(mandateReference)}/cancel",
                 new { }, "CancelMandate", ct).ConfigureAwait(false);
             var mandate = JsonSerializer.Deserialize<PjnAgreement>(responseBody, PayJustNowHttpClient.Json);
             if (mandate is not null) return MapMandate(mandate, null);
@@ -130,12 +139,13 @@ public sealed class PayJustNowMandateProvider : IMandateProvider
     public Task<PaymentResponse> ChargeMandateAsync(MandateChargeRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ChargeMandateCoreAsync(request, ct), ct);
+        return RunChargeAsync(request.Currency,
+            () => _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ChargeMandateCoreAsync(request, ct), ct),
+            ct);
     }
 
     private async Task<PaymentResponse> ChargeMandateCoreAsync(MandateChargeRequest request, CancellationToken ct)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "mandate.charge");
         var body = new
         {
             agreement_id = request.MandateReference,
@@ -145,7 +155,7 @@ public sealed class PayJustNowMandateProvider : IMandateProvider
         };
 
         var responseBody = await PayJustNowHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, $"agreements/{Uri.EscapeDataString(request.MandateReference)}/charges",
+            _httpClient, Logger, HttpMethod.Post, $"agreements/{Uri.EscapeDataString(request.MandateReference)}/charges",
             body, "ChargeMandate", ct, request.IdempotencyKey).ConfigureAwait(false);
         var charge = JsonSerializer.Deserialize<PjnAgreementCharge>(responseBody, PayJustNowHttpClient.Json)
             ?? throw new BhenguPaymentException(ProviderName, "PayJustNow agreement charge returned no payload", "no_charge_data");

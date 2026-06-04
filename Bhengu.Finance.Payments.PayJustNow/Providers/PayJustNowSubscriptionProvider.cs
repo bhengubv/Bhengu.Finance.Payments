@@ -6,8 +6,8 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models.Subscription;
-using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.PayJustNow.Configuration;
 using Bhengu.Finance.Payments.PayJustNow.Internals;
 using Microsoft.Extensions.Logging;
@@ -20,15 +20,14 @@ namespace Bhengu.Finance.Payments.PayJustNow.Providers;
 /// instalment-plan endpoint — every BNPL order is itself a 3-instalment subscription, and the
 /// merchant-facing surface exposes a <c>/plans</c> collection for higher-cycle agreements.
 /// </summary>
-public sealed class PayJustNowSubscriptionProvider : ISubscriptionProvider
+public sealed class PayJustNowSubscriptionProvider : BhenguProviderBase, ISubscriptionProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PayJustNowOptions _options;
-    private readonly ILogger<PayJustNowSubscriptionProvider> _logger;
     private readonly PayJustNowIdempotencyCache _idempotency;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.PayJustNow;
+    public override string ProviderName => ProviderNames.PayJustNow;
 
     /// <summary>Construct the provider. Designed to be registered via DI.</summary>
     public PayJustNowSubscriptionProvider(
@@ -36,10 +35,10 @@ public sealed class PayJustNowSubscriptionProvider : ISubscriptionProvider
         IOptions<PayJustNowOptions> options,
         ILogger<PayJustNowSubscriptionProvider> logger,
         PayJustNowIdempotencyCache idempotency)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotency = idempotency ?? throw new ArgumentNullException(nameof(idempotency));
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
@@ -57,7 +56,6 @@ public sealed class PayJustNowSubscriptionProvider : ISubscriptionProvider
 
     private async Task<Plan> CreatePlanCoreAsync(PlanRequest request, CancellationToken ct)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "createPlan");
         var body = new
         {
             name = request.Name,
@@ -69,7 +67,7 @@ public sealed class PayJustNowSubscriptionProvider : ISubscriptionProvider
         };
 
         var responseBody = await PayJustNowHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, "plans", body, "CreatePlan", ct, request.IdempotencyKey).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Post, "plans", body, "CreatePlan", ct, request.IdempotencyKey).ConfigureAwait(false);
         var plan = JsonSerializer.Deserialize<PjnPlan>(responseBody, PayJustNowHttpClient.Json)
             ?? throw new BhenguPaymentException(ProviderName, "PayJustNow plan create returned no payload", "no_plan_data");
 
@@ -83,7 +81,7 @@ public sealed class PayJustNowSubscriptionProvider : ISubscriptionProvider
         try
         {
             var responseBody = await PayJustNowHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get, $"plans/{Uri.EscapeDataString(planReference)}", null, "GetPlan", ct).ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Get, $"plans/{Uri.EscapeDataString(planReference)}", null, "GetPlan", ct).ConfigureAwait(false);
             var plan = JsonSerializer.Deserialize<PjnPlan>(responseBody, PayJustNowHttpClient.Json);
             return plan is null ? null : MapPlan(plan, null);
         }
@@ -102,7 +100,6 @@ public sealed class PayJustNowSubscriptionProvider : ISubscriptionProvider
 
     private async Task<Subscription> CreateSubscriptionCoreAsync(SubscriptionRequest request, CancellationToken ct)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "createSubscription");
         var body = new
         {
             plan_id = request.PlanReference,
@@ -113,7 +110,7 @@ public sealed class PayJustNowSubscriptionProvider : ISubscriptionProvider
         };
 
         var responseBody = await PayJustNowHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, "subscriptions", body, "CreateSubscription", ct, request.IdempotencyKey).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Post, "subscriptions", body, "CreateSubscription", ct, request.IdempotencyKey).ConfigureAwait(false);
         var sub = JsonSerializer.Deserialize<PjnSubscription>(responseBody, PayJustNowHttpClient.Json)
             ?? throw new BhenguPaymentException(ProviderName, "PayJustNow subscription create returned no payload", "no_subscription_data");
         return MapSubscription(sub, request);
@@ -126,7 +123,7 @@ public sealed class PayJustNowSubscriptionProvider : ISubscriptionProvider
         try
         {
             var responseBody = await PayJustNowHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get, $"subscriptions/{Uri.EscapeDataString(subscriptionReference)}", null, "GetSubscription", ct).ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Get, $"subscriptions/{Uri.EscapeDataString(subscriptionReference)}", null, "GetSubscription", ct).ConfigureAwait(false);
             var sub = JsonSerializer.Deserialize<PjnSubscription>(responseBody, PayJustNowHttpClient.Json);
             return sub is null ? null : MapSubscription(sub, null);
         }
@@ -159,11 +156,10 @@ public sealed class PayJustNowSubscriptionProvider : ISubscriptionProvider
 
     private async Task<Subscription> TransitionAsync(string subscriptionReference, string action, SubscriptionStatus expected, CancellationToken ct)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, $"subscription.{action}");
         try
         {
             var responseBody = await PayJustNowHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Post,
+                _httpClient, Logger, HttpMethod.Post,
                 $"subscriptions/{Uri.EscapeDataString(subscriptionReference)}/{action}",
                 new { }, $"Subscription.{action}", ct).ConfigureAwait(false);
             var sub = JsonSerializer.Deserialize<PjnSubscription>(responseBody, PayJustNowHttpClient.Json);
