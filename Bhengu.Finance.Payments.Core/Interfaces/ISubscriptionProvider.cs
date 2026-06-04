@@ -35,8 +35,18 @@ public interface ISubscriptionProvider
     /// </summary>
     /// <param name="immediately">If true, cancel right now; if false, let the current billing cycle complete and cancel at period end (where the provider supports it).</param>
     Task<Subscription> CancelSubscriptionAsync(string subscriptionReference, bool immediately = false, CancellationToken ct = default);
+}
 
-    /// <summary>Pause a subscription — no further charges until resumed. Throws if the provider doesn't support pausing.</summary>
+/// <summary>
+/// Optional add-on contract for subscription providers that support pause / resume natively.
+/// Implemented by Stripe, Razorpay, MercadoPago etc. Providers that do NOT support pause (PagSeguro,
+/// PayUIndia, Pesapal, Flutterwave) simply don't implement this; consumers query via
+/// <c>subscriptionProvider as ISubscriptionPauseSupport</c> and gate behaviour at compile time
+/// instead of catching a runtime "not supported" exception.
+/// </summary>
+public interface ISubscriptionPauseSupport
+{
+    /// <summary>Pause a subscription — no further charges until resumed.</summary>
     Task<Subscription> PauseSubscriptionAsync(string subscriptionReference, CancellationToken ct = default);
 
     /// <summary>Resume a paused subscription.</summary>

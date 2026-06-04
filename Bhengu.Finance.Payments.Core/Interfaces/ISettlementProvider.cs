@@ -14,13 +14,13 @@ public interface ISettlementProvider
     /// <summary>The provider this settlement capability belongs to.</summary>
     string ProviderName { get; }
 
-    /// <summary>List settlement batches within a UTC date window.</summary>
+    /// <summary>List settlement batches within a UTC date window. Streamed asynchronously.</summary>
     /// <exception cref="Exceptions.ProviderUnavailableException">Provider was unreachable.</exception>
-    Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default);
+    IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default);
 
     /// <summary>Fetch a settlement batch by reference. Returns null if not found.</summary>
     Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default);
 
-    /// <summary>List the constituent transactions inside a settlement batch.</summary>
-    Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default);
+    /// <summary>List the constituent transactions inside a settlement batch. Streamed asynchronously — a single batch can carry tens of thousands of lines.</summary>
+    IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(string settlementReference, CancellationToken ct = default);
 }

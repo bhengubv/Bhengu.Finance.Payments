@@ -29,9 +29,13 @@
     <Deterministic>true</Deterministic>
     <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true' OR '$(TF_BUILD)' == 'true'">true</ContinuousIntegrationBuild>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
-    <IncludeSymbols>true</IncludeSymbols>
-    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <!-- DebugType=embedded ships PDB bytes inside the DLL inside the .nupkg, so symbol packages
+         would be empty and nuget.org rejects them. Do NOT set IncludeSymbols / SymbolPackageFormat. -->
     <DebugType>embedded</DebugType>
+
+    <!-- Shared version for the whole family. Used by .All meta-package; individual provider csprojs
+         can still override Version locally if they need to ship out-of-band. -->
+    <BhenguPaymentsVersion>2.0.0-preview.6</BhenguPaymentsVersion>
   </PropertyGroup>
 
   <ItemGroup>

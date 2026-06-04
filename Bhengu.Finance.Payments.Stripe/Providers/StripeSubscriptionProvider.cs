@@ -4,6 +4,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Subscription;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Stripe.Configuration;
 using Bhengu.Finance.Payments.Stripe.Internals;
 using Microsoft.Extensions.Logging;
@@ -16,28 +17,26 @@ using Subscription = Bhengu.Finance.Payments.Core.Models.Subscription.Subscripti
 namespace Bhengu.Finance.Payments.Stripe.Providers;
 
 /// <summary>
-/// Stripe implementation of <see cref="ISubscriptionProvider"/>. Wraps the Stripe Billing
-/// stack — <c>Product</c>, <c>Price</c>, and <c>Subscription</c> objects — behind the unified
-/// Bhengu plan / subscription contract.
+/// Stripe implementation of <see cref="ISubscriptionProvider"/> + <see cref="ISubscriptionPauseSupport"/>.
+/// Wraps the Stripe Billing stack — <c>Product</c>, <c>Price</c>, and <c>Subscription</c> objects.
 /// </summary>
-public sealed class StripeSubscriptionProvider : ISubscriptionProvider
+public sealed class StripeSubscriptionProvider : BhenguProviderBase, ISubscriptionProvider, ISubscriptionPauseSupport
 {
     private readonly StripeOptions _options;
-    private readonly ILogger<StripeSubscriptionProvider> _logger;
     private readonly IStripeClient _stripeClient;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Stripe;
+    public override string ProviderName => ProviderNames.Stripe;
 
     /// <summary>Construct the provider. Throws <see cref="ProviderConfigurationException"/> if <see cref="StripeOptions.SecretKey"/> is unset.</summary>
     public StripeSubscriptionProvider(
         HttpClient httpClient,
         IOptions<StripeOptions> options,
         ILogger<StripeSubscriptionProvider> logger)
+        : base(logger)
     {
         ArgumentNullException.ThrowIfNull(httpClient);
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(StripeOptions.SecretKey)} is required");
@@ -52,265 +51,224 @@ public sealed class StripeSubscriptionProvider : ISubscriptionProvider
     public Task<Plan> CreatePlanAsync(PlanRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return StripeObservability.ObserveAsync("create_plan", () => CreatePlanCoreAsync(request, ct));
-    }
-
-    private async Task<Plan> CreatePlanCoreAsync(PlanRequest request, CancellationToken ct)
-    {
-        var requestOptions = BuildRequestOptions(request.IdempotencyKey);
-
-        try
+        return RunOperationAsync("create_plan", async () =>
         {
-            // Stripe's modern API uses Product + Price; the older Plan resource is still supported
-            // and is the most natural one-to-one mapping for the Bhengu Plan contract.
-            var planService = new PlanService(_stripeClient);
-            var planOptions = new PlanCreateOptions
+            var requestOptions = BuildRequestOptions(request.IdempotencyKey);
+
+            try
             {
-                Amount = (long)(request.Amount * 100),
-                Currency = request.Currency.ToLowerInvariant(),
-                Interval = MapInterval(request.Interval),
-                IntervalCount = IntervalCount(request.Interval),
-                Nickname = request.Name,
-                Product = new PlanProductOptions
+                // Stripe's modern API uses Product + Price; the older Plan resource is still supported
+                // and is the most natural one-to-one mapping for the Bhengu Plan contract.
+                var planService = new PlanService(_stripeClient);
+                var planOptions = new PlanCreateOptions
                 {
-                    Name = request.Name,
-                    StatementDescriptor = TruncateStatementDescriptor(request.Name)
-                }
-            };
+                    Amount = (long)(request.Amount * 100),
+                    Currency = request.Currency.ToLowerInvariant(),
+                    Interval = MapInterval(request.Interval),
+                    IntervalCount = IntervalCount(request.Interval),
+                    Nickname = request.Name,
+                    Product = new PlanProductOptions
+                    {
+                        Name = request.Name,
+                        StatementDescriptor = TruncateStatementDescriptor(request.Name)
+                    }
+                };
 
-            var plan = await planService.CreateAsync(planOptions, requestOptions, ct).ConfigureAwait(false);
-            _logger.LogInformation("Stripe Plan created: {PlanId} amount={Amount} {Currency}", plan.Id, request.Amount, request.Currency);
-            return Map(plan, request);
-        }
-        catch (StripeException ex)
-        {
-            throw TranslateException(ex, "CreatePlan");
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
-        }
+                var plan = await planService.CreateAsync(planOptions, requestOptions, ct).ConfigureAwait(false);
+                Logger.LogInformation("Stripe Plan created: {PlanId} amount={Amount} {Currency}", plan.Id, request.Amount, request.Currency);
+                return MapPlan(plan, request);
+            }
+            catch (StripeException ex)
+            {
+                throw StripeExceptionTranslator.Translate(ex, ProviderName, "CreatePlan", Logger);
+            }
+        }, ct);
     }
 
     /// <inheritdoc />
     public Task<Plan?> GetPlanAsync(string planReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(planReference);
-        return StripeObservability.ObserveAsync("get_plan", () => GetPlanCoreAsync(planReference, ct));
-    }
-
-    private async Task<Plan?> GetPlanCoreAsync(string planReference, CancellationToken ct)
-    {
-        try
+        return RunOperationAsync("get_plan", async () =>
         {
-            var service = new PlanService(_stripeClient);
-            var plan = await service.GetAsync(planReference, cancellationToken: ct).ConfigureAwait(false);
-            return Map(plan);
-        }
-        catch (StripeException ex) when (ex.HttpStatusCode == System.Net.HttpStatusCode.NotFound)
-        {
-            return null;
-        }
-        catch (StripeException ex)
-        {
-            throw TranslateException(ex, "GetPlan");
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
-        }
+            try
+            {
+                var service = new PlanService(_stripeClient);
+                var plan = await service.GetAsync(planReference, cancellationToken: ct).ConfigureAwait(false);
+                return (Plan?)MapPlan(plan);
+            }
+            catch (StripeException ex) when (ex.HttpStatusCode == System.Net.HttpStatusCode.NotFound)
+            {
+                return null;
+            }
+            catch (StripeException ex)
+            {
+                throw StripeExceptionTranslator.Translate(ex, ProviderName, "GetPlan", Logger);
+            }
+        }, ct);
     }
 
     /// <inheritdoc />
     public Task<Subscription> CreateSubscriptionAsync(SubscriptionRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return StripeObservability.ObserveAsync("create_subscription", () => CreateSubscriptionCoreAsync(request, ct));
-    }
-
-    private async Task<Subscription> CreateSubscriptionCoreAsync(SubscriptionRequest request, CancellationToken ct)
-    {
-        var requestOptions = BuildRequestOptions(request.IdempotencyKey);
-
-        try
+        return RunOperationAsync("create_subscription", async () =>
         {
-            var service = new SubscriptionService(_stripeClient);
-            var subOptions = new SubscriptionCreateOptions
+            var requestOptions = BuildRequestOptions(request.IdempotencyKey);
+
+            try
             {
-                Customer = request.CustomerId,
-                DefaultPaymentMethod = request.PaymentMethodToken,
-                Items = new List<SubscriptionItemOptions>
+                var service = new SubscriptionService(_stripeClient);
+                var subOptions = new SubscriptionCreateOptions
                 {
-                    new() { Plan = request.PlanReference }
-                },
-                Metadata = request.Metadata?.ToDictionary(k => k.Key, v => v.Value),
-                BillingCycleAnchor = request.StartAt,
-                TrialPeriodDays = request.TrialDays
-            };
+                    Customer = request.CustomerId,
+                    DefaultPaymentMethod = request.PaymentMethodToken,
+                    Items = new List<SubscriptionItemOptions>
+                    {
+                        new() { Plan = request.PlanReference }
+                    },
+                    Metadata = request.Metadata?.ToDictionary(k => k.Key, v => v.Value),
+                    BillingCycleAnchor = request.StartAt,
+                    TrialPeriodDays = request.TrialDays
+                };
 
-            var sub = await service.CreateAsync(subOptions, requestOptions, ct).ConfigureAwait(false);
-            _logger.LogInformation("Stripe Subscription created: {SubId} plan={PlanId} customer={CustomerId} status={Status}",
-                sub.Id, request.PlanReference, request.CustomerId, sub.Status);
+                var sub = await service.CreateAsync(subOptions, requestOptions, ct).ConfigureAwait(false);
+                Logger.LogInformation("Stripe Subscription created: {SubId} plan={PlanId} customer={CustomerId} status={Status}",
+                    sub.Id, request.PlanReference, request.CustomerId, sub.Status);
 
-            return Map(sub);
-        }
-        catch (StripeException ex)
-        {
-            throw TranslateException(ex, "CreateSubscription");
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
-        }
+                return MapSubscription(sub);
+            }
+            catch (StripeException ex)
+            {
+                throw StripeExceptionTranslator.Translate(ex, ProviderName, "CreateSubscription", Logger);
+            }
+        }, ct);
     }
 
     /// <inheritdoc />
     public Task<Subscription?> GetSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
-        return StripeObservability.ObserveAsync("get_subscription", () => GetSubscriptionCoreAsync(subscriptionReference, ct));
-    }
-
-    private async Task<Subscription?> GetSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
-    {
-        try
+        return RunOperationAsync("get_subscription", async () =>
         {
-            var service = new SubscriptionService(_stripeClient);
-            var sub = await service.GetAsync(subscriptionReference, cancellationToken: ct).ConfigureAwait(false);
-            return Map(sub);
-        }
-        catch (StripeException ex) when (ex.HttpStatusCode == System.Net.HttpStatusCode.NotFound)
-        {
-            return null;
-        }
-        catch (StripeException ex)
-        {
-            throw TranslateException(ex, "GetSubscription");
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
-        }
+            try
+            {
+                var service = new SubscriptionService(_stripeClient);
+                var sub = await service.GetAsync(subscriptionReference, cancellationToken: ct).ConfigureAwait(false);
+                return (Subscription?)MapSubscription(sub);
+            }
+            catch (StripeException ex) when (ex.HttpStatusCode == System.Net.HttpStatusCode.NotFound)
+            {
+                return null;
+            }
+            catch (StripeException ex)
+            {
+                throw StripeExceptionTranslator.Translate(ex, ProviderName, "GetSubscription", Logger);
+            }
+        }, ct);
     }
 
     /// <inheritdoc />
     public Task<Subscription> CancelSubscriptionAsync(string subscriptionReference, bool immediately = false, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
-        return StripeObservability.ObserveAsync("cancel_subscription", () => CancelSubscriptionCoreAsync(subscriptionReference, immediately, ct));
-    }
-
-    private async Task<Subscription> CancelSubscriptionCoreAsync(string subscriptionReference, bool immediately, CancellationToken ct)
-    {
-        try
+        return RunOperationAsync("cancel_subscription", async () =>
         {
-            var service = new SubscriptionService(_stripeClient);
-            StripeSubscription sub;
-            if (immediately)
+            try
             {
-                sub = await service.CancelAsync(subscriptionReference, cancellationToken: ct).ConfigureAwait(false);
+                var service = new SubscriptionService(_stripeClient);
+                StripeSubscription sub;
+                if (immediately)
+                {
+                    sub = await service.CancelAsync(subscriptionReference, cancellationToken: ct).ConfigureAwait(false);
+                }
+                else
+                {
+                    // Schedule the cancellation at the end of the current billing period.
+                    sub = await service.UpdateAsync(subscriptionReference,
+                        new SubscriptionUpdateOptions { CancelAtPeriodEnd = true },
+                        cancellationToken: ct).ConfigureAwait(false);
+                }
+                Logger.LogInformation("Stripe Subscription cancelled: {SubId} immediately={Immediately} status={Status}",
+                    sub.Id, immediately, sub.Status);
+                return MapSubscription(sub);
             }
-            else
+            catch (StripeException ex) when (ex.HttpStatusCode == System.Net.HttpStatusCode.NotFound)
             {
-                // Schedule the cancellation at the end of the current billing period.
-                sub = await service.UpdateAsync(subscriptionReference,
-                    new SubscriptionUpdateOptions { CancelAtPeriodEnd = true },
-                    cancellationToken: ct).ConfigureAwait(false);
+                // Idempotency contract: already-cancelled subs are not an error.
+                return new Subscription
+                {
+                    Reference = subscriptionReference,
+                    PlanReference = string.Empty,
+                    CustomerId = string.Empty,
+                    Status = SubscriptionStatus.Cancelled,
+                    StartedAt = DateTime.UtcNow,
+                    CancelledAt = DateTime.UtcNow
+                };
             }
-            _logger.LogInformation("Stripe Subscription cancelled: {SubId} immediately={Immediately} status={Status}",
-                sub.Id, immediately, sub.Status);
-            return Map(sub);
-        }
-        catch (StripeException ex) when (ex.HttpStatusCode == System.Net.HttpStatusCode.NotFound)
-        {
-            // Idempotency contract: already-cancelled subs are not an error.
-            return new Subscription
+            catch (StripeException ex)
             {
-                Reference = subscriptionReference,
-                PlanReference = string.Empty,
-                CustomerId = string.Empty,
-                Status = SubscriptionStatus.Cancelled,
-                StartedAt = DateTime.UtcNow,
-                CancelledAt = DateTime.UtcNow
-            };
-        }
-        catch (StripeException ex)
-        {
-            throw TranslateException(ex, "CancelSubscription");
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
-        }
+                throw StripeExceptionTranslator.Translate(ex, ProviderName, "CancelSubscription", Logger);
+            }
+        }, ct);
     }
 
     /// <inheritdoc />
     public Task<Subscription> PauseSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
-        return StripeObservability.ObserveAsync("pause_subscription", () => PauseSubscriptionCoreAsync(subscriptionReference, ct));
-    }
-
-    private async Task<Subscription> PauseSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
-    {
-        try
+        return RunOperationAsync("pause_subscription", async () =>
         {
-            var service = new SubscriptionService(_stripeClient);
-            var sub = await service.UpdateAsync(subscriptionReference, new SubscriptionUpdateOptions
+            try
             {
-                PauseCollection = new SubscriptionPauseCollectionOptions { Behavior = "mark_uncollectible" }
-            }, cancellationToken: ct).ConfigureAwait(false);
-            return Map(sub);
-        }
-        catch (StripeException ex)
-        {
-            throw TranslateException(ex, "PauseSubscription");
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
-        }
+                var service = new SubscriptionService(_stripeClient);
+                var sub = await service.UpdateAsync(subscriptionReference, new SubscriptionUpdateOptions
+                {
+                    PauseCollection = new SubscriptionPauseCollectionOptions { Behavior = "mark_uncollectible" }
+                }, cancellationToken: ct).ConfigureAwait(false);
+                return MapSubscription(sub);
+            }
+            catch (StripeException ex)
+            {
+                throw StripeExceptionTranslator.Translate(ex, ProviderName, "PauseSubscription", Logger);
+            }
+        }, ct);
     }
 
     /// <inheritdoc />
     public Task<Subscription> ResumeSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
-        return StripeObservability.ObserveAsync("resume_subscription", () => ResumeSubscriptionCoreAsync(subscriptionReference, ct));
-    }
-
-    private async Task<Subscription> ResumeSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
-    {
-        try
+        return RunOperationAsync("resume_subscription", async () =>
         {
-            var service = new SubscriptionService(_stripeClient);
-            // For un-paused (collection-paused) subs the dedicated Resume endpoint applies. For subs
-            // that were paused via PauseCollection only, clearing the field via an Update is the
-            // correct path. We try Resume first and fall back to Update.
             try
             {
-                var resumed = await service.ResumeAsync(subscriptionReference, cancellationToken: ct).ConfigureAwait(false);
-                return Map(resumed);
+                var service = new SubscriptionService(_stripeClient);
+                // For un-paused (collection-paused) subs the dedicated Resume endpoint applies. For subs
+                // that were paused via PauseCollection only, clearing the field via an Update is the
+                // correct path. We try Resume first and fall back to Update.
+                try
+                {
+                    var resumed = await service.ResumeAsync(subscriptionReference, cancellationToken: ct).ConfigureAwait(false);
+                    return MapSubscription(resumed);
+                }
+                catch (StripeException resumeEx) when (resumeEx.HttpStatusCode is System.Net.HttpStatusCode.BadRequest)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var sub = await service.UpdateAsync(subscriptionReference,
+                        new SubscriptionUpdateOptions { PauseCollection = null },
+                        cancellationToken: ct).ConfigureAwait(false);
+                    return MapSubscription(sub);
+                }
             }
-            catch (StripeException resumeEx) when (resumeEx.HttpStatusCode is System.Net.HttpStatusCode.BadRequest)
+            catch (StripeException ex)
             {
-                var sub = await service.UpdateAsync(subscriptionReference,
-                    new SubscriptionUpdateOptions { PauseCollection = null },
-                    cancellationToken: ct).ConfigureAwait(false);
-                return Map(sub);
+                throw StripeExceptionTranslator.Translate(ex, ProviderName, "ResumeSubscription", Logger);
             }
-        }
-        catch (StripeException ex)
-        {
-            throw TranslateException(ex, "ResumeSubscription");
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
-        }
+        }, ct);
     }
 
-    private static Plan Map(global::Stripe.Plan plan, PlanRequest? source = null) => new()
+    private static Plan MapPlan(global::Stripe.Plan plan, PlanRequest? source = null) => new()
     {
         Reference = plan.Id,
         Name = plan.Nickname ?? source?.Name ?? plan.Id,
@@ -321,7 +279,7 @@ public sealed class StripeSubscriptionProvider : ISubscriptionProvider
         Description = source?.Description
     };
 
-    private static Subscription Map(StripeSubscription sub) => new()
+    private static Subscription MapSubscription(StripeSubscription sub) => new()
     {
         Reference = sub.Id,
         PlanReference = sub.Items?.Data?.FirstOrDefault()?.Plan?.Id ?? sub.Items?.Data?.FirstOrDefault()?.Price?.Id ?? string.Empty,
@@ -386,22 +344,4 @@ public sealed class StripeSubscriptionProvider : ISubscriptionProvider
 
     private static RequestOptions? BuildRequestOptions(string? idempotencyKey) =>
         string.IsNullOrEmpty(idempotencyKey) ? null : new RequestOptions { IdempotencyKey = idempotencyKey };
-
-    private BhenguPaymentException TranslateException(StripeException ex, string operation)
-    {
-        var httpStatus = (int)ex.HttpStatusCode;
-        var errorCode = ex.StripeError?.Code ?? ex.HttpStatusCode.ToString();
-        var errorMessage = ex.StripeError?.Message ?? ex.Message;
-
-        _logger.LogError(ex, "Stripe {Operation} failed: {HttpStatus} {Code} {Message}",
-            operation, httpStatus, errorCode, errorMessage);
-
-        if (httpStatus == 429)
-            return new ProviderRateLimitException(ProviderName, providerErrorMessage: errorMessage, innerException: ex);
-
-        if (httpStatus is >= 400 and < 500)
-            return new PaymentDeclinedException(ProviderName, errorCode, errorMessage, ex);
-
-        return new ProviderUnavailableException(ProviderName, $"HTTP {httpStatus}: {errorMessage}", ex);
-    }
 }

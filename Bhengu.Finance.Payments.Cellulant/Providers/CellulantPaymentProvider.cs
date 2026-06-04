@@ -15,6 +15,8 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -27,17 +29,16 @@ namespace Bhengu.Finance.Payments.Cellulant.Providers;
 /// via the <c>x-tingg-signature</c> header. Honours per-call <c>IdempotencyKey</c> by dedup'ing
 /// via the shared <see cref="IBhenguDistributedCache"/> for 24 hours.
 /// </summary>
-public sealed class CellulantPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class CellulantPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly CellulantOptions _options;
-    private readonly ILogger<CellulantPaymentProvider> _logger;
     private readonly IBhenguDistributedCache _cache;
     private readonly CellulantTokenBroker _tokenBroker;
     private static readonly TimeSpan s_idempotencyTtl = TimeSpan.FromHours(24);
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Cellulant;
+    public override string ProviderName => ProviderNames.Cellulant;
 
     /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
@@ -61,10 +62,10 @@ public sealed class CellulantPaymentProvider : IPaymentGatewayProvider, IPayoutP
         ILogger<CellulantPaymentProvider> logger,
         IBhenguDistributedCache? cache = null,
         CellulantTokenBroker? tokenBroker = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _cache = cache ?? new InMemoryBhenguDistributedCache();
         _tokenBroker = tokenBroker ?? new CellulantTokenBroker(options!, new Microsoft.Extensions.Logging.Abstractions.NullLogger<CellulantTokenBroker>());
 
@@ -85,21 +86,13 @@ public sealed class CellulantPaymentProvider : IPaymentGatewayProvider, IPayoutP
     }
 
     /// <inheritdoc/>
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
-        var startedAt = DateTime.UtcNow;
-        var outcomeTag = BhenguPaymentDiagnostics.Outcomes.Error;
-        try
+        return RunChargeAsync(request.Currency, async () =>
         {
             var cached = await TryGetCachedAsync<PaymentResponse>(request.IdempotencyKey, "charge", ct).ConfigureAwait(false);
-            if (cached is not null)
-            {
-                outcomeTag = BhenguPaymentDiagnostics.Outcomes.Success;
-                return cached;
-            }
+            if (cached is not null) return cached;
 
             var email = request.Metadata?.GetValueOrDefault("email") ?? "noreply@example.com";
             var name = request.Metadata?.GetValueOrDefault("name") ?? "Customer";
@@ -134,14 +127,13 @@ public sealed class CellulantPaymentProvider : IPaymentGatewayProvider, IPayoutP
             var body = await SendAuthorisedAsync(HttpMethod.Post, "checkout/v3/express", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<CellulantCheckoutResponse>(body);
 
-            _logger.LogInformation("Cellulant checkout created: {Id} status={Status}",
+            Logger.LogInformation("Cellulant checkout created: {Id} status={Status}",
                 response?.CheckoutRequestId, response?.Status);
 
-            var status = MapStatus(response?.Status ?? "pending");
             var pr = new PaymentResponse
             {
                 GatewayReference = response?.CheckoutRequestId ?? merchantTransactionId,
-                Status = status,
+                Status = MapStatus(response?.Status ?? "pending"),
                 Amount = request.Amount,
                 Currency = request.Currency,
                 ProcessedAt = DateTime.UtcNow,
@@ -149,47 +141,19 @@ public sealed class CellulantPaymentProvider : IPaymentGatewayProvider, IPayoutP
                 Message = response?.Status
             };
 
-            outcomeTag = status switch
-            {
-                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
-                PaymentStatus.Failed => BhenguPaymentDiagnostics.Outcomes.Declined,
-                _ => BhenguPaymentDiagnostics.Outcomes.Pending
-            };
             await TrySetCachedAsync(request.IdempotencyKey, "charge", pr, ct).ConfigureAwait(false);
             return pr;
-        }
-        catch (PaymentDeclinedException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        finally
-        {
-            activity.SetOutcome(outcomeTag);
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcomeTag));
-            BhenguPaymentDiagnostics.ChargeDurationMs.Record(
-                (DateTime.UtcNow - startedAt).TotalMilliseconds,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcomeTag));
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, request.Currency);
-        var outcomeTag = BhenguPaymentDiagnostics.Outcomes.Error;
-        try
+        return RunPayoutAsync(request.Currency, async () =>
         {
             var cached = await TryGetCachedAsync<PayoutResponse>(request.IdempotencyKey, "payout", ct).ConfigureAwait(false);
-            if (cached is not null)
-            {
-                outcomeTag = BhenguPaymentDiagnostics.Outcomes.Success;
-                return cached;
-            }
+            if (cached is not null) return cached;
 
             var externalReference = request.IdempotencyKey ?? $"mula-{Guid.NewGuid():N}";
             var requestBody = new
@@ -206,52 +170,31 @@ public sealed class CellulantPaymentProvider : IPaymentGatewayProvider, IPayoutP
             var body = await SendAuthorisedAsync(HttpMethod.Post, "disbursement/v1/initiate", requestBody, ct, "ProcessPayout").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<CellulantPayoutResponse>(body);
 
-            _logger.LogInformation("Cellulant Mula disbursement initiated: {Reference} status={Status}",
+            Logger.LogInformation("Cellulant Mula disbursement initiated: {Reference} status={Status}",
                 response?.TransactionReference, response?.Status);
 
-            var status = MapStatus(response?.Status ?? "pending");
             var pr = new PayoutResponse
             {
                 GatewayReference = response?.TransactionReference ?? string.Empty,
-                Status = status,
+                Status = MapStatus(response?.Status ?? "pending"),
                 Amount = request.Amount,
                 Currency = request.Currency,
                 ProcessedAt = DateTime.UtcNow
             };
 
-            outcomeTag = status == PaymentStatus.Failed
-                ? BhenguPaymentDiagnostics.Outcomes.Declined
-                : BhenguPaymentDiagnostics.Outcomes.Success;
             await TrySetCachedAsync(request.IdempotencyKey, "payout", pr, ct).ConfigureAwait(false);
             return pr;
-        }
-        catch (PaymentDeclinedException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        finally
-        {
-            activity.SetOutcome(outcomeTag);
-            BhenguPaymentDiagnostics.PayoutsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcomeTag));
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
-        var outcomeTag = BhenguPaymentDiagnostics.Outcomes.Error;
-        try
+        return RunRefundAsync(request.GatewayReference, async () =>
         {
             var cached = await TryGetCachedAsync<RefundResponse>(request.IdempotencyKey, "refund", ct).ConfigureAwait(false);
-            if (cached is not null)
-            {
-                outcomeTag = BhenguPaymentDiagnostics.Outcomes.Success;
-                return cached;
-            }
+            if (cached is not null) return cached;
 
             var requestBody = new
             {
@@ -263,35 +206,21 @@ public sealed class CellulantPaymentProvider : IPaymentGatewayProvider, IPayoutP
             var body = await SendAuthorisedAsync(HttpMethod.Post, "refunds", requestBody, ct, "ProcessRefund").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<CellulantRefundResponse>(body);
 
-            _logger.LogInformation("Cellulant refund processed: {Reference} for transaction {TransactionId}",
+            Logger.LogInformation("Cellulant refund processed: {Reference} for transaction {TransactionId}",
                 response?.RefundReference, request.GatewayReference);
 
-            var status = MapStatus(response?.Status ?? "pending");
             var pr = new RefundResponse
             {
                 GatewayReference = response?.RefundReference ?? request.GatewayReference,
                 Amount = request.Amount,
-                Status = status,
+                Status = MapStatus(response?.Status ?? "pending"),
                 ProcessedAt = DateTime.UtcNow,
                 Message = response?.Status
             };
 
-            outcomeTag = status == PaymentStatus.Failed
-                ? BhenguPaymentDiagnostics.Outcomes.Declined
-                : BhenguPaymentDiagnostics.Outcomes.Success;
             await TrySetCachedAsync(request.IdempotencyKey, "refund", pr, ct).ConfigureAwait(false);
             return pr;
-        }
-        catch (PaymentDeclinedException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        finally
-        {
-            activity.SetOutcome(outcomeTag);
-            BhenguPaymentDiagnostics.RefundsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcomeTag));
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>
@@ -300,27 +229,16 @@ public sealed class CellulantPaymentProvider : IPaymentGatewayProvider, IPayoutP
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
+        return RunWebhookVerify(() =>
         {
-            _logger.LogWarning("Cellulant WebhookSecret not configured — signature verification cannot succeed.");
-            return false;
-        }
-
-        try
-        {
-            using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
-            var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
-            var computedSignature = Convert.ToHexString(computedHash).ToLowerInvariant();
-
-            return CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
-                Encoding.UTF8.GetBytes(computedSignature));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Cellulant webhook signature verification raised");
-            return false;
-        }
+            if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
+            {
+                Logger.LogWarning("Cellulant WebhookSecret not configured — signature verification cannot succeed.");
+                return false;
+            }
+            // Tingg signs the raw payload with HMAC-SHA256, lowercase hex, in x-tingg-signature.
+            return SignatureHelpers.VerifyHmacSha256(payload, signature, _options.WebhookSecret);
+        });
     }
 
     /// <inheritdoc/>
@@ -338,14 +256,14 @@ public sealed class CellulantPaymentProvider : IPaymentGatewayProvider, IPayoutP
                 return Task.FromResult<WebhookEvent?>(null);
             }
 
-            _logger.LogInformation("Parsed Cellulant webhook event: {EventType}", webhookEvent.EventType);
+            Logger.LogInformation("Parsed Cellulant webhook event: {EventType}", webhookEvent.EventType);
             var typed = MapWebhookEvent(webhookEvent);
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             return Task.FromResult(typed);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse Cellulant webhook event");
+            Logger.LogError(ex, "Failed to parse Cellulant webhook event");
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
             return Task.FromResult<WebhookEvent?>(null);
         }
@@ -469,6 +387,7 @@ public sealed class CellulantPaymentProvider : IPaymentGatewayProvider, IPayoutP
     private async Task<string> SendAuthorisedAsync(HttpMethod method, string path, object body, CancellationToken ct, string operation)
     {
         var token = await _tokenBroker.EnsureAccessTokenAsync(_httpClient, ct).ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
 
         var json = JsonSerializer.Serialize(body);
         using var req = new HttpRequestMessage(method, path)
@@ -477,16 +396,7 @@ public sealed class CellulantPaymentProvider : IPaymentGatewayProvider, IPayoutP
         };
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Cellulant failed", ex);
-        }
-
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -497,7 +407,7 @@ public sealed class CellulantPaymentProvider : IPaymentGatewayProvider, IPayoutP
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Cellulant {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Cellulant {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(System.Globalization.CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

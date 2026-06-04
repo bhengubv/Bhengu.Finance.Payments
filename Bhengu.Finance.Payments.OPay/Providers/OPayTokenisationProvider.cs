@@ -1,13 +1,13 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
-using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Vault;
-using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.OPay.Configuration;
 using Bhengu.Finance.Payments.OPay.Internals;
 using Microsoft.Extensions.Logging;
@@ -16,174 +16,101 @@ using Microsoft.Extensions.Options;
 namespace Bhengu.Finance.Payments.OPay.Providers;
 
 /// <summary>
-/// OPay implementation of <see cref="ITokenisationProvider"/>. OPay's wallet uses
-/// <em>saved bank accounts</em> (NUBAN + bankCode) as the tokenisable payment-method primitive —
-/// raw card storage is handled by OPay's hosted cashier and not exposed via this server-side
-/// endpoint. The Bhengu adapter maps OPay's "saved bank" object onto the generic
-/// <see cref="PaymentMethod"/> shape with <see cref="PaymentMethodKind.BankAccount"/>.
+/// READ-side OPay tokenisation provider — saved-bank-account fetch / list / delete. The
+/// WRITE-side counterpart that registers raw bank-account credentials lives in
+/// <see cref="OPayRawCardTokenisationProvider"/>.
 /// </summary>
-/// <remarks>
-/// <para>For card vaulting, prefer redirecting the payer to the OPay-hosted cashier so the
-/// vaulted card lives in OPay's PCI-DSS scope, not yours; the resulting <c>paymentToken</c>
-/// returned on the cashier callback is what you persist server-side.</para>
-/// </remarks>
-public sealed class OPayTokenisationProvider : ITokenisationProvider
+public sealed class OPayTokenisationProvider : BhenguProviderBase, ITokenisationProvider
 {
-    private readonly OPayHttpClient _http;
-    private readonly OPayOptions _options;
-    private readonly ILogger<OPayTokenisationProvider> _logger;
-    private readonly OPayIdempotencyCache _idempotency;
+    internal readonly OPayHttpClient Http;
+    internal readonly OPayOptions Options;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.OPay;
+    public override string ProviderName => ProviderNames.OPay;
 
     /// <summary>Construct a tokenisation provider. Designed to be registered via DI.</summary>
     public OPayTokenisationProvider(
         HttpClient httpClient,
         IOptions<OPayOptions> options,
-        ILogger<OPayTokenisationProvider> logger,
-        OPayIdempotencyCache idempotency)
+        ILogger<OPayTokenisationProvider> logger)
+        : base(logger)
     {
         ArgumentNullException.ThrowIfNull(httpClient);
-        _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        _idempotency = idempotency ?? throw new ArgumentNullException(nameof(idempotency));
+        Options = options?.Value ?? throw new ArgumentNullException(nameof(options));
 
-        if (string.IsNullOrWhiteSpace(_options.PublicKey))
+        if (string.IsNullOrWhiteSpace(Options.PublicKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(OPayOptions.PublicKey)} is required");
-        if (string.IsNullOrWhiteSpace(_options.SecretKey))
+        if (string.IsNullOrWhiteSpace(Options.SecretKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(OPayOptions.SecretKey)} is required");
-        if (string.IsNullOrWhiteSpace(_options.MerchantId))
+        if (string.IsNullOrWhiteSpace(Options.MerchantId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(OPayOptions.MerchantId)} is required");
 
-        _http = new OPayHttpClient(httpClient, _options, _logger);
+        Http = new OPayHttpClient(httpClient, Options, Logger);
     }
 
     /// <inheritdoc />
-    /// <remarks>
-    /// OPay does not accept raw card details server-side. To register a saved bank account pass
-    /// the NUBAN bank-account number via <see cref="CardDetails.CardNumber"/> and the 3-digit
-    /// CBN bank code via <see cref="CardDetails.BillingAddressLine1"/>; this method then maps
-    /// the request onto OPay's <c>cashier/savedBankAccount/register</c> endpoint.
-    /// </remarks>
-    public Task<PaymentMethod> TokeniseAsync(TokeniseRequest request, CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(request);
-        return _idempotency.GetOrAddAsync(request.IdempotencyKey, "tokenise",
-            () => TokeniseCoreAsync(request, ct), ct);
-    }
-
-    private async Task<PaymentMethod> TokeniseCoreAsync(TokeniseRequest request, CancellationToken ct)
-    {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise");
-        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
-        try
-        {
-            if (string.IsNullOrWhiteSpace(request.CustomerId))
-                throw new PaymentDeclinedException(ProviderName, "missing_customer",
-                    "OPay tokenisation requires TokeniseRequest.CustomerId (OPay user id).");
-
-            var bankCode = request.Card.BillingAddressLine1
-                ?? throw new PaymentDeclinedException(ProviderName, "missing_bank_code",
-                    "OPay tokenisation requires bank code in CardDetails.BillingAddressLine1.");
-
-            var body = new
-            {
-                publicKey = _options.PublicKey,
-                country = _options.Country,
-                sn = _options.MerchantId,
-                userId = request.CustomerId,
-                bankAccountNumber = request.Card.CardNumber,
-                bankCode,
-                accountHolderName = request.Card.CardholderName,
-                alias = request.DisplayName,
-                setAsDefault = request.SetAsDefault
-            };
-
-            var json = await _http.SendAsync(HttpMethod.Post, "api/v1/international/cashier/savedBankAccount/register",
-                body, "Tokenise", ct).ConfigureAwait(false);
-            var resp = JsonSerializer.Deserialize<OPayResponse<OPaySavedBankAccount>>(json, OPayHttpClient.Json)
-                ?? throw new BhenguPaymentException(ProviderName, "OPay save-bank-account returned an empty body", "empty_response");
-
-            if (!string.Equals(resp.Code, "00000", StringComparison.Ordinal) || string.IsNullOrWhiteSpace(resp.Data?.Token))
-                throw new PaymentDeclinedException(ProviderName, resp.Code ?? "no_token", resp.Message);
-
-            outcome = BhenguPaymentDiagnostics.Outcomes.Success;
-            return Map(resp.Data, request.CustomerId, request.DisplayName, request.SetAsDefault);
-        }
-        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
-        finally
-        {
-            activity?.SetOutcome(outcome);
-        }
-    }
-
-    /// <inheritdoc />
-    public async Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
+    public Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(token);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "get_payment_method");
-        try
+        return RunOperationAsync<PaymentMethod?>("get_payment_method", async () =>
         {
-            var body = new { publicKey = _options.PublicKey, sn = _options.MerchantId, token };
-            var json = await _http.SendAsync(HttpMethod.Post,
-                "api/v1/international/cashier/savedBankAccount/query", body, "GetPaymentMethod", ct).ConfigureAwait(false);
-            var resp = JsonSerializer.Deserialize<OPayResponse<OPaySavedBankAccount>>(json, OPayHttpClient.Json);
-            if (resp?.Data?.Token is null) return null;
-            activity?.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return Map(resp.Data, resp.Data.UserId, null, resp.Data.IsDefault);
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            activity?.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return null;
-        }
+            try
+            {
+                var body = new { publicKey = Options.PublicKey, sn = Options.MerchantId, token };
+                var json = await Http.SendAsync(HttpMethod.Post,
+                    "api/v1/international/cashier/savedBankAccount/query", body, "GetPaymentMethod", ct).ConfigureAwait(false);
+                var resp = JsonSerializer.Deserialize<OPayResponseEnvelope<OPaySavedBankAccount>>(json, OPayHttpClient.Json);
+                if (resp?.Data?.Token is null) return null;
+                return Map(resp.Data, resp.Data.UserId, null, resp.Data.IsDefault);
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return null;
+            }
+        }, ct);
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<PaymentMethod>> ListPaymentMethodsAsync(string customerId, CancellationToken ct = default)
+    public async IAsyncEnumerable<PaymentMethod> ListPaymentMethodsAsync(
+        string customerId,
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(customerId);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "list_payment_methods");
-        var body = new { publicKey = _options.PublicKey, sn = _options.MerchantId, userId = customerId };
-        var json = await _http.SendAsync(HttpMethod.Post,
-            "api/v1/international/cashier/savedBankAccount/list", body, "ListPaymentMethods", ct).ConfigureAwait(false);
-        var resp = JsonSerializer.Deserialize<OPayResponse<OPaySavedBankAccountList>>(json, OPayHttpClient.Json);
-        activity?.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-
-        if (resp?.Data?.Accounts is null || resp.Data.Accounts.Count == 0)
-            return Array.Empty<PaymentMethod>();
-
-        var result = new List<PaymentMethod>(resp.Data.Accounts.Count);
-        foreach (var a in resp.Data.Accounts) result.Add(Map(a, customerId, null, a.IsDefault));
-        return result;
+        var body = new { publicKey = Options.PublicKey, sn = Options.MerchantId, userId = customerId };
+        var json = await RunOperationAsync("list_payment_methods",
+            () => Http.SendAsync(HttpMethod.Post,
+                "api/v1/international/cashier/savedBankAccount/list", body, "ListPaymentMethods", ct), ct).ConfigureAwait(false);
+        var resp = JsonSerializer.Deserialize<OPayResponseEnvelope<OPaySavedBankAccountList>>(json, OPayHttpClient.Json);
+        if (resp?.Data?.Accounts is null) yield break;
+        foreach (var a in resp.Data.Accounts)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return Map(a, customerId, null, a.IsDefault);
+        }
     }
 
     /// <inheritdoc />
-    public async Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
+    public Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(token);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "delete_payment_method");
-        try
+        return RunOperationAsync("delete_payment_method", async () =>
         {
-            var body = new { publicKey = _options.PublicKey, sn = _options.MerchantId, token };
-            var json = await _http.SendAsync(HttpMethod.Post,
-                "api/v1/international/cashier/savedBankAccount/remove", body, "DeletePaymentMethod", ct).ConfigureAwait(false);
-            var resp = JsonSerializer.Deserialize<OPayResponse<object>>(json, OPayHttpClient.Json);
-            activity?.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return string.Equals(resp?.Code, "00000", StringComparison.Ordinal);
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            activity?.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return false;
-        }
+            try
+            {
+                var body = new { publicKey = Options.PublicKey, sn = Options.MerchantId, token };
+                var json = await Http.SendAsync(HttpMethod.Post,
+                    "api/v1/international/cashier/savedBankAccount/remove", body, "DeletePaymentMethod", ct).ConfigureAwait(false);
+                var resp = JsonSerializer.Deserialize<OPayResponseEnvelope<object>>(json, OPayHttpClient.Json);
+                return string.Equals(resp?.Code, "00000", StringComparison.Ordinal);
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return false;
+            }
+        }, ct);
     }
 
-    private static PaymentMethod Map(OPaySavedBankAccount src, string? customerId, string? displayName, bool isDefault) => new()
+    internal static PaymentMethod Map(OPaySavedBankAccount src, string? customerId, string? displayName, bool isDefault) => new()
     {
         Token = src.Token ?? string.Empty,
         CustomerId = customerId ?? src.UserId,
@@ -201,14 +128,14 @@ public sealed class OPayTokenisationProvider : ITokenisationProvider
 
     // === OPay API shapes (internal) ===
 
-    private sealed class OPayResponse<T> where T : class
+    internal sealed class OPayResponseEnvelope<T> where T : class
     {
         [JsonPropertyName("code")] public string? Code { get; set; }
         [JsonPropertyName("message")] public string? Message { get; set; }
         [JsonPropertyName("data")] public T? Data { get; set; }
     }
 
-    private sealed class OPaySavedBankAccount
+    internal sealed class OPaySavedBankAccount
     {
         [JsonPropertyName("token")] public string? Token { get; set; }
         [JsonPropertyName("userId")] public string? UserId { get; set; }
@@ -220,7 +147,7 @@ public sealed class OPayTokenisationProvider : ITokenisationProvider
         [JsonPropertyName("createdAt")] public DateTime? CreatedAt { get; set; }
     }
 
-    private sealed class OPaySavedBankAccountList
+    internal sealed class OPaySavedBankAccountList
     {
         [JsonPropertyName("accounts")] public List<OPaySavedBankAccount>? Accounts { get; set; }
     }

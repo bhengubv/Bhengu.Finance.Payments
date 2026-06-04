@@ -9,6 +9,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Mandate;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.PayFast.Configuration;
 using Bhengu.Finance.Payments.PayFast.Internals;
 using Microsoft.Extensions.Logging;
@@ -33,15 +34,14 @@ namespace Bhengu.Finance.Payments.PayFast.Providers;
 /// in the local <see cref="PayFastMandateAmountCache"/> so subsequent
 /// <see cref="ChargeMandateAsync"/> calls can refuse over-limit pulls before they hit the network.</para>
 /// </remarks>
-public sealed class PayFastMandateProvider : IMandateProvider
+public sealed class PayFastMandateProvider : BhenguProviderBase, IMandateProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PayFastOptions _options;
-    private readonly ILogger<PayFastMandateProvider> _logger;
     private readonly PayFastMandateAmountCache _amountLimits;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.PayFast;
+    public override string ProviderName => ProviderNames.PayFast;
 
     /// <summary>Construct a PayFast mandate provider. Designed to be registered via DI.</summary>
     public PayFastMandateProvider(
@@ -49,10 +49,10 @@ public sealed class PayFastMandateProvider : IMandateProvider
         IOptions<PayFastOptions> options,
         ILogger<PayFastMandateProvider> logger,
         PayFastMandateAmountCache amountLimits)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _amountLimits = amountLimits ?? throw new ArgumentNullException(nameof(amountLimits));
 
         if (string.IsNullOrWhiteSpace(_options.MerchantId))
@@ -70,7 +70,11 @@ public sealed class PayFastMandateProvider : IMandateProvider
     public Task<Mandate> CreateMandateAsync(MandateRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return RunOperationAsync("create_mandate", () => CreateMandateCoreAsync(request), ct);
+    }
 
+    private Task<Mandate> CreateMandateCoreAsync(MandateRequest request)
+    {
         var mPaymentId = request.IdempotencyKey ?? $"mand-{Guid.NewGuid():N}";
 
         var formData = new Dictionary<string, string>(StringComparer.Ordinal)
@@ -111,17 +115,21 @@ public sealed class PayFastMandateProvider : IMandateProvider
             AuthorisationUrl = authorisationUrl
         };
 
-        _logger.LogInformation("PayFast mandate redirect prepared: m_payment_id={MPaymentId} customer={CustomerId} limit={AmountLimit} {Currency}",
+        Logger.LogInformation("PayFast mandate redirect prepared: m_payment_id={MPaymentId} customer={CustomerId} limit={AmountLimit} {Currency}",
             mPaymentId, request.CustomerId, request.AmountLimit, request.Currency);
 
         return Task.FromResult(mandate);
     }
 
     /// <inheritdoc/>
-    public async Task<Mandate?> GetMandateAsync(string mandateReference, CancellationToken ct = default)
+    public Task<Mandate?> GetMandateAsync(string mandateReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(mandateReference);
+        return RunOperationAsync("get_mandate", () => GetMandateCoreAsync(mandateReference, ct), ct);
+    }
 
+    private async Task<Mandate?> GetMandateCoreAsync(string mandateReference, CancellationToken ct)
+    {
         var fetched = await SendSignedAsync<PayFastTokenFetchResponse>(
             HttpMethod.Get, $"subscriptions/{Uri.EscapeDataString(mandateReference)}/fetch", new Dictionary<string, string>(), ct)
             .ConfigureAwait(false);
@@ -144,23 +152,27 @@ public sealed class PayFastMandateProvider : IMandateProvider
     }
 
     /// <inheritdoc/>
-    public async Task<Mandate> CancelMandateAsync(string mandateReference, CancellationToken ct = default)
+    public Task<Mandate> CancelMandateAsync(string mandateReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(mandateReference);
+        return RunOperationAsync("cancel_mandate", () => CancelMandateCoreAsync(mandateReference, ct), ct);
+    }
 
+    private async Task<Mandate> CancelMandateCoreAsync(string mandateReference, CancellationToken ct)
+    {
         try
         {
             await SendSignedAsync<object>(
                 HttpMethod.Put, $"subscriptions/{Uri.EscapeDataString(mandateReference)}/cancel", new Dictionary<string, string>(), ct)
                 .ConfigureAwait(false);
-            _logger.LogInformation("PayFast mandate cancelled: {Reference}", mandateReference);
+            Logger.LogInformation("PayFast mandate cancelled: {Reference}", mandateReference);
         }
         catch (PaymentDeclinedException ex) when (
             ex.ProviderErrorMessage?.Contains("already", StringComparison.OrdinalIgnoreCase) == true ||
             ex.ProviderErrorMessage?.Contains("cancel", StringComparison.OrdinalIgnoreCase) == true)
         {
             // Idempotent: already cancelled is success.
-            _logger.LogInformation("PayFast mandate already cancelled (idempotent): {Reference}", mandateReference);
+            Logger.LogInformation("PayFast mandate already cancelled (idempotent): {Reference}", mandateReference);
         }
 
         var (limit, currency) = _amountLimits.TryGet(mandateReference);
@@ -176,10 +188,14 @@ public sealed class PayFastMandateProvider : IMandateProvider
     }
 
     /// <inheritdoc/>
-    public async Task<PaymentResponse> ChargeMandateAsync(MandateChargeRequest request, CancellationToken ct = default)
+    public Task<PaymentResponse> ChargeMandateAsync(MandateChargeRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return RunChargeAsync(request.Currency, () => ChargeMandateCoreAsync(request, ct), ct);
+    }
 
+    private async Task<PaymentResponse> ChargeMandateCoreAsync(MandateChargeRequest request, CancellationToken ct)
+    {
         var (limit, _) = _amountLimits.TryGet(request.MandateReference);
         if (limit is not null && request.Amount > limit.Value)
         {
@@ -204,7 +220,7 @@ public sealed class PayFastMandateProvider : IMandateProvider
         var result = await SendSignedAsync<PayFastAdhocResponse>(HttpMethod.Post, path, bodyParams, ct).ConfigureAwait(false);
         var status = MapPaymentStatus(result?.Data?.Response);
 
-        _logger.LogInformation("PayFast mandate charged: {Mandate} amount={Amount} response={Response}",
+        Logger.LogInformation("PayFast mandate charged: {Mandate} amount={Amount} response={Response}",
             request.MandateReference, request.Amount, result?.Data?.Response);
 
         return new PaymentResponse
@@ -244,15 +260,7 @@ public sealed class PayFastMandateProvider : IMandateProvider
         if (bodyParams.Count > 0 && method != HttpMethod.Get)
             req.Content = new FormUrlEncodedContent(bodyParams);
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "PayFast API HTTP failure", ex);
-        }
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
 
         var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
@@ -264,7 +272,7 @@ public sealed class PayFastMandateProvider : IMandateProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("PayFast {Method} {Path} failed: {Status} {Body}", method, relativePath, response.StatusCode, body);
+            Logger.LogError("PayFast {Method} {Path} failed: {Status} {Body}", method, relativePath, response.StatusCode, body);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), body);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {body}");
@@ -279,7 +287,7 @@ public sealed class PayFastMandateProvider : IMandateProvider
         }
         catch (JsonException ex)
         {
-            _logger.LogWarning(ex, "PayFast {Method} {Path} returned non-JSON body — accepting as ack", method, relativePath);
+            Logger.LogWarning(ex, "PayFast {Method} {Path} returned non-JSON body — accepting as ack", method, relativePath);
             return null;
         }
     }

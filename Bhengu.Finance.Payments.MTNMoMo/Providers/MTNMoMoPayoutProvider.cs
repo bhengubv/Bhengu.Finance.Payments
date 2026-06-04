@@ -7,10 +7,13 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.MTNMoMo.Configuration;
+using Bhengu.Finance.Payments.MTNMoMo.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -41,35 +44,34 @@ namespace Bhengu.Finance.Payments.MTNMoMo.Providers;
 /// </para>
 /// <para>
 /// <b>OAuth token caching:</b> the disbursement product token is exchanged on demand and cached
-/// in-process until ~1 minute before expiry. Tokens are NOT shared with the collection product
-/// — disbursement and collection have distinct API users.
+/// in the distributed cache until ~1 minute before expiry. Tokens are NOT shared with the collection
+/// product — disbursement and collection have distinct API users.
 /// </para>
 /// </remarks>
-public sealed class MTNMoMoPayoutProvider : IPayoutProvider
+public sealed class MTNMoMoPayoutProvider : BhenguProviderBase, IPayoutProvider
 {
     private const string ProductName = "disbursement";
 
     private readonly HttpClient _httpClient;
     private readonly MTNMoMoOptions _options;
-    private readonly ILogger<MTNMoMoPayoutProvider> _logger;
+    private readonly MTNMoMoOAuthCache _tokenCache;
     private readonly string _baseUrl;
 
-    private string? _cachedToken;
-    private DateTime _cachedTokenExpiresUtc = DateTime.MinValue;
-    private readonly SemaphoreSlim _tokenLock = new(1, 1);
-
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.MTNMoMo;
+    public override string ProviderName => ProviderNames.MTNMoMo;
 
-    /// <summary>Construct a standalone MTN MoMo payout provider. Designed to be registered via DI.</summary>
+    /// <summary>Construct a standalone MTN MoMo payout provider with a distributed OAuth cache.</summary>
     public MTNMoMoPayoutProvider(
         HttpClient httpClient,
         IOptions<MTNMoMoOptions> options,
-        ILogger<MTNMoMoPayoutProvider> logger)
+        ILogger<MTNMoMoPayoutProvider> logger,
+        IBhenguDistributedCache cache)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        ArgumentNullException.ThrowIfNull(cache);
+        _tokenCache = new MTNMoMoOAuthCache(cache);
 
         if (string.IsNullOrWhiteSpace(_options.SubscriptionKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(MTNMoMoOptions.SubscriptionKey)} is required");
@@ -89,11 +91,24 @@ public sealed class MTNMoMoPayoutProvider : IPayoutProvider
             _httpClient.BaseAddress = new Uri(_baseUrl);
     }
 
+    /// <summary>Back-compat constructor that uses the process-local in-memory cache.</summary>
+    public MTNMoMoPayoutProvider(
+        HttpClient httpClient,
+        IOptions<MTNMoMoOptions> options,
+        ILogger<MTNMoMoPayoutProvider> logger)
+        : this(httpClient, options, logger, new InMemoryBhenguDistributedCache())
+    {
+    }
+
     /// <inheritdoc/>
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return RunPayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct), ct);
+    }
 
+    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+    {
         if (string.IsNullOrWhiteSpace(request.DestinationToken))
             throw new PaymentDeclinedException(ProviderName, "invalid_msisdn",
                 "MTN MoMo Transfer requires the payee MSISDN in PayoutRequest.DestinationToken.");
@@ -119,7 +134,7 @@ public sealed class MTNMoMoPayoutProvider : IPayoutProvider
 
         await SendAsync(HttpMethod.Post, "disbursement/v1_0/transfer", body, ct, "Transfer", referenceId).ConfigureAwait(false);
 
-        _logger.LogInformation(
+        Logger.LogInformation(
             "MTN MoMo Disbursement Transfer accepted: ReferenceId={ReferenceId} ExternalId={ExternalId}",
             referenceId, externalId);
 
@@ -143,6 +158,7 @@ public sealed class MTNMoMoPayoutProvider : IPayoutProvider
         };
 
         var token = await GetAccessTokenAsync(ct).ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         req.Headers.Add("X-Reference-Id", referenceId);
         req.Headers.Add("X-Target-Environment", _options.TargetEnvironment);
@@ -150,16 +166,7 @@ public sealed class MTNMoMoPayoutProvider : IPayoutProvider
         if (!string.IsNullOrWhiteSpace(_options.CallbackUrl))
             req.Headers.Add("X-Callback-Url", _options.CallbackUrl);
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, $"HTTP request to MTN MoMo ({operation}) failed", ex);
-        }
-
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -171,7 +178,7 @@ public sealed class MTNMoMoPayoutProvider : IPayoutProvider
         // Per MoMo spec, Transfer returns HTTP 202 Accepted on success with empty body.
         if (response.IsSuccessStatusCode) return;
 
-        _logger.LogError("MTN MoMo {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+        Logger.LogError("MTN MoMo {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
         if ((int)response.StatusCode is >= 400 and < 500)
             throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
         throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
@@ -179,34 +186,25 @@ public sealed class MTNMoMoPayoutProvider : IPayoutProvider
 
     private async Task<string> GetAccessTokenAsync(CancellationToken ct)
     {
-        if (_cachedToken is not null && _cachedTokenExpiresUtc > DateTime.UtcNow.AddMinutes(1))
-            return _cachedToken;
+        var cached = await _tokenCache.GetAsync(ProductName, _options.ApiUserId, ct).ConfigureAwait(false);
+        if (cached is not null) return cached;
 
-        await _tokenLock.WaitAsync(ct).ConfigureAwait(false);
+        await _tokenCache.WaitFetchSlotAsync(ct).ConfigureAwait(false);
         try
         {
-            if (_cachedToken is not null && _cachedTokenExpiresUtc > DateTime.UtcNow.AddMinutes(1))
-                return _cachedToken;
+            cached = await _tokenCache.GetAsync(ProductName, _options.ApiUserId, ct).ConfigureAwait(false);
+            if (cached is not null) return cached;
 
             var creds = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{_options.ApiUserId}:{_options.ApiKey}"));
             using var req = new HttpRequestMessage(HttpMethod.Post, $"{ProductName}/token/");
             req.Headers.Authorization = new AuthenticationHeaderValue("Basic", creds);
             req.Headers.Add("Ocp-Apim-Subscription-Key", _options.SubscriptionKey);
 
-            HttpResponseMessage response;
-            try
-            {
-                response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-            }
-            catch (HttpRequestException ex)
-            {
-                throw new ProviderUnavailableException(ProviderName, "MTN MoMo disbursement OAuth call failed", ex);
-            }
-
+            var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
             var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
             {
-                _logger.LogError("MTN MoMo disbursement OAuth failed: {StatusCode} {Body}", response.StatusCode, body);
+                Logger.LogError("MTN MoMo disbursement OAuth failed: {StatusCode} {Body}", response.StatusCode, body);
                 throw new ProviderUnavailableException(ProviderName, $"MTN MoMo disbursement OAuth HTTP {(int)response.StatusCode}: {body}");
             }
 
@@ -214,13 +212,13 @@ public sealed class MTNMoMoPayoutProvider : IPayoutProvider
             if (token is null || string.IsNullOrEmpty(token.AccessToken))
                 throw new ProviderUnavailableException(ProviderName, "MTN MoMo disbursement OAuth returned an empty token");
 
-            _cachedToken = token.AccessToken;
-            _cachedTokenExpiresUtc = DateTime.UtcNow.AddSeconds(token.ExpiresIn > 0 ? token.ExpiresIn : 3599);
-            return _cachedToken;
+            var ttl = TimeSpan.FromSeconds(Math.Max(60, (token.ExpiresIn > 0 ? token.ExpiresIn : 3599) - 60));
+            await _tokenCache.SetAsync(ProductName, _options.ApiUserId, token.AccessToken, ttl, ct).ConfigureAwait(false);
+            return token.AccessToken;
         }
         finally
         {
-            _tokenLock.Release();
+            _tokenCache.ReleaseFetchSlot();
         }
     }
 

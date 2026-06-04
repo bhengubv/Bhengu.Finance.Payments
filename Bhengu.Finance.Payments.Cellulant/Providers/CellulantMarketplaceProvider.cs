@@ -4,6 +4,7 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -17,6 +18,7 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Marketplace;
 using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -36,18 +38,17 @@ namespace Bhengu.Finance.Payments.Cellulant.Providers;
 /// they survive single-process restarts when InMemoryBhenguDistributedCache is in use; in
 /// production with Redis they survive arbitrarily.</para>
 /// </remarks>
-public sealed class CellulantMarketplaceProvider : IMarketplaceProvider
+public sealed class CellulantMarketplaceProvider : BhenguProviderBase, IMarketplaceProvider
 {
     private readonly HttpClient _httpClient;
     private readonly CellulantOptions _options;
-    private readonly ILogger<CellulantMarketplaceProvider> _logger;
     private readonly CellulantTokenBroker _tokenBroker;
     private readonly IBhenguDistributedCache _cache;
     private readonly ConcurrentDictionary<string, SplitDefinition> _splitCache = new();
     private static readonly TimeSpan s_splitTtl = TimeSpan.FromDays(7);
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Cellulant;
+    public override string ProviderName => ProviderNames.Cellulant;
 
     /// <summary>Construct the provider. Designed to be registered via DI.</summary>
     public CellulantMarketplaceProvider(
@@ -56,10 +57,10 @@ public sealed class CellulantMarketplaceProvider : IMarketplaceProvider
         ILogger<CellulantMarketplaceProvider> logger,
         CellulantTokenBroker? tokenBroker = null,
         IBhenguDistributedCache? cache = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _tokenBroker = tokenBroker ?? new CellulantTokenBroker(options!, new Microsoft.Extensions.Logging.Abstractions.NullLogger<CellulantTokenBroker>());
         _cache = cache ?? new InMemoryBhenguDistributedCache();
 
@@ -76,107 +77,103 @@ public sealed class CellulantMarketplaceProvider : IMarketplaceProvider
     }
 
     /// <inheritdoc/>
-    public async Task<SubAccount> CreateSubAccountAsync(SubAccountRequest request, CancellationToken ct = default)
+    public Task<SubAccount> CreateSubAccountAsync(SubAccountRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "create_sub_account");
-
         if (string.IsNullOrWhiteSpace(request.SettlementAccountToken))
             throw new BhenguPaymentException(ProviderName,
                 "Cellulant sub-services require SettlementAccountToken (bank account / wallet MSISDN).",
                 "missing_settlement_account");
 
-        var cached = await TryGetCachedAsync<SubAccount>(request.IdempotencyKey, "sub_account", ct).ConfigureAwait(false);
-        if (cached is not null)
+        return RunOperationAsync("create_sub_account", async () =>
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return cached;
-        }
+            var cached = await TryGetCachedAsync<SubAccount>(request.IdempotencyKey, "sub_account", ct).ConfigureAwait(false);
+            if (cached is not null) return cached;
 
-        var body = new
-        {
-            parentServiceCode = _options.ServiceCode,
-            businessName = request.BusinessName,
-            contactEmail = request.ContactEmail,
-            countryCode = request.Country,
-            settlementCurrency = request.SettlementCurrency ?? "KES",
-            settlementAccount = request.SettlementAccountToken
-        };
+            var body = new
+            {
+                parentServiceCode = _options.ServiceCode,
+                businessName = request.BusinessName,
+                contactEmail = request.ContactEmail,
+                countryCode = request.Country,
+                settlementCurrency = request.SettlementCurrency ?? "KES",
+                settlementAccount = request.SettlementAccountToken
+            };
 
-        var responseBody = await SendAuthorisedAsync(HttpMethod.Post, "services/v1/sub-services", body, ct, "CreateSubAccount").ConfigureAwait(false);
-        var response = JsonSerializer.Deserialize<CellulantSubAccountResponse>(responseBody);
-        if (response?.Data is null)
-            throw new BhenguPaymentException(ProviderName, "Cellulant sub-service create returned no data", "no_subaccount_data");
+            var responseBody = await SendAuthorisedAsync(HttpMethod.Post, "services/v1/sub-services", body, ct, "CreateSubAccount").ConfigureAwait(false);
+            var response = JsonSerializer.Deserialize<CellulantSubAccountResponse>(responseBody);
+            if (response?.Data is null)
+                throw new BhenguPaymentException(ProviderName, "Cellulant sub-service create returned no data", "no_subaccount_data");
 
-        var sub = MapSubAccount(response.Data, request);
-        await TrySetCachedAsync(request.IdempotencyKey, "sub_account", sub, ct).ConfigureAwait(false);
-        activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-        return sub;
+            var sub = MapSubAccount(response.Data, request);
+            await TrySetCachedAsync(request.IdempotencyKey, "sub_account", sub, ct).ConfigureAwait(false);
+            return sub;
+        }, ct);
     }
 
     /// <inheritdoc/>
-    public async Task<SubAccount?> GetSubAccountAsync(string subAccountReference, CancellationToken ct = default)
+    public Task<SubAccount?> GetSubAccountAsync(string subAccountReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subAccountReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "get_sub_account");
-        try
+        return RunOperationAsync("get_sub_account", async () =>
         {
-            var body = await SendAuthorisedAsync(HttpMethod.Get, $"services/v1/sub-services/{Uri.EscapeDataString(subAccountReference)}", null, ct, "GetSubAccount").ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<CellulantSubAccountResponse>(body);
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return response?.Data is { } data ? MapSubAccount(data, null) : null;
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return null;
-        }
+            try
+            {
+                var body = await SendAuthorisedAsync(HttpMethod.Get, $"services/v1/sub-services/{Uri.EscapeDataString(subAccountReference)}", null, ct, "GetSubAccount").ConfigureAwait(false);
+                var response = JsonSerializer.Deserialize<CellulantSubAccountResponse>(body);
+                return response?.Data is { } data ? MapSubAccount(data, null) : null;
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return null;
+            }
+        }, ct);
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<SubAccount>> ListSubAccountsAsync(CancellationToken ct = default)
+    public async IAsyncEnumerable<SubAccount> ListSubAccountsAsync([EnumeratorCancellation] CancellationToken ct = default)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "list_sub_accounts");
-        var body = await SendAuthorisedAsync(HttpMethod.Get, $"services/v1/sub-services?parentServiceCode={Uri.EscapeDataString(_options.ServiceCode)}", null, ct, "ListSubAccounts").ConfigureAwait(false);
-        var response = JsonSerializer.Deserialize<CellulantSubAccountListResponse>(body);
-        activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+        var response = await RunOperationAsync("list_sub_accounts", async () =>
+        {
+            var body = await SendAuthorisedAsync(HttpMethod.Get, $"services/v1/sub-services?parentServiceCode={Uri.EscapeDataString(_options.ServiceCode)}", null, ct, "ListSubAccounts").ConfigureAwait(false);
+            return JsonSerializer.Deserialize<CellulantSubAccountListResponse>(body);
+        }, ct).ConfigureAwait(false);
 
-        if (response?.Data is null) return Array.Empty<SubAccount>();
-        var result = new List<SubAccount>(response.Data.Count);
-        foreach (var d in response.Data) result.Add(MapSubAccount(d, null));
-        return result;
+        if (response?.Data is null) yield break;
+        foreach (var d in response.Data)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return MapSubAccount(d, null);
+        }
     }
 
     /// <inheritdoc/>
-    public async Task<SplitDefinition> CreateSplitAsync(SplitDefinitionRequest request, CancellationToken ct = default)
+    public Task<SplitDefinition> CreateSplitAsync(SplitDefinitionRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "create_split");
         if (request.Rules.Count == 0)
             throw new BhenguPaymentException(ProviderName, "Split definition must contain at least one rule.", "empty_split");
 
-        var cached = await TryGetCachedAsync<SplitDefinition>(request.IdempotencyKey, "split", ct).ConfigureAwait(false);
-        if (cached is not null)
+        return RunOperationAsync("create_split", async () =>
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return cached;
-        }
+            var cached = await TryGetCachedAsync<SplitDefinition>(request.IdempotencyKey, "split", ct).ConfigureAwait(false);
+            if (cached is not null) return cached;
 
-        var reference = $"tingg-split-{Guid.NewGuid():N}";
-        var split = new SplitDefinition
-        {
-            Reference = reference,
-            Name = request.Name,
-            Currency = request.Currency,
-            Rules = request.Rules.ToArray()
-        };
+            var reference = $"tingg-split-{Guid.NewGuid():N}";
+            var split = new SplitDefinition
+            {
+                Reference = reference,
+                Name = request.Name,
+                Currency = request.Currency,
+                Rules = request.Rules.ToArray()
+            };
 
-        _splitCache[reference] = split;
-        await _cache.SetAsync(SplitCacheKey(reference), split, s_splitTtl, ct).ConfigureAwait(false);
-        await TrySetCachedAsync(request.IdempotencyKey, "split", split, ct).ConfigureAwait(false);
-        _logger.LogInformation("Cellulant split definition created: {Reference}", reference);
-        activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-        return split;
+            _splitCache[reference] = split;
+            await _cache.SetAsync(SplitCacheKey(reference), split, s_splitTtl, ct).ConfigureAwait(false);
+            await TrySetCachedAsync(request.IdempotencyKey, "split", split, ct).ConfigureAwait(false);
+            Logger.LogInformation("Cellulant split definition created: {Reference}", reference);
+            return split;
+        }, ct);
     }
 
     /// <inheritdoc/>
@@ -190,12 +187,10 @@ public sealed class CellulantMarketplaceProvider : IMarketplaceProvider
     }
 
     /// <inheritdoc/>
-    public async Task<PaymentResponse> ChargeWithSplitAsync(ChargeWithSplitRequest request, CancellationToken ct = default)
+    public Task<PaymentResponse> ChargeWithSplitAsync(ChargeWithSplitRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Payment.Currency);
-        var outcomeTag = BhenguPaymentDiagnostics.Outcomes.Error;
-        try
+        return RunChargeAsync(request.Payment.Currency, async () =>
         {
             IReadOnlyList<SplitRule> rules;
             if (request.InlineRules is { Count: > 0 })
@@ -237,34 +232,17 @@ public sealed class CellulantMarketplaceProvider : IMarketplaceProvider
             var responseBody = await SendAuthorisedAsync(HttpMethod.Post, "checkout/v3/express", body, ct, "ChargeWithSplit").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<CellulantCheckoutResponse>(responseBody);
 
-            var status = MapStatus(response?.Status);
-            outcomeTag = status == PaymentStatus.Failed
-                ? BhenguPaymentDiagnostics.Outcomes.Declined
-                : status == PaymentStatus.Completed
-                    ? BhenguPaymentDiagnostics.Outcomes.Success
-                    : BhenguPaymentDiagnostics.Outcomes.Pending;
-
             return new PaymentResponse
             {
                 GatewayReference = response?.CheckoutRequestId ?? merchantTxId,
-                Status = status,
+                Status = MapStatus(response?.Status),
                 Amount = request.Payment.Amount,
                 Currency = request.Payment.Currency,
                 ProcessedAt = DateTime.UtcNow,
                 RedirectUrl = response?.RedirectUrl,
                 Message = response?.Status
             };
-        }
-        catch (PaymentDeclinedException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        finally
-        {
-            activity.SetOutcome(outcomeTag);
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcomeTag));
-        }
+        }, ct);
     }
 
     private static SubAccount MapSubAccount(CellulantSubAccountData data, SubAccountRequest? fallback) => new()
@@ -288,6 +266,8 @@ public sealed class CellulantMarketplaceProvider : IMarketplaceProvider
     private async Task<string> SendAuthorisedAsync(HttpMethod method, string path, object? body, CancellationToken ct, string operation)
     {
         var token = await _tokenBroker.EnsureAccessTokenAsync(_httpClient, ct).ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
+
         using var req = new HttpRequestMessage(method, path);
         if (body is not null)
         {
@@ -296,16 +276,7 @@ public sealed class CellulantMarketplaceProvider : IMarketplaceProvider
         }
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Cellulant failed", ex);
-        }
-
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -316,7 +287,7 @@ public sealed class CellulantMarketplaceProvider : IMarketplaceProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Cellulant {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Cellulant {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

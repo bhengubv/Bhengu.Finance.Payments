@@ -14,6 +14,8 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.Onafriq.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -27,16 +29,15 @@ namespace Bhengu.Finance.Payments.Onafriq.Providers;
 /// Refunds are not supported by Onafriq: money movement is one-directional and reversals require
 /// a new opposite transaction.
 /// </summary>
-public sealed class OnafriqPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class OnafriqPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly OnafriqOptions _options;
-    private readonly ILogger<OnafriqPaymentProvider> _logger;
     private readonly IBhenguDistributedCache _cache;
     private static readonly TimeSpan s_idempotencyTtl = TimeSpan.FromHours(24);
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Onafriq;
+    public override string ProviderName => ProviderNames.Onafriq;
 
     /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
@@ -54,10 +55,10 @@ public sealed class OnafriqPaymentProvider : IPaymentGatewayProvider, IPayoutPro
         IOptions<OnafriqOptions> options,
         ILogger<OnafriqPaymentProvider> logger,
         IBhenguDistributedCache? cache = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _cache = cache ?? new InMemoryBhenguDistributedCache();
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
@@ -79,21 +80,13 @@ public sealed class OnafriqPaymentProvider : IPaymentGatewayProvider, IPayoutPro
     }
 
     /// <inheritdoc/>
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
-        var startedAt = DateTime.UtcNow;
-        var outcomeTag = BhenguPaymentDiagnostics.Outcomes.Error;
-        try
+        return RunChargeAsync(request.Currency, async () =>
         {
             var cached = await TryGetCachedAsync<PaymentResponse>(request.IdempotencyKey, "charge", ct).ConfigureAwait(false);
-            if (cached is not null)
-            {
-                outcomeTag = BhenguPaymentDiagnostics.Outcomes.Success;
-                return cached;
-            }
+            if (cached is not null) return cached;
 
             // PaymentMethodToken format: "<country>:<walletNumber>" (e.g. "ZA:27710000000").
             var (countryCode, walletNumber) = SplitDestination(request.PaymentMethodToken, defaultCountry: "ZA");
@@ -112,61 +105,32 @@ public sealed class OnafriqPaymentProvider : IPaymentGatewayProvider, IPayoutPro
             var body = await SendAsync(HttpMethod.Post, "v1/collections", requestBody, ct, "ProcessPayment", request.IdempotencyKey).ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<OnafriqTransactionResponse>(body);
 
-            _logger.LogInformation("Onafriq collection initiated: {Id} status={Status}",
+            Logger.LogInformation("Onafriq collection initiated: {Id} status={Status}",
                 response?.TransactionId, response?.Status);
 
-            var status = MapStatus(response?.Status ?? "pending");
             var pr = new PaymentResponse
             {
                 GatewayReference = response?.TransactionId ?? string.Empty,
-                Status = status,
+                Status = MapStatus(response?.Status ?? "pending"),
                 Amount = request.Amount,
                 Currency = request.Currency,
                 ProcessedAt = DateTime.UtcNow,
                 Message = response?.Status
             };
 
-            outcomeTag = status switch
-            {
-                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
-                PaymentStatus.Failed => BhenguPaymentDiagnostics.Outcomes.Declined,
-                _ => BhenguPaymentDiagnostics.Outcomes.Pending
-            };
             await TrySetCachedAsync(request.IdempotencyKey, "charge", pr, ct).ConfigureAwait(false);
             return pr;
-        }
-        catch (PaymentDeclinedException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        finally
-        {
-            activity.SetOutcome(outcomeTag);
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcomeTag));
-            BhenguPaymentDiagnostics.ChargeDurationMs.Record(
-                (DateTime.UtcNow - startedAt).TotalMilliseconds,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcomeTag));
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, request.Currency);
-        var outcomeTag = BhenguPaymentDiagnostics.Outcomes.Error;
-        try
+        return RunPayoutAsync(request.Currency, async () =>
         {
             var cached = await TryGetCachedAsync<PayoutResponse>(request.IdempotencyKey, "payout", ct).ConfigureAwait(false);
-            if (cached is not null)
-            {
-                outcomeTag = BhenguPaymentDiagnostics.Outcomes.Success;
-                return cached;
-            }
+            if (cached is not null) return cached;
 
             // DestinationToken format: "<country>:<walletNumber>" (e.g. "GH:233244000000").
             var (destCountry, destWallet) = SplitDestination(request.DestinationToken, defaultCountry: "GH");
@@ -196,39 +160,21 @@ public sealed class OnafriqPaymentProvider : IPaymentGatewayProvider, IPayoutPro
             var body = await SendAsync(HttpMethod.Post, "v1/transactions", requestBody, ct, "ProcessPayout", request.IdempotencyKey).ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<OnafriqTransactionResponse>(body);
 
-            _logger.LogInformation("Onafriq transfer initiated: {Id} status={Status}",
+            Logger.LogInformation("Onafriq transfer initiated: {Id} status={Status}",
                 response?.TransactionId, response?.Status);
 
-            var status = MapStatus(response?.Status ?? "pending");
             var pr = new PayoutResponse
             {
                 GatewayReference = response?.TransactionId ?? string.Empty,
-                Status = status,
+                Status = MapStatus(response?.Status ?? "pending"),
                 Amount = request.Amount,
                 Currency = request.Currency,
                 ProcessedAt = DateTime.UtcNow
             };
 
-            outcomeTag = status switch
-            {
-                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
-                PaymentStatus.Failed => BhenguPaymentDiagnostics.Outcomes.Declined,
-                _ => BhenguPaymentDiagnostics.Outcomes.Pending
-            };
             await TrySetCachedAsync(request.IdempotencyKey, "payout", pr, ct).ConfigureAwait(false);
             return pr;
-        }
-        catch (PaymentDeclinedException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        finally
-        {
-            activity.SetOutcome(outcomeTag);
-            BhenguPaymentDiagnostics.PayoutsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcomeTag));
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>
@@ -250,27 +196,15 @@ public sealed class OnafriqPaymentProvider : IPaymentGatewayProvider, IPayoutPro
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
+        return RunWebhookVerify(() =>
         {
-            _logger.LogWarning("Onafriq WebhookSecret not configured — signature verification cannot succeed.");
-            return false;
-        }
-
-        try
-        {
-            using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
-            var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
-            var computedSignature = Convert.ToHexString(computedHash).ToLowerInvariant();
-
-            return CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
-                Encoding.UTF8.GetBytes(computedSignature));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Onafriq webhook signature verification raised");
-            return false;
-        }
+            if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
+            {
+                Logger.LogWarning("Onafriq WebhookSecret not configured — signature verification cannot succeed.");
+                return false;
+            }
+            return SignatureHelpers.VerifyHmacSha256(payload, signature, _options.WebhookSecret);
+        });
     }
 
     /// <inheritdoc/>
@@ -288,14 +222,14 @@ public sealed class OnafriqPaymentProvider : IPaymentGatewayProvider, IPayoutPro
                 return Task.FromResult<WebhookEvent?>(null);
             }
 
-            _logger.LogInformation("Parsed Onafriq webhook event: {EventType}", webhookEvent.EventType);
+            Logger.LogInformation("Parsed Onafriq webhook event: {EventType}", webhookEvent.EventType);
             var typed = MapWebhookEvent(webhookEvent);
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             return Task.FromResult(typed);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse Onafriq webhook event");
+            Logger.LogError(ex, "Failed to parse Onafriq webhook event");
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
             return Task.FromResult<WebhookEvent?>(null);
         }
@@ -309,7 +243,6 @@ public sealed class OnafriqPaymentProvider : IPaymentGatewayProvider, IPayoutPro
         var amount = webhookEvent.Data?.Amount ?? 0m;
         var currency = webhookEvent.Data?.Currency ?? "USD";
         var eventName = webhookEvent.EventType?.ToLowerInvariant();
-        var isTransfer = eventName?.Contains("transaction", StringComparison.OrdinalIgnoreCase) ?? false;
 
         switch (eventName)
         {
@@ -405,16 +338,7 @@ public sealed class OnafriqPaymentProvider : IPaymentGatewayProvider, IPayoutPro
         if (!string.IsNullOrWhiteSpace(idempotencyKey))
             req.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Onafriq failed", ex);
-        }
-
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -425,7 +349,7 @@ public sealed class OnafriqPaymentProvider : IPaymentGatewayProvider, IPayoutPro
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Onafriq {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Onafriq {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

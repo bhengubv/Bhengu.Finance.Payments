@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Validation;
@@ -35,6 +36,7 @@ public static class ServiceCollectionExtensions
         if (string.IsNullOrWhiteSpace(probe.TargetEnvironment))
             throw new ProviderConfigurationException("mtnmomo", $"{MTNMoMoOptions.ConfigSection}:TargetEnvironment is required");
 
+        services.AddBhenguInMemoryCache();
         services.AddHttpClient<MTNMoMoPaymentProvider>();
         services.AddHttpClient<MTNMoMoPayoutProvider>();
         services.AddTransient<IPaymentGatewayProvider, MTNMoMoPaymentProvider>(sp =>

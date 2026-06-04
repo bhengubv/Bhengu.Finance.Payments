@@ -7,9 +7,13 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.MPesa.Configuration;
 using Bhengu.Finance.Payments.MPesa.Internals;
 using Microsoft.Extensions.Logging;
@@ -27,19 +31,17 @@ namespace Bhengu.Finance.Payments.MPesa.Providers;
 /// The <paramref name="signature"/> argument to <see cref="VerifyWebhookSignature"/> is treated as the URL-path token.
 /// </para>
 /// </summary>
-public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class MPesaPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly MPesaOptions _options;
-    private readonly ILogger<MPesaPaymentProvider> _logger;
+    private readonly MPesaOAuthCache _tokenCache;
     private readonly string _baseUrl;
 
-    private string? _cachedAccessToken;
-    private DateTime _cachedTokenExpiresUtc = DateTime.MinValue;
-    private readonly SemaphoreSlim _tokenLock = new(1, 1);
+    /// <inheritdoc/>
+    public override string ProviderName => ProviderNames.MPesa;
 
-    public string ProviderName => ProviderNames.MPesa;
-
+    /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
         ProviderCapabilities.Refund |
@@ -47,14 +49,18 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
         ProviderCapabilities.Webhook |
         ProviderCapabilities.MobileMoney;
 
+    /// <summary>Construct the provider with a distributed OAuth cache (preferred for multi-replica deploys).</summary>
     public MPesaPaymentProvider(
         HttpClient httpClient,
         IOptions<MPesaOptions> options,
-        ILogger<MPesaPaymentProvider> logger)
+        ILogger<MPesaPaymentProvider> logger,
+        IBhenguDistributedCache cache)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        ArgumentNullException.ThrowIfNull(cache);
+        _tokenCache = new MPesaOAuthCache(cache);
 
         if (string.IsNullOrWhiteSpace(_options.ConsumerKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(MPesaOptions.ConsumerKey)} is required");
@@ -75,11 +81,20 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
             _httpClient.BaseAddress = new Uri(_baseUrl);
     }
 
+    /// <summary>Back-compat constructor that uses the process-local in-memory cache.</summary>
+    public MPesaPaymentProvider(
+        HttpClient httpClient,
+        IOptions<MPesaOptions> options,
+        ILogger<MPesaPaymentProvider> logger)
+        : this(httpClient, options, logger, new InMemoryBhenguDistributedCache())
+    {
+    }
+
     /// <inheritdoc/>
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return MPesaObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+        return RunChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct), ct);
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
@@ -116,7 +131,7 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
 
         var stk = JsonSerializer.Deserialize<MPesaStkPushResponse>(responseBody);
 
-        _logger.LogInformation(
+        Logger.LogInformation(
             "M-Pesa STK Push initiated: MerchantRequestID={MerchantRequestId} CheckoutRequestID={CheckoutRequestId} ResponseCode={ResponseCode}",
             stk?.MerchantRequestID, stk?.CheckoutRequestID, stk?.ResponseCode);
 
@@ -138,7 +153,7 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return MPesaObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+        return RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct), ct);
     }
 
     private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
@@ -168,7 +183,7 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
 
         var reversal = JsonSerializer.Deserialize<MPesaReversalResponse>(responseBody);
 
-        _logger.LogInformation(
+        Logger.LogInformation(
             "M-Pesa Reversal accepted: ConversationID={ConversationId} OriginatorConversationID={OriginatorConversationId} ResponseCode={ResponseCode}",
             reversal?.ConversationID, reversal?.OriginatorConversationID, reversal?.ResponseCode);
 
@@ -188,7 +203,7 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return MPesaObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+        return RunPayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct), ct);
     }
 
     private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
@@ -226,7 +241,7 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
 
         var b2c = JsonSerializer.Deserialize<MPesaB2CResponse>(responseBody);
 
-        _logger.LogInformation(
+        Logger.LogInformation(
             "M-Pesa B2C accepted: OriginatorConversationID={OriginatorConversationId} ConversationID={ConversationId} ResponseCode={ResponseCode}",
             b2c?.OriginatorConversationID, b2c?.ConversationID, b2c?.ResponseCode);
 
@@ -252,25 +267,23 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        if (string.IsNullOrWhiteSpace(_options.CallbackUrlToken))
+        return RunWebhookVerify(() =>
         {
-            _logger.LogWarning("M-Pesa CallbackUrlToken not configured — webhook source cannot be authenticated.");
-            MPesaObservability.RecordWebhookVerification(false);
-            return false;
-        }
+            if (string.IsNullOrWhiteSpace(_options.CallbackUrlToken))
+            {
+                Logger.LogWarning("M-Pesa CallbackUrlToken not configured — webhook source cannot be authenticated.");
+                return false;
+            }
 
-        var verified = System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
-            Encoding.UTF8.GetBytes(signature),
-            Encoding.UTF8.GetBytes(_options.CallbackUrlToken));
-        MPesaObservability.RecordWebhookVerification(verified);
-        return verified;
+            return SignatureHelpers.ConstantTimeEquals(signature, _options.CallbackUrlToken);
+        });
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        return MPesaObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+        return RunOperationAsync("webhook", () => ParseWebhookCoreAsync(payload, ct), ct);
     }
 
     private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
@@ -285,7 +298,7 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
             {
                 var status = stk.ResultCode == 0 ? PaymentStatus.Completed : PaymentStatus.Failed;
 
-                _logger.LogInformation(
+                Logger.LogInformation(
                     "Parsed M-Pesa STK callback: CheckoutRequestID={CheckoutRequestId} ResultCode={ResultCode}",
                     stk.CheckoutRequestID, stk.ResultCode);
 
@@ -295,8 +308,8 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
                     Status = status,
                     EventType = stk.ResultCode == 0 ? "stkcallback.success" : "stkcallback.failure",
                     Category = stk.ResultCode == 0
-                        ? Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.ChargeSucceeded
-                        : Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.ChargeFailed
+                        ? WebhookEventCategory.ChargeSucceeded
+                        : WebhookEventCategory.ChargeFailed
                 });
             }
 
@@ -306,33 +319,33 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
             {
                 var succeeded = result.ResultCode == 0;
 
-                _logger.LogInformation(
+                Logger.LogInformation(
                     "Parsed M-Pesa Result callback: ConversationID={ConversationId} TransactionID={TransactionId} ResultCode={ResultCode}",
                     result.ConversationID, result.TransactionID, result.ResultCode);
 
                 // Surface as a typed payout event so consumers can switch on the concrete record.
                 if (succeeded)
                 {
-                    return Task.FromResult<WebhookEvent?>(new Bhengu.Finance.Payments.Core.Models.Webhooks.PayoutCompletedEvent
+                    return Task.FromResult<WebhookEvent?>(new PayoutCompletedEvent
                     {
                         GatewayReference = result.TransactionID ?? result.ConversationID,
                         PayoutReference = result.TransactionID ?? result.ConversationID,
                         Status = PaymentStatus.Completed,
                         EventType = "b2c.result.success",
-                        Category = Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.PayoutCompleted,
+                        Category = WebhookEventCategory.PayoutCompleted,
                         Amount = ExtractAmount(result),
                         Currency = "KES",
                         DestinationToken = ExtractRecipientMsisdn(result)
                     });
                 }
 
-                return Task.FromResult<WebhookEvent?>(new Bhengu.Finance.Payments.Core.Models.Webhooks.PayoutFailedEvent
+                return Task.FromResult<WebhookEvent?>(new PayoutFailedEvent
                 {
                     GatewayReference = result.TransactionID ?? result.ConversationID,
                     PayoutReference = result.TransactionID ?? result.ConversationID,
                     Status = PaymentStatus.Failed,
                     EventType = "b2c.result.failure",
-                    Category = Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.PayoutFailed,
+                    Category = WebhookEventCategory.PayoutFailed,
                     Amount = ExtractAmount(result),
                     Currency = "KES",
                     FailureCode = result.ResultCode.ToString(CultureInfo.InvariantCulture),
@@ -340,11 +353,18 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
                 });
             }
 
-            return Task.FromResult<WebhookEvent?>(null);
+            // Unrecognised shape — surface a base WebhookEvent with Unknown category instead of null
+            // so consumers always have something to ack against. Reference is empty by spec.
+            return Task.FromResult<WebhookEvent?>(new WebhookEvent
+            {
+                GatewayReference = string.Empty,
+                Status = PaymentStatus.Pending,
+                Category = WebhookEventCategory.Unknown
+            });
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse M-Pesa webhook payload");
+            Logger.LogError(ex, "Failed to parse M-Pesa webhook payload");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -387,19 +407,11 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
         if (requireAuth)
         {
             var token = await GetAccessTokenAsync(ct).ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
             req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         }
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, $"HTTP request to M-Pesa ({operation}) failed", ex);
-        }
-
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -410,9 +422,9 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("M-Pesa {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("M-Pesa {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
-                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
+                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
         }
 
@@ -421,33 +433,24 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
 
     private async Task<string> GetAccessTokenAsync(CancellationToken ct)
     {
-        if (_cachedAccessToken is not null && _cachedTokenExpiresUtc > DateTime.UtcNow.AddMinutes(1))
-            return _cachedAccessToken;
+        var cached = await _tokenCache.GetAsync(_options.ConsumerKey, ct).ConfigureAwait(false);
+        if (cached is not null) return cached;
 
-        await _tokenLock.WaitAsync(ct).ConfigureAwait(false);
+        await _tokenCache.WaitFetchSlotAsync(ct).ConfigureAwait(false);
         try
         {
-            if (_cachedAccessToken is not null && _cachedTokenExpiresUtc > DateTime.UtcNow.AddMinutes(1))
-                return _cachedAccessToken;
+            cached = await _tokenCache.GetAsync(_options.ConsumerKey, ct).ConfigureAwait(false);
+            if (cached is not null) return cached;
 
             var creds = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{_options.ConsumerKey}:{_options.ConsumerSecret}"));
             using var req = new HttpRequestMessage(HttpMethod.Get, "oauth/v1/generate?grant_type=client_credentials");
             req.Headers.Authorization = new AuthenticationHeaderValue("Basic", creds);
 
-            HttpResponseMessage response;
-            try
-            {
-                response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-            }
-            catch (HttpRequestException ex)
-            {
-                throw new ProviderUnavailableException(ProviderName, "M-Pesa OAuth call failed", ex);
-            }
-
+            var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
             var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
             {
-                _logger.LogError("M-Pesa OAuth failed: {StatusCode} {Body}", response.StatusCode, body);
+                Logger.LogError("M-Pesa OAuth failed: {StatusCode} {Body}", response.StatusCode, body);
                 throw new ProviderUnavailableException(ProviderName, $"M-Pesa OAuth HTTP {(int)response.StatusCode}: {body}");
             }
 
@@ -456,13 +459,14 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
                 throw new ProviderUnavailableException(ProviderName, "M-Pesa OAuth returned an empty token");
 
             var expiresIn = int.TryParse(token.ExpiresIn, NumberStyles.Integer, CultureInfo.InvariantCulture, out var s) ? s : 3599;
-            _cachedAccessToken = token.AccessToken;
-            _cachedTokenExpiresUtc = DateTime.UtcNow.AddSeconds(expiresIn);
-            return _cachedAccessToken;
+            // Store for expires_in - 60s so we always refresh before the upstream invalidates.
+            var ttl = TimeSpan.FromSeconds(Math.Max(60, expiresIn - 60));
+            await _tokenCache.SetAsync(_options.ConsumerKey, token.AccessToken, ttl, ct).ConfigureAwait(false);
+            return token.AccessToken;
         }
         finally
         {
-            _tokenLock.Release();
+            _tokenCache.ReleaseFetchSlot();
         }
     }
 

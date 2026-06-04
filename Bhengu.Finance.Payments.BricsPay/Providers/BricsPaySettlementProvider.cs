@@ -2,6 +2,7 @@
 
 using System.Globalization;
 using System.Net;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -12,6 +13,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Settlement;
 using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -22,25 +24,24 @@ namespace Bhengu.Finance.Payments.BricsPay.Providers;
 /// <c>/settlements</c> feed which surfaces the per-day cross-border settlement batches credited
 /// to the merchant's home-currency account.
 /// </summary>
-public sealed class BricsPaySettlementProvider : ISettlementProvider
+public sealed class BricsPaySettlementProvider : BhenguProviderBase, ISettlementProvider
 {
     private readonly HttpClient _httpClient;
     private readonly BricsPayOptions _options;
-    private readonly ILogger<BricsPaySettlementProvider> _logger;
     private readonly string _baseUrl;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.BricsPay;
+    public override string ProviderName => ProviderNames.BricsPay;
 
     /// <summary>Construct the provider. Designed to be registered via DI.</summary>
     public BricsPaySettlementProvider(
         HttpClient httpClient,
         IOptions<BricsPayOptions> options,
         ILogger<BricsPaySettlementProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.MerchantId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(BricsPayOptions.MerchantId)} is required");
@@ -53,54 +54,60 @@ public sealed class BricsPaySettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+    public async IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "list_settlements");
         var qs = $"?merchant_id={Uri.EscapeDataString(_options.MerchantId)}&from={Uri.EscapeDataString(fromUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture))}&to={Uri.EscapeDataString(toUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture))}";
 
-        var body = await SendAsync(HttpMethod.Get, $"{_baseUrl}/settlements{qs}", null, ct, "ListSettlements").ConfigureAwait(false);
-        var response = JsonSerializer.Deserialize<BricsPaySettlementListResponse>(body);
-        activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-        if (response?.Settlements is null) return Array.Empty<Settlement>();
-
-        var result = new List<Settlement>(response.Settlements.Count);
-        foreach (var s in response.Settlements) result.Add(MapSettlement(s));
-        return result;
-    }
-
-    /// <inheritdoc/>
-    public async Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "get_settlement");
-        try
+        var response = await RunOperationAsync("list_settlements", async () =>
         {
-            var body = await SendAsync(HttpMethod.Get, $"{_baseUrl}/settlements/{Uri.EscapeDataString(settlementReference)}", null, ct, "GetSettlement").ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<BricsPaySettlementResponse>(body);
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return response?.Settlement is { } s ? MapSettlement(s) : null;
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            var body = await SendAsync(HttpMethod.Get, $"{_baseUrl}/settlements{qs}", null, ct, "ListSettlements").ConfigureAwait(false);
+            return JsonSerializer.Deserialize<BricsPaySettlementListResponse>(body);
+        }, ct).ConfigureAwait(false);
+
+        if (response?.Settlements is null) yield break;
+        foreach (var s in response.Settlements)
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return null;
+            ct.ThrowIfCancellationRequested();
+            yield return MapSettlement(s);
         }
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
+    public Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "list_settlement_transactions");
+        return RunOperationAsync("get_settlement", async () =>
+        {
+            try
+            {
+                var body = await SendAsync(HttpMethod.Get, $"{_baseUrl}/settlements/{Uri.EscapeDataString(settlementReference)}", null, ct, "GetSettlement").ConfigureAwait(false);
+                var response = JsonSerializer.Deserialize<BricsPaySettlementResponse>(body);
+                return response?.Settlement is { } s ? MapSettlement(s) : null;
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return null;
+            }
+        }, ct);
+    }
 
-        var body = await SendAsync(HttpMethod.Get, $"{_baseUrl}/settlements/{Uri.EscapeDataString(settlementReference)}/transactions", null, ct, "ListSettlementTransactions").ConfigureAwait(false);
-        var response = JsonSerializer.Deserialize<BricsPaySettlementTransactionListResponse>(body);
-        activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-        if (response?.Transactions is null) return Array.Empty<SettlementTransaction>();
+    /// <inheritdoc/>
+    public async IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(string settlementReference, [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(settlementReference);
 
-        var result = new List<SettlementTransaction>(response.Transactions.Count);
-        foreach (var t in response.Transactions) result.Add(MapTransaction(t));
-        return result;
+        var response = await RunOperationAsync("list_settlement_transactions", async () =>
+        {
+            var body = await SendAsync(HttpMethod.Get, $"{_baseUrl}/settlements/{Uri.EscapeDataString(settlementReference)}/transactions", null, ct, "ListSettlementTransactions").ConfigureAwait(false);
+            return JsonSerializer.Deserialize<BricsPaySettlementTransactionListResponse>(body);
+        }, ct).ConfigureAwait(false);
+
+        if (response?.Transactions is null) yield break;
+        foreach (var t in response.Transactions)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return MapTransaction(t);
+        }
     }
 
     private static Settlement MapSettlement(BricsPaySettlementData s) => new()
@@ -148,16 +155,7 @@ public sealed class BricsPaySettlementProvider : ISettlementProvider
         req.Headers.Add("X-Signature", signature);
         req.Headers.Add("X-Timestamp", timestamp.ToString(CultureInfo.InvariantCulture));
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to BRICS Pay failed", ex);
-        }
-
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -168,7 +166,7 @@ public sealed class BricsPaySettlementProvider : ISettlementProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("BRICS Pay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("BRICS Pay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

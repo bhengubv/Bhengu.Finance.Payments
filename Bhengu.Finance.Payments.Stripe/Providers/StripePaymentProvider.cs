@@ -5,6 +5,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Stripe.Configuration;
 using Bhengu.Finance.Payments.Stripe.Internals;
 using Microsoft.Extensions.Logging;
@@ -18,14 +19,15 @@ namespace Bhengu.Finance.Payments.Stripe.Providers;
 /// to the Bhengu.Finance.Payments contract. Supports payments, payouts (via Stripe Connect /
 /// platform balance), refunds and webhook verification.
 /// </summary>
-public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class StripePaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly StripeOptions _options;
-    private readonly ILogger<StripePaymentProvider> _logger;
     private readonly IStripeClient _stripeClient;
 
-    public string ProviderName => ProviderNames.Stripe;
+    /// <inheritdoc />
+    public override string ProviderName => ProviderNames.Stripe;
 
+    /// <summary>Capability flags advertised by the Stripe payment provider.</summary>
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
         ProviderCapabilities.Refund |
@@ -44,14 +46,15 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
         ProviderCapabilities.TypedWebhooks |
         ProviderCapabilities.PartialRefund;
 
+    /// <summary>Construct the provider. Throws <see cref="ProviderConfigurationException"/> if <see cref="StripeOptions.SecretKey"/> is unset.</summary>
     public StripePaymentProvider(
         HttpClient httpClient,
         IOptions<StripeOptions> options,
         ILogger<StripePaymentProvider> logger)
+        : base(logger)
     {
         ArgumentNullException.ThrowIfNull(httpClient);
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(StripeOptions.SecretKey)} is required");
@@ -71,139 +74,121 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return StripeObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
-    }
-
-    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
-    {
-        var amountInCents = (long)(request.Amount * 100);
-        var metadata = request.Metadata?.ToDictionary(k => k.Key, v => v.Value) ?? new Dictionary<string, string>();
-
-        var options = new PaymentIntentCreateOptions
+        return RunChargeAsync(request.Currency, async () =>
         {
-            Amount = amountInCents,
-            Currency = request.Currency.ToLowerInvariant(),
-            PaymentMethod = request.PaymentMethodToken,
-            Description = request.Description,
-            ConfirmationMethod = "automatic",
-            Confirm = true,
-            Metadata = metadata
-        };
+            var amountInCents = (long)(request.Amount * 100);
+            var metadata = request.Metadata?.ToDictionary(k => k.Key, v => v.Value) ?? new Dictionary<string, string>();
 
-        try
-        {
-            var service = new PaymentIntentService(_stripeClient);
-            var paymentIntent = await service.CreateAsync(options, BuildRequestOptions(request.IdempotencyKey), ct).ConfigureAwait(false);
-
-            _logger.LogInformation("Stripe PaymentIntent created: {Id} status={Status}",
-                paymentIntent.Id, paymentIntent.Status);
-
-            return new PaymentResponse
+            var options = new PaymentIntentCreateOptions
             {
-                GatewayReference = paymentIntent.Id,
-                Status = MapStatus(paymentIntent.Status),
-                Amount = request.Amount,
-                Currency = request.Currency,
-                ProcessedAt = DateTime.UtcNow,
-                Message = paymentIntent.Status
+                Amount = amountInCents,
+                Currency = request.Currency.ToLowerInvariant(),
+                PaymentMethod = request.PaymentMethodToken,
+                Description = request.Description,
+                ConfirmationMethod = "automatic",
+                Confirm = true,
+                Metadata = metadata
             };
-        }
-        catch (StripeException ex)
-        {
-            throw TranslateException(ex, "ProcessPayment");
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
-        }
+
+            try
+            {
+                var service = new PaymentIntentService(_stripeClient);
+                var paymentIntent = await service.CreateAsync(options, BuildRequestOptions(request.IdempotencyKey), ct).ConfigureAwait(false);
+
+                Logger.LogInformation("Stripe PaymentIntent created: {Id} status={Status}",
+                    paymentIntent.Id, paymentIntent.Status);
+
+                return new PaymentResponse
+                {
+                    GatewayReference = paymentIntent.Id,
+                    Status = MapStatus(paymentIntent.Status),
+                    Amount = request.Amount,
+                    Currency = request.Currency,
+                    ProcessedAt = DateTime.UtcNow,
+                    Message = paymentIntent.Status
+                };
+            }
+            catch (StripeException ex)
+            {
+                throw StripeExceptionTranslator.Translate(ex, ProviderName, "ProcessPayment", Logger);
+            }
+        }, ct);
     }
 
     /// <inheritdoc/>
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return StripeObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
-    }
-
-    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
-    {
-        var amountInCents = (long)(request.Amount * 100);
-        var options = new PayoutCreateOptions
+        return RunPayoutAsync(request.Currency, async () =>
         {
-            Amount = amountInCents,
-            Currency = request.Currency.ToLowerInvariant(),
-            Description = request.Description,
-            Destination = request.DestinationToken
-        };
-
-        try
-        {
-            var service = new PayoutService(_stripeClient);
-            var payout = await service.CreateAsync(options, BuildRequestOptions(request.IdempotencyKey), ct).ConfigureAwait(false);
-
-            _logger.LogInformation("Stripe Payout created: {Id} status={Status}", payout.Id, payout.Status);
-
-            return new PayoutResponse
+            var amountInCents = (long)(request.Amount * 100);
+            var options = new PayoutCreateOptions
             {
-                GatewayReference = payout.Id,
-                Status = MapStatus(payout.Status),
-                Amount = request.Amount,
-                Currency = request.Currency,
-                ProcessedAt = DateTime.UtcNow
+                Amount = amountInCents,
+                Currency = request.Currency.ToLowerInvariant(),
+                Description = request.Description,
+                Destination = request.DestinationToken
             };
-        }
-        catch (StripeException ex)
-        {
-            throw TranslateException(ex, "ProcessPayout");
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
-        }
+
+            try
+            {
+                var service = new PayoutService(_stripeClient);
+                var payout = await service.CreateAsync(options, BuildRequestOptions(request.IdempotencyKey), ct).ConfigureAwait(false);
+
+                Logger.LogInformation("Stripe Payout created: {Id} status={Status}", payout.Id, payout.Status);
+
+                return new PayoutResponse
+                {
+                    GatewayReference = payout.Id,
+                    Status = MapStatus(payout.Status),
+                    Amount = request.Amount,
+                    Currency = request.Currency,
+                    ProcessedAt = DateTime.UtcNow
+                };
+            }
+            catch (StripeException ex)
+            {
+                throw StripeExceptionTranslator.Translate(ex, ProviderName, "ProcessPayout", Logger);
+            }
+        }, ct);
     }
 
     /// <inheritdoc/>
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return StripeObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
-    }
-
-    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
-    {
-        var amountInCents = (long)(request.Amount * 100);
-        var options = new RefundCreateOptions
+        return RunRefundAsync(request.GatewayReference, async () =>
         {
-            PaymentIntent = request.GatewayReference,
-            Amount = amountInCents,
-            Reason = MapRefundReason(request.Reason)
-        };
-
-        try
-        {
-            var service = new RefundService(_stripeClient);
-            var refund = await service.CreateAsync(options, BuildRequestOptions(request.IdempotencyKey), ct).ConfigureAwait(false);
-
-            _logger.LogInformation("Stripe Refund created: {Id} for PaymentIntent {PaymentIntent}",
-                refund.Id, request.GatewayReference);
-
-            return new RefundResponse
+            var amountInCents = (long)(request.Amount * 100);
+            var options = new RefundCreateOptions
             {
-                GatewayReference = refund.Id,
-                Amount = request.Amount,
-                Status = MapStatus(refund.Status),
-                ProcessedAt = DateTime.UtcNow,
-                Message = refund.Status
+                PaymentIntent = request.GatewayReference,
+                Amount = amountInCents,
+                Reason = MapRefundReason(request.Reason)
             };
-        }
-        catch (StripeException ex)
-        {
-            throw TranslateException(ex, "ProcessRefund");
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
-        }
+
+            try
+            {
+                var service = new RefundService(_stripeClient);
+                var refund = await service.CreateAsync(options, BuildRequestOptions(request.IdempotencyKey), ct).ConfigureAwait(false);
+
+                Logger.LogInformation("Stripe Refund created: {Id} for PaymentIntent {PaymentIntent}",
+                    refund.Id, request.GatewayReference);
+
+                return new RefundResponse
+                {
+                    GatewayReference = refund.Id,
+                    Amount = request.Amount,
+                    Status = MapStatus(refund.Status),
+                    ProcessedAt = DateTime.UtcNow,
+                    Message = refund.Status
+                };
+            }
+            catch (StripeException ex)
+            {
+                throw StripeExceptionTranslator.Translate(ex, ProviderName, "ProcessRefund", Logger);
+            }
+        }, ct);
     }
 
     /// <inheritdoc/>
@@ -214,49 +199,50 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
 
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
-            _logger.LogWarning("Stripe WebhookSecret not configured — signature verification cannot succeed.");
-            StripeObservability.RecordWebhookVerification(false);
-            return false;
+            Logger.LogWarning("Stripe WebhookSecret not configured — signature verification cannot succeed.");
+            // Surface a single false outcome on the verifications counter so this misconfiguration shows up on dashboards.
+            return RunWebhookVerify(() => false);
         }
 
-        try
+        return RunWebhookVerify(() =>
         {
-            EventUtility.ConstructEvent(payload, signature, _options.WebhookSecret);
-            StripeObservability.RecordWebhookVerification(true);
-            return true;
-        }
-        catch (StripeException ex)
-        {
-            _logger.LogWarning("Stripe webhook signature verification failed: {Error}", ex.Message);
-            StripeObservability.RecordWebhookVerification(false);
-            return false;
-        }
+            try
+            {
+                // Stripe.net's EventUtility performs constant-time signature comparison internally;
+                // delegating to it preserves the upstream's hardened verifier.
+                EventUtility.ConstructEvent(payload, signature, _options.WebhookSecret);
+                return true;
+            }
+            catch (StripeException ex)
+            {
+                Logger.LogWarning("Stripe webhook signature verification failed: {Error}", ex.Message);
+                return false;
+            }
+        });
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        return StripeObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
-    }
-
-    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
-    {
-        try
+        return RunOperationAsync("parse_webhook", () =>
         {
-            // throwOnApiVersionMismatch:false lets the SDK keep up across Stripe API minor versions
-            // without forcing every consumer to upgrade Stripe.net the day the new version ships.
-            var stripeEvent = EventUtility.ParseEvent(payload, throwOnApiVersionMismatch: false);
-            _logger.LogInformation("Parsed Stripe webhook event: {EventType}", stripeEvent.Type);
+            try
+            {
+                // throwOnApiVersionMismatch:false lets the SDK keep up across Stripe API minor versions
+                // without forcing every consumer to upgrade Stripe.net the day the new version ships.
+                var stripeEvent = EventUtility.ParseEvent(payload, throwOnApiVersionMismatch: false);
+                Logger.LogInformation("Parsed Stripe webhook event: {EventType}", stripeEvent.Type);
 
-            var typed = MapStripeEvent(stripeEvent);
-            return Task.FromResult(typed);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to parse Stripe webhook event");
-            return Task.FromResult<WebhookEvent?>(null);
-        }
+                var typed = MapStripeEvent(stripeEvent);
+                return Task.FromResult<WebhookEvent?>(typed);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Failed to parse Stripe webhook event");
+                return Task.FromResult<WebhookEvent?>(null);
+            }
+        }, ct);
     }
 
     private static WebhookEvent? MapStripeEvent(Event stripeEvent)
@@ -382,7 +368,13 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
                         IsPartial = false
                     };
                 }
-                return null;
+                return new WebhookEvent
+                {
+                    GatewayReference = r.PaymentIntentId ?? r.ChargeId ?? r.Id,
+                    Status = PaymentStatus.Pending,
+                    EventType = stripeEvent.Type,
+                    Category = WebhookEventCategory.Unknown
+                };
             }
             case "refund.failed":
             {
@@ -445,7 +437,13 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
                         ChargebackFee = d.BalanceTransactions?.FirstOrDefault()?.Fee / 100m
                     };
                 }
-                return null;
+                return new WebhookEvent
+                {
+                    GatewayReference = d.ChargeId ?? d.PaymentIntentId ?? d.Id,
+                    Status = PaymentStatus.Pending,
+                    EventType = stripeEvent.Type,
+                    Category = WebhookEventCategory.Unknown
+                };
             }
             case "customer.subscription.created":
             {
@@ -479,7 +477,13 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
                         NextBillingAt = sub.CurrentPeriodEnd == default ? null : sub.CurrentPeriodEnd
                     };
                 }
-                return null;
+                return new WebhookEvent
+                {
+                    GatewayReference = sub.Id,
+                    Status = PaymentStatus.Pending,
+                    EventType = stripeEvent.Type,
+                    Category = WebhookEventCategory.Unknown
+                };
             }
             case "customer.subscription.deleted":
             {
@@ -567,33 +571,24 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
                         MandateReference = m.Id
                     };
                 }
-                return null;
+                return new WebhookEvent
+                {
+                    GatewayReference = m.Id,
+                    Status = PaymentStatus.Pending,
+                    EventType = stripeEvent.Type,
+                    Category = WebhookEventCategory.Unknown
+                };
             }
             default:
+                // Unrecognised upstream event type — return null so the consumer's handler can
+                // short-circuit cleanly instead of dispatching on a Category=Unknown placeholder.
+                // (Convention shared with all other providers in the family.)
                 return null;
         }
     }
 
     private static RequestOptions? BuildRequestOptions(string? idempotencyKey) =>
         string.IsNullOrEmpty(idempotencyKey) ? null : new RequestOptions { IdempotencyKey = idempotencyKey };
-
-    private BhenguPaymentException TranslateException(StripeException ex, string operation)
-    {
-        var httpStatus = (int)ex.HttpStatusCode;
-        var errorCode = ex.StripeError?.Code ?? ex.HttpStatusCode.ToString();
-        var errorMessage = ex.StripeError?.Message ?? ex.Message;
-
-        _logger.LogError(ex, "Stripe {Operation} failed: {HttpStatus} {Code} {Message}",
-            operation, httpStatus, errorCode, errorMessage);
-
-        if (httpStatus == 429)
-            return new ProviderRateLimitException(ProviderName, providerErrorMessage: errorMessage, innerException: ex);
-
-        if (httpStatus is >= 400 and < 500)
-            return new PaymentDeclinedException(ProviderName, errorCode, errorMessage, ex);
-
-        return new ProviderUnavailableException(ProviderName, $"HTTP {httpStatus}: {errorMessage}", ex);
-    }
 
     private static PaymentStatus MapStatus(string raw) => raw?.ToLowerInvariant() switch
     {

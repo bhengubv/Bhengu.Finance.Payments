@@ -3,7 +3,6 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -12,7 +11,8 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
-using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.Moniepoint.Configuration;
 using Bhengu.Finance.Payments.Moniepoint.Internals;
 using Microsoft.Extensions.Logging;
@@ -24,15 +24,14 @@ namespace Bhengu.Finance.Payments.Moniepoint.Providers;
 /// Moniepoint (Nigeria) payment gateway provider. Wraps the Moniepoint REST API
 /// for initialised checkout, verify, refund and transfer operations.
 /// </summary>
-public sealed class MoniepointPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class MoniepointPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly MoniepointOptions _options;
-    private readonly ILogger<MoniepointPaymentProvider> _logger;
     private readonly MoniepointIdempotencyCache? _idempotency;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Moniepoint;
+    public override string ProviderName => ProviderNames.Moniepoint;
 
     /// <inheritdoc />
     public ProviderCapabilities Capabilities =>
@@ -53,10 +52,10 @@ public sealed class MoniepointPaymentProvider : IPaymentGatewayProvider, IPayout
         IOptions<MoniepointOptions> options,
         ILogger<MoniepointPaymentProvider> logger,
         MoniepointIdempotencyCache? idempotency = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotency = idempotency;
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
@@ -73,69 +72,45 @@ public sealed class MoniepointPaymentProvider : IPaymentGatewayProvider, IPayout
     {
         ArgumentNullException.ThrowIfNull(request);
         return _idempotency is null
-            ? ProcessPaymentCoreAsync(request, ct)
+            ? RunChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct), ct)
             : _idempotency.GetOrAddAsync(request.IdempotencyKey, "charge",
-                () => ProcessPaymentCoreAsync(request, ct), ct);
+                () => RunChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct), ct), ct);
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
     {
-        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
-        try
+        var reference = request.Metadata?.GetValueOrDefault("reference") ?? request.IdempotencyKey ?? $"mpt-{Guid.NewGuid():N}";
+        var customerEmail = request.Metadata?.GetValueOrDefault("email") ?? "noreply@bhengu.example";
+        var customerName = request.Metadata?.GetValueOrDefault("name") ?? "Bhengu Customer";
+        var customerPhone = request.Metadata?.GetValueOrDefault("phone") ?? string.Empty;
+
+        var requestBody = new
         {
-            var reference = request.Metadata?.GetValueOrDefault("reference") ?? request.IdempotencyKey ?? $"mpt-{Guid.NewGuid():N}";
-            var customerEmail = request.Metadata?.GetValueOrDefault("email") ?? "noreply@bhengu.example";
-            var customerName = request.Metadata?.GetValueOrDefault("name") ?? "Bhengu Customer";
-            var customerPhone = request.Metadata?.GetValueOrDefault("phone") ?? string.Empty;
+            amount = request.Amount,
+            currency = request.Currency.ToUpperInvariant(),
+            reference,
+            customer = new { email = customerEmail, name = customerName, phone = customerPhone },
+            redirectUrl = _options.RedirectUrl,
+            paymentMethod = request.PaymentMethodToken
+        };
 
-            var requestBody = new
-            {
-                amount = request.Amount,
-                currency = request.Currency.ToUpperInvariant(),
-                reference,
-                customer = new { email = customerEmail, name = customerName, phone = customerPhone },
-                redirectUrl = _options.RedirectUrl,
-                paymentMethod = request.PaymentMethodToken
-            };
+        var body = await SendAsync(HttpMethod.Post, "api/v1/transactions/initialize",
+            requestBody, ct, "ProcessPayment").ConfigureAwait(false);
+        var resp = JsonSerializer.Deserialize<MoniepointInitResponse>(body);
 
-            var body = await SendAsync(HttpMethod.Post, "api/v1/transactions/initialize",
-                requestBody, ct, "ProcessPayment").ConfigureAwait(false);
-            var resp = JsonSerializer.Deserialize<MoniepointInitResponse>(body);
+        Logger.LogInformation("Moniepoint init: {Reference} status={Status}",
+            resp?.Data?.Reference ?? reference, resp?.Data?.Status);
 
-            _logger.LogInformation("Moniepoint init: {Reference} status={Status}",
-                resp?.Data?.Reference ?? reference, resp?.Data?.Status);
-
-            var status = MapStatus(resp?.Data?.Status);
-            outcome = status switch
-            {
-                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
-                _ => BhenguPaymentDiagnostics.Outcomes.Declined
-            };
-
-            return new PaymentResponse
-            {
-                GatewayReference = resp?.Data?.Reference ?? reference,
-                Status = status,
-                Amount = request.Amount,
-                Currency = request.Currency,
-                ProcessedAt = DateTime.UtcNow,
-                Message = resp?.Message
-            };
-        }
-        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
-        finally
+        var status = MapStatus(resp?.Data?.Status);
+        return new PaymentResponse
         {
-            activity?.SetOutcome(outcome);
-            sw.Stop();
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
-            BhenguPaymentDiagnostics.ChargeDurationMs.Record(sw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
-        }
+            GatewayReference = resp?.Data?.Reference ?? reference,
+            Status = status,
+            Amount = request.Amount,
+            Currency = request.Currency,
+            ProcessedAt = DateTime.UtcNow,
+            Message = resp?.Message
+        };
     }
 
     /// <inheritdoc />
@@ -143,56 +118,35 @@ public sealed class MoniepointPaymentProvider : IPaymentGatewayProvider, IPayout
     {
         ArgumentNullException.ThrowIfNull(request);
         return _idempotency is null
-            ? ProcessRefundCoreAsync(request, ct)
+            ? RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct), ct)
             : _idempotency.GetOrAddAsync(request.IdempotencyKey, "refund",
-                () => ProcessRefundCoreAsync(request, ct), ct);
+                () => RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct), ct), ct);
     }
 
     private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
     {
-        using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
-        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
-        try
+        var requestBody = new
         {
-            var requestBody = new
-            {
-                amount = request.Amount,
-                reason = request.Reason
-            };
+            amount = request.Amount,
+            reason = request.Reason
+        };
 
-            var path = $"api/v1/transactions/{Uri.EscapeDataString(request.GatewayReference)}/refund";
-            var body = await SendAsync(HttpMethod.Post, path, requestBody, ct, "ProcessRefund").ConfigureAwait(false);
-            var resp = JsonSerializer.Deserialize<MoniepointRefundResponse>(body);
+        var path = $"api/v1/transactions/{Uri.EscapeDataString(request.GatewayReference)}/refund";
+        var body = await SendAsync(HttpMethod.Post, path, requestBody, ct, "ProcessRefund").ConfigureAwait(false);
+        var resp = JsonSerializer.Deserialize<MoniepointRefundResponse>(body);
 
-            _logger.LogInformation("Moniepoint refund created: {RefundRef} for txn {TxnRef}",
-                resp?.Data?.RefundReference, request.GatewayReference);
+        Logger.LogInformation("Moniepoint refund created: {RefundRef} for txn {TxnRef}",
+            resp?.Data?.RefundReference, request.GatewayReference);
 
-            var status = MapStatus(resp?.Data?.Status);
-            outcome = status switch
-            {
-                PaymentStatus.Completed or PaymentStatus.Refunded => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
-                _ => BhenguPaymentDiagnostics.Outcomes.Declined
-            };
-
-            return new RefundResponse
-            {
-                GatewayReference = resp?.Data?.RefundReference ?? string.Empty,
-                Amount = request.Amount,
-                Status = status,
-                ProcessedAt = DateTime.UtcNow,
-                Message = resp?.Message
-            };
-        }
-        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
-        finally
+        var status = MapStatus(resp?.Data?.Status);
+        return new RefundResponse
         {
-            activity?.SetOutcome(outcome);
-            BhenguPaymentDiagnostics.RefundsTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
-        }
+            GatewayReference = resp?.Data?.RefundReference ?? string.Empty,
+            Amount = request.Amount,
+            Status = status,
+            ProcessedAt = DateTime.UtcNow,
+            Message = resp?.Message
+        };
     }
 
     /// <inheritdoc />
@@ -200,69 +154,48 @@ public sealed class MoniepointPaymentProvider : IPaymentGatewayProvider, IPayout
     {
         ArgumentNullException.ThrowIfNull(request);
         return _idempotency is null
-            ? ProcessPayoutCoreAsync(request, ct)
+            ? RunPayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct), ct)
             : _idempotency.GetOrAddAsync(request.IdempotencyKey, "payout",
-                () => ProcessPayoutCoreAsync(request, ct), ct);
+                () => RunPayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct), ct), ct);
     }
 
     private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
     {
-        using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, request.Currency);
-        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
-        try
+        // DestinationToken expected format: "<bankCode>:<accountNumber>" or "<accountNumber>".
+        string beneficiaryBank = string.Empty;
+        string beneficiaryAccount = request.DestinationToken;
+        var sep = request.DestinationToken.IndexOf(':');
+        if (sep > 0)
         {
-            // DestinationToken expected format: "<bankCode>:<accountNumber>" or "<accountNumber>".
-            string beneficiaryBank = string.Empty;
-            string beneficiaryAccount = request.DestinationToken;
-            var sep = request.DestinationToken.IndexOf(':');
-            if (sep > 0)
-            {
-                beneficiaryBank = request.DestinationToken[..sep];
-                beneficiaryAccount = request.DestinationToken[(sep + 1)..];
-            }
-
-            var requestBody = new
-            {
-                amount = request.Amount,
-                currency = request.Currency.ToUpperInvariant(),
-                beneficiaryAccount,
-                beneficiaryBank,
-                narration = request.Description,
-                reference = request.IdempotencyKey ?? $"tfr-{Guid.NewGuid():N}"
-            };
-
-            var body = await SendAsync(HttpMethod.Post, "api/v1/transfers", requestBody, ct, "ProcessPayout").ConfigureAwait(false);
-            var resp = JsonSerializer.Deserialize<MoniepointTransferResponse>(body);
-
-            _logger.LogInformation("Moniepoint transfer created: {Reference} status={Status}",
-                resp?.Data?.Reference, resp?.Data?.Status);
-
-            var status = MapStatus(resp?.Data?.Status);
-            outcome = status switch
-            {
-                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
-                _ => BhenguPaymentDiagnostics.Outcomes.Declined
-            };
-
-            return new PayoutResponse
-            {
-                GatewayReference = resp?.Data?.Reference ?? string.Empty,
-                Status = status,
-                Amount = request.Amount,
-                Currency = request.Currency,
-                ProcessedAt = DateTime.UtcNow
-            };
+            beneficiaryBank = request.DestinationToken[..sep];
+            beneficiaryAccount = request.DestinationToken[(sep + 1)..];
         }
-        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
-        finally
+
+        var requestBody = new
         {
-            activity?.SetOutcome(outcome);
-            BhenguPaymentDiagnostics.PayoutsTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
-        }
+            amount = request.Amount,
+            currency = request.Currency.ToUpperInvariant(),
+            beneficiaryAccount,
+            beneficiaryBank,
+            narration = request.Description,
+            reference = request.IdempotencyKey ?? $"tfr-{Guid.NewGuid():N}"
+        };
+
+        var body = await SendAsync(HttpMethod.Post, "api/v1/transfers", requestBody, ct, "ProcessPayout").ConfigureAwait(false);
+        var resp = JsonSerializer.Deserialize<MoniepointTransferResponse>(body);
+
+        Logger.LogInformation("Moniepoint transfer created: {Reference} status={Status}",
+            resp?.Data?.Reference, resp?.Data?.Status);
+
+        var status = MapStatus(resp?.Data?.Status);
+        return new PayoutResponse
+        {
+            GatewayReference = resp?.Data?.Reference ?? string.Empty,
+            Status = status,
+            Amount = request.Amount,
+            Currency = request.Currency,
+            ProcessedAt = DateTime.UtcNow
+        };
     }
 
     /// <inheritdoc />
@@ -271,36 +204,17 @@ public sealed class MoniepointPaymentProvider : IPaymentGatewayProvider, IPayout
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        var valid = false;
-        try
+        return RunWebhookVerify(() =>
         {
             var secret = string.IsNullOrWhiteSpace(_options.WebhookSecret) ? _options.ApiKey : _options.WebhookSecret;
             if (string.IsNullOrWhiteSpace(secret))
             {
-                _logger.LogWarning("Moniepoint webhook secret not configured — signature verification cannot succeed.");
+                Logger.LogWarning("Moniepoint webhook secret not configured — signature verification cannot succeed.");
                 return false;
             }
 
-            using var hmac = new HMACSHA512(Encoding.UTF8.GetBytes(secret));
-            var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
-            var computedSignature = Convert.ToHexString(computedHash).ToLowerInvariant();
-
-            valid = CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
-                Encoding.UTF8.GetBytes(computedSignature));
-            return valid;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Moniepoint webhook signature verification raised");
-            return false;
-        }
-        finally
-        {
-            BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("valid", valid));
-        }
+            return SignatureHelpers.VerifyHmacSha256(payload, signature, secret);
+        });
     }
 
     /// <inheritdoc />
@@ -308,21 +222,23 @@ public sealed class MoniepointPaymentProvider : IPaymentGatewayProvider, IPayout
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
 
-        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
-        try
+        return RunOperationAsync<WebhookEvent?>("parse_webhook", () =>
         {
-            var evt = JsonSerializer.Deserialize<MoniepointWebhookEvent>(payload);
-            if (evt is null) return Task.FromResult<WebhookEvent?>(null);
+            try
+            {
+                var evt = JsonSerializer.Deserialize<MoniepointWebhookEvent>(payload);
+                if (evt is null) return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed Moniepoint webhook event: {EventType}", evt.Event);
-            var typed = MapWebhookEvent(evt);
-            return Task.FromResult(typed);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to parse Moniepoint webhook event");
-            return Task.FromResult<WebhookEvent?>(null);
-        }
+                Logger.LogInformation("Parsed Moniepoint webhook event: {EventType}", evt.Event);
+                var typed = MapWebhookEvent(evt);
+                return Task.FromResult(typed);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Failed to parse Moniepoint webhook event");
+                return Task.FromResult<WebhookEvent?>(null);
+            }
+        }, ct);
     }
 
     private static WebhookEvent? MapWebhookEvent(MoniepointWebhookEvent webhookEvent)
@@ -448,6 +364,8 @@ public sealed class MoniepointPaymentProvider : IPaymentGatewayProvider, IPayout
                 };
 
             default:
+                // Unrecognised upstream event type — return null so the consumer's handler can
+                // short-circuit cleanly instead of dispatching on a Category=Unknown placeholder.
                 return null;
         }
     }
@@ -460,15 +378,7 @@ public sealed class MoniepointPaymentProvider : IPaymentGatewayProvider, IPayout
             Content = new StringContent(json, Encoding.UTF8, "application/json")
         };
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Moniepoint failed", ex);
-        }
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
 
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
@@ -480,7 +390,7 @@ public sealed class MoniepointPaymentProvider : IPaymentGatewayProvider, IPayout
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Moniepoint {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Moniepoint {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

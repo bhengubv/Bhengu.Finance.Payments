@@ -3,6 +3,7 @@
 using Bhengu.Finance.Payments.AirtelMoney.Configuration;
 using Bhengu.Finance.Payments.AirtelMoney.Providers;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Validation;

@@ -63,21 +63,36 @@ public sealed class PaystackIdempotencyCache
 
         var cacheKey = KeyPrefix + idempotencyKey;
 
-        // Hot path: distributed cache hit.
+        // In-flight FIRST so concurrent peers within the same burst share the same Task and observe
+        // the same materialised result instance. Checking the distributed cache first would race —
+        // caller 1 completes synchronously and persists; caller 2 then sees the cache hit and gets
+        // a JSON-deserialised copy (different reference) instead of the coalesced Task result.
+        // CRITICAL: wrap in Lazy<Task<T>>(ExecutionAndPublication) so the factory runs exactly once
+        // even when N concurrent threads race into GetOrAdd. Without Lazy, ConcurrentDictionary's
+        // value factory can fire multiple times before one thread wins the insert — burning N HTTP
+        // calls before the dedupe takes effect.
+        if (_inFlight.TryGetValue(idempotencyKey, out var existing))
+        {
+            return await ((Lazy<Task<T>>)existing).Value.ConfigureAwait(false);
+        }
+
+        // Now check the distributed cache for completed prior calls (different burst).
         var cached = await _cache.GetAsync<T>(cacheKey).ConfigureAwait(false);
         if (cached is not null)
             return cached;
 
-        // In-flight coalesce: peers share the same Task.
-        var task = (Task<T>)_inFlight.GetOrAdd(idempotencyKey, _ => RunAndPersistAsync(factory, cacheKey));
+        var lazy = (Lazy<Task<T>>)_inFlight.GetOrAdd(
+            idempotencyKey,
+            _ => new Lazy<Task<T>>(() => RunAndPersistAsync(factory, cacheKey),
+                LazyThreadSafetyMode.ExecutionAndPublication));
         try
         {
-            return await task.ConfigureAwait(false);
+            return await lazy.Value.ConfigureAwait(false);
         }
         finally
         {
             // Evict only the entry we added — survives concurrent peers using the same key.
-            _inFlight.TryRemove(new KeyValuePair<string, object>(idempotencyKey, task));
+            _inFlight.TryRemove(new KeyValuePair<string, object>(idempotencyKey, lazy));
         }
     }
 

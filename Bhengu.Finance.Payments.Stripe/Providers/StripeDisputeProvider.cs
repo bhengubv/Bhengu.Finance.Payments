@@ -1,9 +1,11 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using System.Runtime.CompilerServices;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Dispute;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Stripe.Configuration;
 using Bhengu.Finance.Payments.Stripe.Internals;
 using Microsoft.Extensions.Logging;
@@ -19,24 +21,23 @@ namespace Bhengu.Finance.Payments.Stripe.Providers;
 /// Stripe implementation of <see cref="IDisputeProvider"/>. Wraps Stripe's <c>Dispute</c> API
 /// to enumerate disputes, submit evidence, and close (accept) disputes.
 /// </summary>
-public sealed class StripeDisputeProvider : IDisputeProvider
+public sealed class StripeDisputeProvider : BhenguProviderBase, IDisputeProvider
 {
     private readonly StripeOptions _options;
-    private readonly ILogger<StripeDisputeProvider> _logger;
     private readonly IStripeClient _stripeClient;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Stripe;
+    public override string ProviderName => ProviderNames.Stripe;
 
     /// <summary>Construct the provider. Throws <see cref="ProviderConfigurationException"/> if <see cref="StripeOptions.SecretKey"/> is unset.</summary>
     public StripeDisputeProvider(
         HttpClient httpClient,
         IOptions<StripeOptions> options,
         ILogger<StripeDisputeProvider> logger)
+        : base(logger)
     {
         ArgumentNullException.ThrowIfNull(httpClient);
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(StripeOptions.SecretKey)} is required");
@@ -51,59 +52,71 @@ public sealed class StripeDisputeProvider : IDisputeProvider
     public Task<Dispute?> GetDisputeAsync(string disputeReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(disputeReference);
-        return StripeObservability.ObserveAsync("get_dispute", () => GetDisputeCoreAsync(disputeReference, ct));
-    }
-
-    private async Task<Dispute?> GetDisputeCoreAsync(string disputeReference, CancellationToken ct)
-    {
-        try
+        return RunOperationAsync("get_dispute", async () =>
         {
-            var service = new DisputeService(_stripeClient);
-            var dispute = await service.GetAsync(disputeReference, cancellationToken: ct).ConfigureAwait(false);
-            return Map(dispute);
-        }
-        catch (StripeException ex) when (ex.HttpStatusCode == System.Net.HttpStatusCode.NotFound)
-        {
-            return null;
-        }
-        catch (StripeException ex)
-        {
-            throw TranslateException(ex, "GetDispute");
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
-        }
+            try
+            {
+                var service = new DisputeService(_stripeClient);
+                var dispute = await service.GetAsync(disputeReference, cancellationToken: ct).ConfigureAwait(false);
+                return (Dispute?)Map(dispute);
+            }
+            catch (StripeException ex) when (ex.HttpStatusCode == System.Net.HttpStatusCode.NotFound)
+            {
+                return null;
+            }
+            catch (StripeException ex)
+            {
+                throw StripeExceptionTranslator.Translate(ex, ProviderName, "GetDispute", Logger);
+            }
+        }, ct);
     }
 
     /// <inheritdoc />
-    public Task<IReadOnlyList<Dispute>> ListDisputesAsync(DateTime? fromUtc = null, DateTime? toUtc = null, CancellationToken ct = default)
-        => StripeObservability.ObserveAsync("list_disputes", () => ListDisputesCoreAsync(fromUtc, toUtc, ct));
-
-    private async Task<IReadOnlyList<Dispute>> ListDisputesCoreAsync(DateTime? fromUtc, DateTime? toUtc, CancellationToken ct)
+    public async IAsyncEnumerable<Dispute> ListDisputesAsync(
+        DateTime? fromUtc = null,
+        DateTime? toUtc = null,
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
+        var service = new DisputeService(_stripeClient);
+        var listOptions = new DisputeListOptions
+        {
+            Limit = 100,
+            Created = (fromUtc is null && toUtc is null) ? null : new DateRangeOptions
+            {
+                GreaterThanOrEqual = fromUtc,
+                LessThanOrEqual = toUtc
+            }
+        };
+
+        // Manual GetAsyncEnumerator so we can translate StripeException → canonical hierarchy
+        // around MoveNextAsync. `try`/`catch` cannot wrap `yield return` inside an iterator body.
+        var enumerator = service.ListAutoPagingAsync(listOptions, cancellationToken: ct)
+            .GetAsyncEnumerator(ct);
         try
         {
-            var service = new DisputeService(_stripeClient);
-            var listOptions = new DisputeListOptions
+            while (true)
             {
-                Limit = 100,
-                Created = (fromUtc is null && toUtc is null) ? null : new DateRangeOptions
+                StripeDispute? current;
+                try
                 {
-                    GreaterThanOrEqual = fromUtc,
-                    LessThanOrEqual = toUtc
+                    if (!await enumerator.MoveNextAsync().ConfigureAwait(false)) yield break;
+                    current = enumerator.Current;
                 }
-            };
-            var page = await service.ListAsync(listOptions, cancellationToken: ct).ConfigureAwait(false);
-            return page.Data.Select(Map).ToList();
+                catch (StripeException ex)
+                {
+                    throw StripeExceptionTranslator.Translate(ex, ProviderName, "ListDisputes", Logger);
+                }
+                catch (HttpRequestException ex)
+                {
+                    throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
+                }
+                ct.ThrowIfCancellationRequested();
+                yield return Map(current);
+            }
         }
-        catch (StripeException ex)
+        finally
         {
-            throw TranslateException(ex, "ListDisputes");
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
+            await enumerator.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -112,81 +125,69 @@ public sealed class StripeDisputeProvider : IDisputeProvider
     {
         ArgumentException.ThrowIfNullOrEmpty(disputeReference);
         ArgumentNullException.ThrowIfNull(evidence);
-        return StripeObservability.ObserveAsync("submit_dispute_evidence", () => SubmitEvidenceCoreAsync(disputeReference, evidence, ct));
-    }
-
-    private async Task<Dispute> SubmitEvidenceCoreAsync(string disputeReference, DisputeEvidence evidence, CancellationToken ct)
-    {
-        try
+        return RunOperationAsync("submit_dispute_evidence", async () =>
         {
-            var service = new DisputeService(_stripeClient);
-            var stripeEvidence = new DisputeEvidenceOptions
+            try
             {
-                UncategorizedText = evidence.Explanation,
-                CustomerName = evidence.CustomerName,
-                CustomerEmailAddress = evidence.CustomerEmailAddress,
-                BillingAddress = evidence.BillingAddress,
-                ShippingAddress = evidence.ShippingAddress,
-                ShippingCarrier = evidence.ShippingCarrier,
-                ShippingTrackingNumber = evidence.ShippingTrackingNumber,
-                ShippingDate = evidence.ShippingDate?.ToString("yyyy-MM-dd"),
-                ShippingDocumentation = evidence.FileReferences?.FirstOrDefault(),
-                UncategorizedFile = evidence.FileReferences is { Count: > 1 } refs ? refs[1] : null
-            };
-
-            // Allow consumers to push Stripe-specific evidence fields verbatim.
-            if (evidence.ProviderEvidenceFields is { Count: > 0 })
-            {
-                foreach (var (key, value) in evidence.ProviderEvidenceFields)
+                var service = new DisputeService(_stripeClient);
+                var stripeEvidence = new DisputeEvidenceOptions
                 {
-                    ApplyProviderField(stripeEvidence, key, value);
+                    UncategorizedText = evidence.Explanation,
+                    CustomerName = evidence.CustomerName,
+                    CustomerEmailAddress = evidence.CustomerEmailAddress,
+                    BillingAddress = evidence.BillingAddress,
+                    ShippingAddress = evidence.ShippingAddress,
+                    ShippingCarrier = evidence.ShippingCarrier,
+                    ShippingTrackingNumber = evidence.ShippingTrackingNumber,
+                    ShippingDate = evidence.ShippingDate?.ToString("yyyy-MM-dd"),
+                    ShippingDocumentation = evidence.FileReferences?.FirstOrDefault(),
+                    UncategorizedFile = evidence.FileReferences is { Count: > 1 } refs ? refs[1] : null
+                };
+
+                // Allow consumers to push Stripe-specific evidence fields verbatim.
+                if (evidence.ProviderEvidenceFields is { Count: > 0 })
+                {
+                    foreach (var (key, value) in evidence.ProviderEvidenceFields)
+                    {
+                        ApplyProviderField(stripeEvidence, key, value);
+                    }
                 }
+
+                var updateOptions = new DisputeUpdateOptions
+                {
+                    Evidence = stripeEvidence,
+                    Submit = true
+                };
+
+                var updated = await service.UpdateAsync(disputeReference, updateOptions, cancellationToken: ct).ConfigureAwait(false);
+                Logger.LogInformation("Stripe Dispute evidence submitted: {DisputeId} status={Status}", updated.Id, updated.Status);
+                return Map(updated);
             }
-
-            var updateOptions = new DisputeUpdateOptions
+            catch (StripeException ex)
             {
-                Evidence = stripeEvidence,
-                Submit = true
-            };
-
-            var updated = await service.UpdateAsync(disputeReference, updateOptions, cancellationToken: ct).ConfigureAwait(false);
-            _logger.LogInformation("Stripe Dispute evidence submitted: {DisputeId} status={Status}", updated.Id, updated.Status);
-            return Map(updated);
-        }
-        catch (StripeException ex)
-        {
-            throw TranslateException(ex, "SubmitDisputeEvidence");
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
-        }
+                throw StripeExceptionTranslator.Translate(ex, ProviderName, "SubmitDisputeEvidence", Logger);
+            }
+        }, ct);
     }
 
     /// <inheritdoc />
     public Task<Dispute> AcceptDisputeAsync(string disputeReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(disputeReference);
-        return StripeObservability.ObserveAsync("accept_dispute", () => AcceptDisputeCoreAsync(disputeReference, ct));
-    }
-
-    private async Task<Dispute> AcceptDisputeCoreAsync(string disputeReference, CancellationToken ct)
-    {
-        try
+        return RunOperationAsync("accept_dispute", async () =>
         {
-            var service = new DisputeService(_stripeClient);
-            var closed = await service.CloseAsync(disputeReference, cancellationToken: ct).ConfigureAwait(false);
-            _logger.LogInformation("Stripe Dispute accepted: {DisputeId} status={Status}", closed.Id, closed.Status);
-            return Map(closed);
-        }
-        catch (StripeException ex)
-        {
-            throw TranslateException(ex, "AcceptDispute");
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
-        }
+            try
+            {
+                var service = new DisputeService(_stripeClient);
+                var closed = await service.CloseAsync(disputeReference, cancellationToken: ct).ConfigureAwait(false);
+                Logger.LogInformation("Stripe Dispute accepted: {DisputeId} status={Status}", closed.Id, closed.Status);
+                return Map(closed);
+            }
+            catch (StripeException ex)
+            {
+                throw StripeExceptionTranslator.Translate(ex, ProviderName, "AcceptDispute", Logger);
+            }
+        }, ct);
     }
 
     private static Dispute Map(StripeDispute d) => new()
@@ -239,23 +240,5 @@ public sealed class StripeDisputeProvider : IDisputeProvider
             case "uncategorized_file": evidence.UncategorizedFile = value; break;
             default: break;
         }
-    }
-
-    private BhenguPaymentException TranslateException(StripeException ex, string operation)
-    {
-        var httpStatus = (int)ex.HttpStatusCode;
-        var errorCode = ex.StripeError?.Code ?? ex.HttpStatusCode.ToString();
-        var errorMessage = ex.StripeError?.Message ?? ex.Message;
-
-        _logger.LogError(ex, "Stripe {Operation} failed: {HttpStatus} {Code} {Message}",
-            operation, httpStatus, errorCode, errorMessage);
-
-        if (httpStatus == 429)
-            return new ProviderRateLimitException(ProviderName, providerErrorMessage: errorMessage, innerException: ex);
-
-        if (httpStatus is >= 400 and < 500)
-            return new PaymentDeclinedException(ProviderName, errorCode, errorMessage, ex);
-
-        return new ProviderUnavailableException(ProviderName, $"HTTP {httpStatus}: {errorMessage}", ex);
     }
 }

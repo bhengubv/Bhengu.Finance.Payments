@@ -1,8 +1,6 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Net;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
@@ -11,6 +9,8 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.PayFast.Configuration;
 using Bhengu.Finance.Payments.PayFast.Internals;
 using Microsoft.Extensions.Logging;
@@ -23,18 +23,17 @@ namespace Bhengu.Finance.Payments.PayFast.Providers;
 /// Supports tokenised ad-hoc charging via the PayFast subscriptions API.
 /// PayFast does NOT support payouts via API — <see cref="IPayoutProvider"/> is intentionally not implemented.
 /// </summary>
-public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
+public sealed class PayFastPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider
 {
     private const string SubSeenKeyPrefix = "payfast:sub-seen:";
     private static readonly TimeSpan SubSeenTtl = TimeSpan.FromDays(90);
 
     private readonly HttpClient _httpClient;
     private readonly PayFastOptions _options;
-    private readonly ILogger<PayFastPaymentProvider> _logger;
     private readonly IBhenguDistributedCache _cache;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.PayFast;
+    public override string ProviderName => ProviderNames.PayFast;
 
     /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
@@ -58,10 +57,10 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
         IOptions<PayFastOptions> options,
         ILogger<PayFastPaymentProvider> logger,
         IBhenguDistributedCache cache)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _cache = cache ?? throw new ArgumentNullException(nameof(cache));
 
         if (string.IsNullOrWhiteSpace(_options.MerchantId))
@@ -88,7 +87,7 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return PayFastObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+        return RunChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct), ct);
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
@@ -110,7 +109,11 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
                 formData["m_payment_id"] = transactionId;
         }
 
-        var signature = GenerateApiSignature(formData, timestamp);
+        var signature = PayFastSignatureHelper.ComputeApiSignature(
+            _options.MerchantId,
+            _options.Passphrase ?? string.Empty,
+            timestamp,
+            formData);
 
         var path = $"subscriptions/{Uri.EscapeDataString(request.PaymentMethodToken)}/adhoc{(_options.UseSandbox ? "?testing=true" : "")}";
 
@@ -123,15 +126,7 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
         http.Headers.Add("timestamp", timestamp);
         http.Headers.Add("signature", signature);
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(http, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to PayFast failed", ex);
-        }
+        var response = await _httpClient.SendAsync(http, ct).ConfigureAwait(false);
 
         var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
@@ -143,7 +138,7 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("PayFast payment failed: {StatusCode} {Body}", response.StatusCode, body);
+            Logger.LogError("PayFast payment failed: {StatusCode} {Body}", response.StatusCode, body);
             // 4xx that isn't 429 — treat as a decline (insufficient funds, card error, etc.)
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), body);
@@ -153,7 +148,7 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
         var payfastResponse = JsonSerializer.Deserialize<PayFastAdhocResponse>(body);
         var status = MapStatus(payfastResponse?.data?.response ?? "pending");
 
-        _logger.LogInformation("PayFast ad-hoc payment created: {GatewayReference} status={Status}",
+        Logger.LogInformation("PayFast ad-hoc payment created: {GatewayReference} status={Status}",
             payfastResponse?.data?.pf_payment_id, status);
 
         return new PaymentResponse
@@ -171,7 +166,7 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return PayFastObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+        return RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct), ct);
     }
 
     private Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
@@ -179,7 +174,7 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
         // PayFast does not expose a refund API — refunds are processed manually via merchant dashboard.
         // We return a deterministic tracking reference so the caller can match this entry to the manual
         // action when reconciling. Consumers requiring automated refunds must use a different provider.
-        _logger.LogWarning(
+        Logger.LogWarning(
             "PayFast refund requested for {GatewayReference} amount={Amount}. PayFast has no refund API; manual dashboard processing required.",
             request.GatewayReference, request.Amount);
 
@@ -203,8 +198,7 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        bool verified;
-        try
+        return RunWebhookVerify(() =>
         {
             var parameters = ParseFormUrlEncoded(payload);
             parameters.Remove("signature");
@@ -217,21 +211,9 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
             if (!string.IsNullOrEmpty(_options.Passphrase))
                 sorted.Add($"passphrase={WebUtility.UrlEncode(_options.Passphrase)}");
 
-            var paramString = string.Join("&", sorted);
-            var hashBytes = MD5.HashData(Encoding.UTF8.GetBytes(paramString));
-            var computed = Convert.ToHexString(hashBytes).ToLowerInvariant();
-
-            verified = CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
-                Encoding.UTF8.GetBytes(computed));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "PayFast signature verification raised");
-            verified = false;
-        }
-        PayFastObservability.RecordWebhookVerification(verified);
-        return verified;
+            var canonical = string.Join("&", sorted);
+            return SignatureHelpers.VerifyMd5(canonical, signature);
+        });
     }
 
     /// <summary>
@@ -254,7 +236,7 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        return PayFastObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+        return RunOperationAsync<WebhookEvent?>("parse_webhook", () => ParseWebhookCoreAsync(payload, ct), ct);
     }
 
     private async Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
@@ -271,7 +253,7 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
             var status = MapStatus(paymentStatus);
             var hasToken = !string.IsNullOrEmpty(token);
 
-            _logger.LogInformation("PayFast ITN parsed: gatewayReference={PfPaymentId} status={Status} hasToken={HasToken}",
+            Logger.LogInformation("PayFast ITN parsed: gatewayReference={PfPaymentId} status={Status} hasToken={HasToken}",
                 pfPaymentId, status, hasToken);
 
             // For COMPLETE+token (subscription), decide created-vs-renewed by checking a distributed
@@ -289,7 +271,7 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
             }
 
             // Typed sub-records by (payment_status, hasToken).
-            WebhookEvent? typed = (paymentStatus.ToUpperInvariant(), hasToken) switch
+            WebhookEvent typed = (paymentStatus.ToUpperInvariant(), hasToken) switch
             {
                 ("COMPLETE", true) when isFirstSeen => new SubscriptionCreatedEvent
                 {
@@ -369,9 +351,9 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
 
             return typed;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogError(ex, "Failed to parse PayFast ITN payload");
+            Logger.LogError(ex, "Failed to parse PayFast ITN payload");
             return null;
         }
     }
@@ -395,12 +377,12 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
         try
         {
             await SendSignedAsync<object>(HttpMethod.Put, $"subscriptions/{token}/cancel", ct).ConfigureAwait(false);
-            _logger.LogInformation("PayFast token cancelled: {Token}", token);
+            Logger.LogInformation("PayFast token cancelled: {Token}", token);
             return true;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogError(ex, "PayFast cancel token failed for {Token}", token);
+            Logger.LogError(ex, "PayFast cancel token failed for {Token}", token);
             return false;
         }
     }
@@ -412,7 +394,11 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
     private async Task<T?> SendSignedAsync<T>(HttpMethod method, string relativePath, CancellationToken ct) where T : class
     {
         var timestamp = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss");
-        var signature = GenerateApiSignature(new Dictionary<string, string>(), timestamp);
+        var signature = PayFastSignatureHelper.ComputeApiSignature(
+            _options.MerchantId,
+            _options.Passphrase ?? string.Empty,
+            timestamp,
+            new Dictionary<string, string>());
 
         var url = relativePath + (_options.UseSandbox ? (relativePath.Contains('?') ? "&testing=true" : "?testing=true") : "");
         using var req = new HttpRequestMessage(method, url);
@@ -421,44 +407,15 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
         req.Headers.Add("timestamp", timestamp);
         req.Headers.Add("signature", signature);
 
-        HttpResponseMessage resp;
-        try
-        {
-            resp = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "PayFast API HTTP failure", ex);
-        }
+        var resp = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
 
         var body = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         if (!resp.IsSuccessStatusCode)
         {
-            _logger.LogError("PayFast {Method} {Path} failed: {Status} {Body}", method, relativePath, resp.StatusCode, body);
+            Logger.LogError("PayFast {Method} {Path} failed: {Status} {Body}", method, relativePath, resp.StatusCode, body);
             return null;
         }
         return JsonSerializer.Deserialize<T>(body);
-    }
-
-    private string GenerateApiSignature(Dictionary<string, string> bodyParams, string timestamp)
-    {
-        var allParams = new Dictionary<string, string>
-        {
-            ["merchant-id"] = _options.MerchantId,
-            ["passphrase"] = _options.Passphrase,
-            ["timestamp"] = timestamp,
-            ["version"] = "v1"
-        };
-        foreach (var (k, v) in bodyParams)
-            allParams[k] = v;
-
-        var sorted = allParams
-            .OrderBy(p => p.Key, StringComparer.Ordinal)
-            .Select(p => $"{p.Key}={Uri.EscapeDataString(p.Value)}");
-
-        var paramString = string.Join("&", sorted);
-        var hashBytes = MD5.HashData(Encoding.UTF8.GetBytes(paramString));
-        return Convert.ToHexString(hashBytes).ToLowerInvariant();
     }
 
     private static Dictionary<string, string> ParseFormUrlEncoded(string formData)

@@ -41,6 +41,7 @@ public static class ServiceCollectionExtensions
 
         services.AddHttpClient<ChipperCashPaymentProvider>();
         services.AddHttpClient<ChipperCashTokenisationProvider>();
+        services.AddHttpClient<ChipperCashRawCardTokenisationProvider>();
 
         services.AddTransient<IPaymentGatewayProvider, ChipperCashPaymentProvider>(sp =>
             sp.GetRequiredService<ChipperCashPaymentProvider>());
@@ -48,6 +49,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<ChipperCashPaymentProvider>());
         services.AddTransient<ITokenisationProvider, ChipperCashTokenisationProvider>(sp =>
             sp.GetRequiredService<ChipperCashTokenisationProvider>());
+        services.AddTransient<IRawCardTokenisationProvider, ChipperCashRawCardTokenisationProvider>(sp =>
+            sp.GetRequiredService<ChipperCashRawCardTokenisationProvider>());
 
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.ChipperCash,
             (sp, _) => sp.GetRequiredService<ChipperCashPaymentProvider>());
@@ -55,6 +58,8 @@ public static class ServiceCollectionExtensions
             (sp, _) => sp.GetRequiredService<ChipperCashPaymentProvider>());
         services.AddKeyedTransient<ITokenisationProvider>(ProviderNames.ChipperCash,
             (sp, _) => sp.GetRequiredService<ChipperCashTokenisationProvider>());
+        services.AddKeyedTransient<IRawCardTokenisationProvider>(ProviderNames.ChipperCash,
+            (sp, _) => sp.GetRequiredService<ChipperCashRawCardTokenisationProvider>());
 
         services.AddBhenguPaymentStartupValidation();
 

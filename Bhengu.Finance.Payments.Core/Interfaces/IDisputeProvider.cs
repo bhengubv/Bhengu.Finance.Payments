@@ -18,9 +18,13 @@ public interface IDisputeProvider
     /// <exception cref="Exceptions.ProviderUnavailableException">Provider was unreachable.</exception>
     Task<Dispute?> GetDisputeAsync(string disputeReference, CancellationToken ct = default);
 
-    /// <summary>List disputes within an optional UTC date window. Pass null bounds to omit a filter.</summary>
+    /// <summary>
+    /// List disputes within an optional UTC date window. Streamed asynchronously so a merchant with
+    /// a long dispute history doesn't materialise every dispute in one allocation; the provider
+    /// fetches pages from the upstream as the consumer enumerates.
+    /// </summary>
     /// <exception cref="Exceptions.ProviderUnavailableException">Provider was unreachable.</exception>
-    Task<IReadOnlyList<Dispute>> ListDisputesAsync(DateTime? fromUtc = null, DateTime? toUtc = null, CancellationToken ct = default);
+    IAsyncEnumerable<Dispute> ListDisputesAsync(DateTime? fromUtc = null, DateTime? toUtc = null, CancellationToken ct = default);
 
     /// <summary>
     /// Submit contesting evidence for an open dispute. After submission the dispute moves to

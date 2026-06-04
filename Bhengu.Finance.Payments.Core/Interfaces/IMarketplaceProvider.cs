@@ -23,8 +23,8 @@ public interface IMarketplaceProvider
     /// <summary>Fetch a sub-account by reference. Returns null if not found.</summary>
     Task<SubAccount?> GetSubAccountAsync(string subAccountReference, CancellationToken ct = default);
 
-    /// <summary>List all sub-accounts on the platform.</summary>
-    Task<IReadOnlyList<SubAccount>> ListSubAccountsAsync(CancellationToken ct = default);
+    /// <summary>List all sub-accounts on the platform. Streamed asynchronously.</summary>
+    IAsyncEnumerable<SubAccount> ListSubAccountsAsync(CancellationToken ct = default);
 
     /// <summary>Create a reusable split definition.</summary>
     Task<SplitDefinition> CreateSplitAsync(SplitDefinitionRequest request, CancellationToken ct = default);

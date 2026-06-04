@@ -217,12 +217,16 @@ public class OPayPaymentProviderTests
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsNull_ForUnknownEventType()
+    public async Task ParseWebhookAsync_ReturnsUnknownCategory_ForUnknownEventType()
     {
+        // OPay surfaces unrecognised but verified events as Category=Unknown so consumers can log
+        // and act on new upstream types even before the SDK is taught to classify them.
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
-        Assert.Null(await provider.ParseWebhookAsync("""
+        var evt = await provider.ParseWebhookAsync("""
             {"type":"some.weird.event","payload":{"reference":"X"}}
-            """));
+            """);
+        Assert.NotNull(evt);
+        Assert.Equal(Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.Unknown, evt!.Category);
     }
 
     [Fact]

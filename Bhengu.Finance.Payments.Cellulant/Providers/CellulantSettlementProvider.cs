@@ -3,6 +3,7 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -13,6 +14,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Settlement;
 using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -23,15 +25,14 @@ namespace Bhengu.Finance.Payments.Cellulant.Providers;
 /// <c>/settlements/v1</c> endpoints that surface per-service settlement batches and the
 /// constituent payment transactions that rolled into each batch.
 /// </summary>
-public sealed class CellulantSettlementProvider : ISettlementProvider
+public sealed class CellulantSettlementProvider : BhenguProviderBase, ISettlementProvider
 {
     private readonly HttpClient _httpClient;
     private readonly CellulantOptions _options;
-    private readonly ILogger<CellulantSettlementProvider> _logger;
     private readonly CellulantTokenBroker _tokenBroker;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Cellulant;
+    public override string ProviderName => ProviderNames.Cellulant;
 
     /// <summary>Construct the provider. Designed to be registered via DI.</summary>
     public CellulantSettlementProvider(
@@ -39,10 +40,10 @@ public sealed class CellulantSettlementProvider : ISettlementProvider
         IOptions<CellulantOptions> options,
         ILogger<CellulantSettlementProvider> logger,
         CellulantTokenBroker? tokenBroker = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _tokenBroker = tokenBroker ?? new CellulantTokenBroker(options!, new Microsoft.Extensions.Logging.Abstractions.NullLogger<CellulantTokenBroker>());
 
         if (string.IsNullOrWhiteSpace(_options.ServiceCode))
@@ -58,54 +59,60 @@ public sealed class CellulantSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+    public async IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "list_settlements");
         var path = $"settlements/v1?serviceCode={Uri.EscapeDataString(_options.ServiceCode)}&from={Uri.EscapeDataString(fromUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture))}&to={Uri.EscapeDataString(toUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture))}";
 
-        var body = await SendAuthorisedAsync(HttpMethod.Get, path, null, ct, "ListSettlements").ConfigureAwait(false);
-        var response = JsonSerializer.Deserialize<CellulantSettlementListResponse>(body);
-        activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-
-        if (response?.Data is null) return Array.Empty<Settlement>();
-        var result = new List<Settlement>(response.Data.Count);
-        foreach (var s in response.Data) result.Add(MapSettlement(s));
-        return result;
-    }
-
-    /// <inheritdoc/>
-    public async Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "get_settlement");
-        try
+        var response = await RunOperationAsync("list_settlements", async () =>
         {
-            var body = await SendAuthorisedAsync(HttpMethod.Get, $"settlements/v1/{Uri.EscapeDataString(settlementReference)}", null, ct, "GetSettlement").ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<CellulantSettlementResponse>(body);
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return response?.Settlement is { } s ? MapSettlement(s) : null;
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            var body = await SendAuthorisedAsync(HttpMethod.Get, path, null, ct, "ListSettlements").ConfigureAwait(false);
+            return JsonSerializer.Deserialize<CellulantSettlementListResponse>(body);
+        }, ct).ConfigureAwait(false);
+
+        if (response?.Data is null) yield break;
+        foreach (var s in response.Data)
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return null;
+            ct.ThrowIfCancellationRequested();
+            yield return MapSettlement(s);
         }
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
+    public Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "list_settlement_transactions");
+        return RunOperationAsync("get_settlement", async () =>
+        {
+            try
+            {
+                var body = await SendAuthorisedAsync(HttpMethod.Get, $"settlements/v1/{Uri.EscapeDataString(settlementReference)}", null, ct, "GetSettlement").ConfigureAwait(false);
+                var response = JsonSerializer.Deserialize<CellulantSettlementResponse>(body);
+                return response?.Settlement is { } s ? MapSettlement(s) : null;
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return null;
+            }
+        }, ct);
+    }
 
-        var body = await SendAuthorisedAsync(HttpMethod.Get, $"settlements/v1/{Uri.EscapeDataString(settlementReference)}/transactions", null, ct, "ListSettlementTransactions").ConfigureAwait(false);
-        var response = JsonSerializer.Deserialize<CellulantSettlementTransactionListResponse>(body);
-        activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+    /// <inheritdoc/>
+    public async IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(string settlementReference, [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(settlementReference);
 
-        if (response?.Data is null) return Array.Empty<SettlementTransaction>();
-        var result = new List<SettlementTransaction>(response.Data.Count);
-        foreach (var t in response.Data) result.Add(MapTransaction(t));
-        return result;
+        var response = await RunOperationAsync("list_settlement_transactions", async () =>
+        {
+            var body = await SendAuthorisedAsync(HttpMethod.Get, $"settlements/v1/{Uri.EscapeDataString(settlementReference)}/transactions", null, ct, "ListSettlementTransactions").ConfigureAwait(false);
+            return JsonSerializer.Deserialize<CellulantSettlementTransactionListResponse>(body);
+        }, ct).ConfigureAwait(false);
+
+        if (response?.Data is null) yield break;
+        foreach (var t in response.Data)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return MapTransaction(t);
+        }
     }
 
     private static Settlement MapSettlement(CellulantSettlementData s) => new()
@@ -143,6 +150,8 @@ public sealed class CellulantSettlementProvider : ISettlementProvider
     private async Task<string> SendAuthorisedAsync(HttpMethod method, string path, object? body, CancellationToken ct, string operation)
     {
         var token = await _tokenBroker.EnsureAccessTokenAsync(_httpClient, ct).ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
+
         using var req = new HttpRequestMessage(method, path);
         if (body is not null)
         {
@@ -151,16 +160,7 @@ public sealed class CellulantSettlementProvider : ISettlementProvider
         }
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Cellulant failed", ex);
-        }
-
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -171,7 +171,7 @@ public sealed class CellulantSettlementProvider : ISettlementProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Cellulant {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Cellulant {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

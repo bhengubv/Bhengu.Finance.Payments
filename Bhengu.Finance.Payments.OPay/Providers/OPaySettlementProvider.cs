@@ -1,13 +1,14 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Settlement;
-using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.OPay.Configuration;
 using Bhengu.Finance.Payments.OPay.Internals;
 using Microsoft.Extensions.Logging;
@@ -23,37 +24,38 @@ namespace Bhengu.Finance.Payments.OPay.Providers;
 /// OPay returns wire amounts in the smallest currency unit (kobo for NGN, piastre for EGP);
 /// the SDK divides by 100 before returning.
 /// </remarks>
-public sealed class OPaySettlementProvider : ISettlementProvider
+public sealed class OPaySettlementProvider : BhenguProviderBase, ISettlementProvider
 {
     private readonly OPayHttpClient _http;
     private readonly OPayOptions _options;
-    private readonly ILogger<OPaySettlementProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.OPay;
+    public override string ProviderName => ProviderNames.OPay;
 
     /// <summary>Construct a settlement provider. Designed to be registered via DI.</summary>
     public OPaySettlementProvider(
         HttpClient httpClient,
         IOptions<OPayOptions> options,
         ILogger<OPaySettlementProvider> logger)
+        : base(logger)
     {
         ArgumentNullException.ThrowIfNull(httpClient);
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(OPayOptions.SecretKey)} is required");
         if (string.IsNullOrWhiteSpace(_options.MerchantId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(OPayOptions.MerchantId)} is required");
 
-        _http = new OPayHttpClient(httpClient, _options, _logger);
+        _http = new OPayHttpClient(httpClient, _options, Logger);
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+    public async IAsyncEnumerable<Settlement> ListSettlementsAsync(
+        DateTime fromUtc,
+        DateTime toUtc,
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "list_settlements");
         var body = new
         {
             publicKey = _options.PublicKey,
@@ -63,45 +65,46 @@ public sealed class OPaySettlementProvider : ISettlementProvider
             pageSize = 100,
             pageNo = 1
         };
-        var json = await _http.SendAsync(HttpMethod.Post,
-            "api/v1/international/settlement/list", body, "ListSettlements", ct).ConfigureAwait(false);
+        var json = await RunOperationAsync("list_settlements",
+            () => _http.SendAsync(HttpMethod.Post,
+                "api/v1/international/settlement/list", body, "ListSettlements", ct), ct).ConfigureAwait(false);
         var resp = JsonSerializer.Deserialize<OPayResponse<OPaySettlementListData>>(json, OPayHttpClient.Json);
-        activity?.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+        if (resp?.Data?.Settlements is null) yield break;
 
-        if (resp?.Data?.Settlements is null || resp.Data.Settlements.Count == 0)
-            return Array.Empty<Settlement>();
-
-        var result = new List<Settlement>(resp.Data.Settlements.Count);
-        foreach (var s in resp.Data.Settlements) result.Add(MapSettlement(s));
-        return result;
-    }
-
-    /// <inheritdoc />
-    public async Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "get_settlement");
-        try
+        foreach (var s in resp.Data.Settlements)
         {
-            var body = new { publicKey = _options.PublicKey, sn = _options.MerchantId, settlementId = settlementReference };
-            var json = await _http.SendAsync(HttpMethod.Post,
-                "api/v1/international/settlement/query", body, "GetSettlement", ct).ConfigureAwait(false);
-            var resp = JsonSerializer.Deserialize<OPayResponse<OPaySettlementData>>(json, OPayHttpClient.Json);
-            activity?.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return resp?.Data is null ? null : MapSettlement(resp.Data);
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            activity?.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return null;
+            ct.ThrowIfCancellationRequested();
+            yield return MapSettlement(s);
         }
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
+    public Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "list_settlement_transactions");
+        return RunOperationAsync<Settlement?>("get_settlement", async () =>
+        {
+            try
+            {
+                var body = new { publicKey = _options.PublicKey, sn = _options.MerchantId, settlementId = settlementReference };
+                var json = await _http.SendAsync(HttpMethod.Post,
+                    "api/v1/international/settlement/query", body, "GetSettlement", ct).ConfigureAwait(false);
+                var resp = JsonSerializer.Deserialize<OPayResponse<OPaySettlementData>>(json, OPayHttpClient.Json);
+                return resp?.Data is null ? null : MapSettlement(resp.Data);
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return null;
+            }
+        }, ct);
+    }
+
+    /// <inheritdoc />
+    public async IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(
+        string settlementReference,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(settlementReference);
         var body = new
         {
             publicKey = _options.PublicKey,
@@ -110,17 +113,17 @@ public sealed class OPaySettlementProvider : ISettlementProvider
             pageSize = 100,
             pageNo = 1
         };
-        var json = await _http.SendAsync(HttpMethod.Post,
-            "api/v1/international/settlement/transactions", body, "ListSettlementTransactions", ct).ConfigureAwait(false);
+        var json = await RunOperationAsync("list_settlement_transactions",
+            () => _http.SendAsync(HttpMethod.Post,
+                "api/v1/international/settlement/transactions", body, "ListSettlementTransactions", ct), ct).ConfigureAwait(false);
         var resp = JsonSerializer.Deserialize<OPayResponse<OPaySettlementTransactionListData>>(json, OPayHttpClient.Json);
-        activity?.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+        if (resp?.Data?.Transactions is null) yield break;
 
-        if (resp?.Data?.Transactions is null || resp.Data.Transactions.Count == 0)
-            return Array.Empty<SettlementTransaction>();
-
-        var result = new List<SettlementTransaction>(resp.Data.Transactions.Count);
-        foreach (var t in resp.Data.Transactions) result.Add(MapTransaction(t));
-        return result;
+        foreach (var t in resp.Data.Transactions)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return MapTransaction(t);
+        }
     }
 
     private static Settlement MapSettlement(OPaySettlementData s) => new()

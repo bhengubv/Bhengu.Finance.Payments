@@ -41,6 +41,7 @@ public static class ServiceCollectionExtensions
 
         services.AddHttpClient<InterswitchPaymentProvider>();
         services.AddHttpClient<InterswitchTokenisationProvider>();
+        services.AddHttpClient<InterswitchRawCardTokenisationProvider>();
         services.AddHttpClient<InterswitchSettlementProvider>();
 
         services.AddTransient<IPaymentGatewayProvider, InterswitchPaymentProvider>(sp =>
@@ -49,6 +50,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<InterswitchPaymentProvider>());
         services.AddTransient<ITokenisationProvider, InterswitchTokenisationProvider>(sp =>
             sp.GetRequiredService<InterswitchTokenisationProvider>());
+        services.AddTransient<IRawCardTokenisationProvider, InterswitchRawCardTokenisationProvider>(sp =>
+            sp.GetRequiredService<InterswitchRawCardTokenisationProvider>());
         services.AddTransient<ISettlementProvider, InterswitchSettlementProvider>(sp =>
             sp.GetRequiredService<InterswitchSettlementProvider>());
 
@@ -58,6 +61,8 @@ public static class ServiceCollectionExtensions
             (sp, _) => sp.GetRequiredService<InterswitchPaymentProvider>());
         services.AddKeyedTransient<ITokenisationProvider>(ProviderNames.Interswitch,
             (sp, _) => sp.GetRequiredService<InterswitchTokenisationProvider>());
+        services.AddKeyedTransient<IRawCardTokenisationProvider>(ProviderNames.Interswitch,
+            (sp, _) => sp.GetRequiredService<InterswitchRawCardTokenisationProvider>());
         services.AddKeyedTransient<ISettlementProvider>(ProviderNames.Interswitch,
             (sp, _) => sp.GetRequiredService<InterswitchSettlementProvider>());
 

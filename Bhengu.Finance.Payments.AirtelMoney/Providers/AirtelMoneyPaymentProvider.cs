@@ -3,16 +3,19 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.AirtelMoney.Configuration;
 using Bhengu.Finance.Payments.AirtelMoney.Internals;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -22,19 +25,17 @@ namespace Bhengu.Finance.Payments.AirtelMoney.Providers;
 /// Airtel Money provider. Implements Collect (charge), Disbursement (payout), and Refund.
 /// Inbound callbacks are HMAC-SHA256 signed with <see cref="AirtelMoneyOptions.WebhookSecret"/>.
 /// </summary>
-public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class AirtelMoneyPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly AirtelMoneyOptions _options;
-    private readonly ILogger<AirtelMoneyPaymentProvider> _logger;
+    private readonly AirtelMoneyOAuthCache _tokenCache;
     private readonly string _baseUrl;
 
-    private string? _cachedAccessToken;
-    private DateTime _cachedTokenExpiresUtc = DateTime.MinValue;
-    private readonly SemaphoreSlim _tokenLock = new(1, 1);
+    /// <inheritdoc/>
+    public override string ProviderName => ProviderNames.AirtelMoney;
 
-    public string ProviderName => ProviderNames.AirtelMoney;
-
+    /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
         ProviderCapabilities.Refund |
@@ -42,14 +43,18 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
         ProviderCapabilities.Webhook |
         ProviderCapabilities.MobileMoney;
 
+    /// <summary>Construct the provider with a distributed OAuth cache.</summary>
     public AirtelMoneyPaymentProvider(
         HttpClient httpClient,
         IOptions<AirtelMoneyOptions> options,
-        ILogger<AirtelMoneyPaymentProvider> logger)
+        ILogger<AirtelMoneyPaymentProvider> logger,
+        IBhenguDistributedCache cache)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        ArgumentNullException.ThrowIfNull(cache);
+        _tokenCache = new AirtelMoneyOAuthCache(cache);
 
         if (string.IsNullOrWhiteSpace(_options.ClientId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(AirtelMoneyOptions.ClientId)} is required");
@@ -69,11 +74,20 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
             _httpClient.BaseAddress = new Uri(_baseUrl);
     }
 
+    /// <summary>Back-compat constructor that uses the process-local in-memory cache.</summary>
+    public AirtelMoneyPaymentProvider(
+        HttpClient httpClient,
+        IOptions<AirtelMoneyOptions> options,
+        ILogger<AirtelMoneyPaymentProvider> logger)
+        : this(httpClient, options, logger, new InMemoryBhenguDistributedCache())
+    {
+    }
+
     /// <inheritdoc/>
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return AirtelMoneyObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+        return RunChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct), ct);
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
@@ -110,7 +124,7 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
         var data = result?.Data;
         var status = MapStatus(data?.Transaction?.Status);
 
-        _logger.LogInformation(
+        Logger.LogInformation(
             "Airtel Money Collect accepted: TransactionId={TransactionId} AirtelMoneyId={AirtelMoneyId} Status={Status}",
             transactionId, data?.Transaction?.AirtelMoneyId, data?.Transaction?.Status);
 
@@ -129,7 +143,7 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return AirtelMoneyObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+        return RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct), ct);
     }
 
     private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
@@ -142,7 +156,7 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
         var result = JsonSerializer.Deserialize<AirtelEnvelope<AirtelRefundData>>(responseBody);
         var status = MapStatus(result?.Data?.Transaction?.Status);
 
-        _logger.LogInformation(
+        Logger.LogInformation(
             "Airtel Money Refund accepted: AirtelMoneyId={AirtelMoneyId} Status={Status}",
             request.GatewayReference, result?.Data?.Transaction?.Status);
 
@@ -160,7 +174,7 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return AirtelMoneyObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+        return RunPayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct), ct);
     }
 
     private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
@@ -191,7 +205,7 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
         var result = JsonSerializer.Deserialize<AirtelEnvelope<AirtelDisbursementData>>(responseBody);
         var status = MapStatus(result?.Data?.Transaction?.Status);
 
-        _logger.LogInformation(
+        Logger.LogInformation(
             "Airtel Money Disbursement accepted: TransactionId={TransactionId} Status={Status}",
             transactionId, result?.Data?.Transaction?.Status);
 
@@ -211,38 +225,24 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
+        return RunWebhookVerify(() =>
         {
-            _logger.LogWarning("Airtel Money WebhookSecret not configured — signature verification cannot succeed.");
-            AirtelMoneyObservability.RecordWebhookVerification(false);
-            return false;
-        }
+            if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
+            {
+                Logger.LogWarning("Airtel Money WebhookSecret not configured — signature verification cannot succeed.");
+                return false;
+            }
 
-        bool verified;
-        try
-        {
-            using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
-            var hash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
-            var expected = Convert.ToBase64String(hash);
-
-            verified = CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(signature),
-                Encoding.UTF8.GetBytes(expected));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Airtel Money webhook signature verification raised");
-            verified = false;
-        }
-        AirtelMoneyObservability.RecordWebhookVerification(verified);
-        return verified;
+            // Airtel returns the HMAC-SHA256 digest Base64-encoded on the webhook header.
+            return SignatureHelpers.VerifyHmacSha256(payload, signature, _options.WebhookSecret, SignatureHelpers.Encoding.Base64);
+        });
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        return AirtelMoneyObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+        return RunOperationAsync("webhook", () => ParseWebhookCoreAsync(payload, ct), ct);
     }
 
     private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
@@ -258,7 +258,7 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
             var eventType = (evt!.EventType ?? txn.StatusCode ?? "unknown").ToLowerInvariant();
             var gatewayReference = txn.AirtelMoneyId ?? txn.Id;
 
-            _logger.LogInformation(
+            Logger.LogInformation(
                 "Parsed Airtel Money webhook: TransactionId={TransactionId} Status={Status} EventType={EventType}",
                 txn.Id, txn.StatusCode, eventType);
 
@@ -272,13 +272,13 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
             {
                 if (status == PaymentStatus.Completed)
                 {
-                    return Task.FromResult<WebhookEvent?>(new Bhengu.Finance.Payments.Core.Models.Webhooks.PayoutCompletedEvent
+                    return Task.FromResult<WebhookEvent?>(new PayoutCompletedEvent
                     {
                         GatewayReference = gatewayReference,
                         PayoutReference = gatewayReference,
                         Status = status,
                         EventType = eventType,
-                        Category = Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.PayoutCompleted,
+                        Category = WebhookEventCategory.PayoutCompleted,
                         Amount = 0m,
                         Currency = _options.Currency
                     });
@@ -286,13 +286,13 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
 
                 if (status == PaymentStatus.Failed)
                 {
-                    return Task.FromResult<WebhookEvent?>(new Bhengu.Finance.Payments.Core.Models.Webhooks.PayoutFailedEvent
+                    return Task.FromResult<WebhookEvent?>(new PayoutFailedEvent
                     {
                         GatewayReference = gatewayReference,
                         PayoutReference = gatewayReference,
                         Status = status,
                         EventType = eventType,
-                        Category = Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.PayoutFailed,
+                        Category = WebhookEventCategory.PayoutFailed,
                         Amount = 0m,
                         Currency = _options.Currency,
                         FailureCode = txn.StatusCode,
@@ -301,16 +301,25 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
                 }
             }
 
+            var category = status switch
+            {
+                PaymentStatus.Completed => WebhookEventCategory.ChargeSucceeded,
+                PaymentStatus.Pending => WebhookEventCategory.ChargePending,
+                PaymentStatus.Failed => WebhookEventCategory.ChargeFailed,
+                _ => WebhookEventCategory.Unknown
+            };
+
             return Task.FromResult<WebhookEvent?>(new WebhookEvent
             {
                 GatewayReference = gatewayReference,
                 Status = status,
-                EventType = eventType
+                EventType = eventType,
+                Category = category
             });
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse Airtel Money webhook payload");
+            Logger.LogError(ex, "Failed to parse Airtel Money webhook payload");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -327,20 +336,12 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
         };
 
         var token = await GetAccessTokenAsync(ct).ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         req.Headers.Add("X-Country", _options.Country);
         req.Headers.Add("X-Currency", _options.Currency);
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, $"HTTP request to Airtel Money ({operation}) failed", ex);
-        }
-
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -351,9 +352,9 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Airtel Money {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Airtel Money {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
-                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
+                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
         }
 
@@ -362,14 +363,14 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
 
     private async Task<string> GetAccessTokenAsync(CancellationToken ct)
     {
-        if (_cachedAccessToken is not null && _cachedTokenExpiresUtc > DateTime.UtcNow.AddMinutes(1))
-            return _cachedAccessToken;
+        var cached = await _tokenCache.GetAsync(_options.ClientId, ct).ConfigureAwait(false);
+        if (cached is not null) return cached;
 
-        await _tokenLock.WaitAsync(ct).ConfigureAwait(false);
+        await _tokenCache.WaitFetchSlotAsync(ct).ConfigureAwait(false);
         try
         {
-            if (_cachedAccessToken is not null && _cachedTokenExpiresUtc > DateTime.UtcNow.AddMinutes(1))
-                return _cachedAccessToken;
+            cached = await _tokenCache.GetAsync(_options.ClientId, ct).ConfigureAwait(false);
+            if (cached is not null) return cached;
 
             var body = new
             {
@@ -383,20 +384,11 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
                 Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json")
             };
 
-            HttpResponseMessage response;
-            try
-            {
-                response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-            }
-            catch (HttpRequestException ex)
-            {
-                throw new ProviderUnavailableException(ProviderName, "Airtel Money OAuth call failed", ex);
-            }
-
+            var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
             var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
             {
-                _logger.LogError("Airtel Money OAuth failed: {StatusCode} {Body}", response.StatusCode, responseBody);
+                Logger.LogError("Airtel Money OAuth failed: {StatusCode} {Body}", response.StatusCode, responseBody);
                 throw new ProviderUnavailableException(ProviderName, $"Airtel Money OAuth HTTP {(int)response.StatusCode}: {responseBody}");
             }
 
@@ -404,13 +396,13 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
             if (token is null || string.IsNullOrEmpty(token.AccessToken))
                 throw new ProviderUnavailableException(ProviderName, "Airtel Money OAuth returned an empty token");
 
-            _cachedAccessToken = token.AccessToken;
-            _cachedTokenExpiresUtc = DateTime.UtcNow.AddSeconds(token.ExpiresIn > 0 ? token.ExpiresIn : 3599);
-            return _cachedAccessToken;
+            var ttl = TimeSpan.FromSeconds(Math.Max(60, (token.ExpiresIn > 0 ? token.ExpiresIn : 3599) - 60));
+            await _tokenCache.SetAsync(_options.ClientId, token.AccessToken, ttl, ct).ConfigureAwait(false);
+            return token.AccessToken;
         }
         finally
         {
-            _tokenLock.Release();
+            _tokenCache.ReleaseFetchSlot();
         }
     }
 

@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Validation;
@@ -35,6 +36,7 @@ public static class ServiceCollectionExtensions
         if (string.IsNullOrWhiteSpace(probe.Passkey))
             throw new ProviderConfigurationException("mpesa", $"{MPesaOptions.ConfigSection}:Passkey is required");
 
+        services.AddBhenguInMemoryCache();
         services.AddHttpClient<MPesaPaymentProvider>();
         services.AddHttpClient<MPesaPayoutProvider>();
         services.AddTransient<IPaymentGatewayProvider, MPesaPaymentProvider>(sp =>

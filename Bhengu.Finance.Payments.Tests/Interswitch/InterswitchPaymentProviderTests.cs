@@ -218,12 +218,16 @@ public class InterswitchPaymentProviderTests
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsNull_ForUnknownEventType()
+    public async Task ParseWebhookAsync_ReturnsUnknownCategory_ForUnknownEventType()
     {
+        // Interswitch surfaces unrecognised but verified events as Category=Unknown so consumers can log
+        // and act on new upstream types even before the SDK is taught to classify them.
         var provider = Create(TokenThen(_ => new HttpResponseMessage(HttpStatusCode.OK)));
-        Assert.Null(await provider.ParseWebhookAsync("""
+        var evt = await provider.ParseWebhookAsync("""
             {"eventType":"some.unknown.event","data":{"transactionRef":"X"}}
-            """));
+            """);
+        Assert.NotNull(evt);
+        Assert.Equal(Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.Unknown, evt!.Category);
     }
 
     [Fact]

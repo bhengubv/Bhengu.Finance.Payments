@@ -1,9 +1,11 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using System.Runtime.CompilerServices;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Settlement;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Stripe.Configuration;
 using Bhengu.Finance.Payments.Stripe.Internals;
 using Microsoft.Extensions.Logging;
@@ -19,24 +21,23 @@ namespace Bhengu.Finance.Payments.Stripe.Providers;
 /// <c>BalanceTransaction</c> records joined back to that payout. This provider folds the two
 /// resources into the unified <see cref="Settlement"/> contract.
 /// </summary>
-public sealed class StripeSettlementProvider : ISettlementProvider
+public sealed class StripeSettlementProvider : BhenguProviderBase, ISettlementProvider
 {
     private readonly StripeOptions _options;
-    private readonly ILogger<StripeSettlementProvider> _logger;
     private readonly IStripeClient _stripeClient;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Stripe;
+    public override string ProviderName => ProviderNames.Stripe;
 
     /// <summary>Construct the provider. Throws <see cref="ProviderConfigurationException"/> if <see cref="StripeOptions.SecretKey"/> is unset.</summary>
     public StripeSettlementProvider(
         HttpClient httpClient,
         IOptions<StripeOptions> options,
         ILogger<StripeSettlementProvider> logger)
+        : base(logger)
     {
         ArgumentNullException.ThrowIfNull(httpClient);
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(StripeOptions.SecretKey)} is required");
@@ -48,33 +49,51 @@ public sealed class StripeSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc />
-    public Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
-        => StripeObservability.ObserveAsync("list_settlements", () => ListSettlementsCoreAsync(fromUtc, toUtc, ct));
-
-    private async Task<IReadOnlyList<Settlement>> ListSettlementsCoreAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct)
+    public async IAsyncEnumerable<Settlement> ListSettlementsAsync(
+        DateTime fromUtc,
+        DateTime toUtc,
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
+        var service = new PayoutService(_stripeClient);
+        var listOptions = new PayoutListOptions
+        {
+            Limit = 100,
+            ArrivalDate = new DateRangeOptions
+            {
+                GreaterThanOrEqual = fromUtc,
+                LessThanOrEqual = toUtc
+            }
+        };
+
+        // Manual enumerator so we can translate StripeException → canonical hierarchy
+        // around MoveNextAsync. `try`/`catch` cannot wrap `yield return` inside an iterator.
+        var enumerator = service.ListAutoPagingAsync(listOptions, cancellationToken: ct)
+            .GetAsyncEnumerator(ct);
         try
         {
-            var service = new PayoutService(_stripeClient);
-            var listOptions = new PayoutListOptions
+            while (true)
             {
-                Limit = 100,
-                ArrivalDate = new DateRangeOptions
+                Payout? current;
+                try
                 {
-                    GreaterThanOrEqual = fromUtc,
-                    LessThanOrEqual = toUtc
+                    if (!await enumerator.MoveNextAsync().ConfigureAwait(false)) yield break;
+                    current = enumerator.Current;
                 }
-            };
-            var page = await service.ListAsync(listOptions, cancellationToken: ct).ConfigureAwait(false);
-            return page.Data.Select(Map).ToList();
+                catch (StripeException ex)
+                {
+                    throw StripeExceptionTranslator.Translate(ex, ProviderName, "ListSettlements", Logger);
+                }
+                catch (HttpRequestException ex)
+                {
+                    throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
+                }
+                ct.ThrowIfCancellationRequested();
+                yield return Map(current);
+            }
         }
-        catch (StripeException ex)
+        finally
         {
-            throw TranslateException(ex, "ListSettlements");
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
+            await enumerator.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -82,58 +101,66 @@ public sealed class StripeSettlementProvider : ISettlementProvider
     public Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-        return StripeObservability.ObserveAsync("get_settlement", () => GetSettlementCoreAsync(settlementReference, ct));
-    }
-
-    private async Task<Settlement?> GetSettlementCoreAsync(string settlementReference, CancellationToken ct)
-    {
-        try
+        return RunOperationAsync("get_settlement", async () =>
         {
-            var service = new PayoutService(_stripeClient);
-            var payout = await service.GetAsync(settlementReference, cancellationToken: ct).ConfigureAwait(false);
-            return Map(payout);
-        }
-        catch (StripeException ex) when (ex.HttpStatusCode == System.Net.HttpStatusCode.NotFound)
-        {
-            return null;
-        }
-        catch (StripeException ex)
-        {
-            throw TranslateException(ex, "GetSettlement");
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
-        }
+            try
+            {
+                var service = new PayoutService(_stripeClient);
+                var payout = await service.GetAsync(settlementReference, cancellationToken: ct).ConfigureAwait(false);
+                return (Settlement?)Map(payout);
+            }
+            catch (StripeException ex) when (ex.HttpStatusCode == System.Net.HttpStatusCode.NotFound)
+            {
+                return null;
+            }
+            catch (StripeException ex)
+            {
+                throw StripeExceptionTranslator.Translate(ex, ProviderName, "GetSettlement", Logger);
+            }
+        }, ct);
     }
 
     /// <inheritdoc />
-    public Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
+    public async IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(
+        string settlementReference,
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-        return StripeObservability.ObserveAsync("list_settlement_transactions", () => ListTransactionsCoreAsync(settlementReference, ct));
-    }
 
-    private async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsCoreAsync(string settlementReference, CancellationToken ct)
-    {
+        var service = new BalanceTransactionService(_stripeClient);
+        var listOptions = new BalanceTransactionListOptions
+        {
+            Payout = settlementReference,
+            Limit = 100
+        };
+
+        var enumerator = service.ListAutoPagingAsync(listOptions, cancellationToken: ct)
+            .GetAsyncEnumerator(ct);
         try
         {
-            var service = new BalanceTransactionService(_stripeClient);
-            var listOptions = new BalanceTransactionListOptions
+            while (true)
             {
-                Payout = settlementReference,
-                Limit = 100
-            };
-            var page = await service.ListAsync(listOptions, cancellationToken: ct).ConfigureAwait(false);
-            return page.Data.Select(MapTx).ToList();
+                BalanceTransaction? current;
+                try
+                {
+                    if (!await enumerator.MoveNextAsync().ConfigureAwait(false)) yield break;
+                    current = enumerator.Current;
+                }
+                catch (StripeException ex)
+                {
+                    throw StripeExceptionTranslator.Translate(ex, ProviderName, "ListTransactions", Logger);
+                }
+                catch (HttpRequestException ex)
+                {
+                    throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
+                }
+                ct.ThrowIfCancellationRequested();
+                yield return MapTx(current);
+            }
         }
-        catch (StripeException ex)
+        finally
         {
-            throw TranslateException(ex, "ListSettlementTransactions");
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
+            await enumerator.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -172,22 +199,4 @@ public sealed class StripeSettlementProvider : ISettlementProvider
         _ when (type?.Contains("dispute", StringComparison.OrdinalIgnoreCase) ?? false) => SettlementTransactionKind.Chargeback,
         _ => SettlementTransactionKind.Other
     };
-
-    private BhenguPaymentException TranslateException(StripeException ex, string operation)
-    {
-        var httpStatus = (int)ex.HttpStatusCode;
-        var errorCode = ex.StripeError?.Code ?? ex.HttpStatusCode.ToString();
-        var errorMessage = ex.StripeError?.Message ?? ex.Message;
-
-        _logger.LogError(ex, "Stripe {Operation} failed: {HttpStatus} {Code} {Message}",
-            operation, httpStatus, errorCode, errorMessage);
-
-        if (httpStatus == 429)
-            return new ProviderRateLimitException(ProviderName, providerErrorMessage: errorMessage, innerException: ex);
-
-        if (httpStatus is >= 400 and < 500)
-            return new PaymentDeclinedException(ProviderName, errorCode, errorMessage, ex);
-
-        return new ProviderUnavailableException(ProviderName, $"HTTP {httpStatus}: {errorMessage}", ex);
-    }
 }

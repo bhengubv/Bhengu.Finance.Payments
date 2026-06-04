@@ -5,6 +5,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.ThreeDSecure;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Stripe.Configuration;
 using Bhengu.Finance.Payments.Stripe.Internals;
 using Microsoft.Extensions.Logging;
@@ -18,24 +19,23 @@ namespace Bhengu.Finance.Payments.Stripe.Providers;
 /// with <c>request_three_d_secure = "any"</c>. The PaymentIntent's <c>next_action</c>
 /// (<c>redirect_to_url</c>) is surfaced as the challenge URL.
 /// </summary>
-public sealed class StripeThreeDSecureProvider : IThreeDSecureProvider
+public sealed class StripeThreeDSecureProvider : BhenguProviderBase, IThreeDSecureProvider
 {
     private readonly StripeOptions _options;
-    private readonly ILogger<StripeThreeDSecureProvider> _logger;
     private readonly IStripeClient _stripeClient;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Stripe;
+    public override string ProviderName => ProviderNames.Stripe;
 
     /// <summary>Construct the provider. Throws <see cref="ProviderConfigurationException"/> if <see cref="StripeOptions.SecretKey"/> is unset.</summary>
     public StripeThreeDSecureProvider(
         HttpClient httpClient,
         IOptions<StripeOptions> options,
         ILogger<StripeThreeDSecureProvider> logger)
+        : base(logger)
     {
         ArgumentNullException.ThrowIfNull(httpClient);
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(StripeOptions.SecretKey)} is required");
@@ -50,72 +50,60 @@ public sealed class StripeThreeDSecureProvider : IThreeDSecureProvider
     public Task<ThreeDSecureChallenge> StartAuthenticationAsync(PaymentRequest chargeIntent, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(chargeIntent);
-        return StripeObservability.ObserveAsync("start_3ds", () => StartAuthenticationCoreAsync(chargeIntent, ct));
-    }
-
-    private async Task<ThreeDSecureChallenge> StartAuthenticationCoreAsync(PaymentRequest chargeIntent, CancellationToken ct)
-    {
-        var requestOptions = BuildRequestOptions(chargeIntent.IdempotencyKey);
-        try
+        return RunOperationAsync("start_3ds", async () =>
         {
-            var service = new PaymentIntentService(_stripeClient);
-            var options = new PaymentIntentCreateOptions
+            var requestOptions = BuildRequestOptions(chargeIntent.IdempotencyKey);
+            try
             {
-                Amount = (long)(chargeIntent.Amount * 100),
-                Currency = chargeIntent.Currency.ToLowerInvariant(),
-                PaymentMethod = chargeIntent.PaymentMethodToken,
-                Customer = chargeIntent.CustomerId,
-                Description = chargeIntent.Description,
-                ConfirmationMethod = "manual",
-                Confirm = true,
-                PaymentMethodOptions = new PaymentIntentPaymentMethodOptionsOptions
+                var service = new PaymentIntentService(_stripeClient);
+                var options = new PaymentIntentCreateOptions
                 {
-                    Card = new PaymentIntentPaymentMethodOptionsCardOptions
+                    Amount = (long)(chargeIntent.Amount * 100),
+                    Currency = chargeIntent.Currency.ToLowerInvariant(),
+                    PaymentMethod = chargeIntent.PaymentMethodToken,
+                    Customer = chargeIntent.CustomerId,
+                    Description = chargeIntent.Description,
+                    ConfirmationMethod = "manual",
+                    Confirm = true,
+                    PaymentMethodOptions = new PaymentIntentPaymentMethodOptionsOptions
                     {
-                        RequestThreeDSecure = "any"
-                    }
-                },
-                Metadata = chargeIntent.Metadata?.ToDictionary(k => k.Key, v => v.Value)
-            };
+                        Card = new PaymentIntentPaymentMethodOptionsCardOptions
+                        {
+                            RequestThreeDSecure = "any"
+                        }
+                    },
+                    Metadata = chargeIntent.Metadata?.ToDictionary(k => k.Key, v => v.Value)
+                };
 
-            var intent = await service.CreateAsync(options, requestOptions, ct).ConfigureAwait(false);
-            _logger.LogInformation("Stripe 3DS PaymentIntent created: {Id} status={Status}", intent.Id, intent.Status);
+                var intent = await service.CreateAsync(options, requestOptions, ct).ConfigureAwait(false);
+                Logger.LogInformation("Stripe 3DS PaymentIntent created: {Id} status={Status}", intent.Id, intent.Status);
 
-            return MapChallenge(intent);
-        }
-        catch (StripeException ex)
-        {
-            throw TranslateException(ex, "Start3DS");
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
-        }
+                return MapChallenge(intent);
+            }
+            catch (StripeException ex)
+            {
+                throw StripeExceptionTranslator.Translate(ex, ProviderName, "Start3DS", Logger);
+            }
+        }, ct);
     }
 
     /// <inheritdoc />
     public Task<ThreeDSecureChallenge> GetChallengeAsync(string challengeReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(challengeReference);
-        return StripeObservability.ObserveAsync("get_3ds_challenge", () => GetChallengeCoreAsync(challengeReference, ct));
-    }
-
-    private async Task<ThreeDSecureChallenge> GetChallengeCoreAsync(string challengeReference, CancellationToken ct)
-    {
-        try
+        return RunOperationAsync("get_3ds_challenge", async () =>
         {
-            var service = new PaymentIntentService(_stripeClient);
-            var intent = await service.GetAsync(challengeReference, cancellationToken: ct).ConfigureAwait(false);
-            return MapChallenge(intent);
-        }
-        catch (StripeException ex)
-        {
-            throw TranslateException(ex, "Get3DS");
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
-        }
+            try
+            {
+                var service = new PaymentIntentService(_stripeClient);
+                var intent = await service.GetAsync(challengeReference, cancellationToken: ct).ConfigureAwait(false);
+                return MapChallenge(intent);
+            }
+            catch (StripeException ex)
+            {
+                throw StripeExceptionTranslator.Translate(ex, ProviderName, "Get3DS", Logger);
+            }
+        }, ct);
     }
 
     private static ThreeDSecureChallenge MapChallenge(PaymentIntent intent) => new()
@@ -142,22 +130,4 @@ public sealed class StripeThreeDSecureProvider : IThreeDSecureProvider
 
     private static RequestOptions? BuildRequestOptions(string? idempotencyKey) =>
         string.IsNullOrEmpty(idempotencyKey) ? null : new RequestOptions { IdempotencyKey = idempotencyKey };
-
-    private BhenguPaymentException TranslateException(StripeException ex, string operation)
-    {
-        var httpStatus = (int)ex.HttpStatusCode;
-        var errorCode = ex.StripeError?.Code ?? ex.HttpStatusCode.ToString();
-        var errorMessage = ex.StripeError?.Message ?? ex.Message;
-
-        _logger.LogError(ex, "Stripe {Operation} failed: {HttpStatus} {Code} {Message}",
-            operation, httpStatus, errorCode, errorMessage);
-
-        if (httpStatus == 429)
-            return new ProviderRateLimitException(ProviderName, providerErrorMessage: errorMessage, innerException: ex);
-
-        if (httpStatus is >= 400 and < 500)
-            return new PaymentDeclinedException(ProviderName, errorCode, errorMessage, ex);
-
-        return new ProviderUnavailableException(ProviderName, $"HTTP {httpStatus}: {errorMessage}", ex);
-    }
 }

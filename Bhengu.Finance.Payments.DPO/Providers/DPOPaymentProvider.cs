@@ -13,6 +13,7 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.DPO.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -25,16 +26,15 @@ namespace Bhengu.Finance.Payments.DPO.Providers;
 /// createTransferToken (disbursement) endpoints. Callbacks are unsigned — webhook authenticity
 /// must be established by calling verifyToken against the supplied TransToken.
 /// </summary>
-public sealed class DPOPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class DPOPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly DPOOptions _options;
-    private readonly ILogger<DPOPaymentProvider> _logger;
     private readonly IBhenguDistributedCache _cache;
     private static readonly TimeSpan s_idempotencyTtl = TimeSpan.FromHours(24);
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.DPO;
+    public override string ProviderName => ProviderNames.DPO;
 
     /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
@@ -55,10 +55,10 @@ public sealed class DPOPaymentProvider : IPaymentGatewayProvider, IPayoutProvide
         IOptions<DPOOptions> options,
         ILogger<DPOPaymentProvider> logger,
         IBhenguDistributedCache? cache = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _cache = cache ?? new InMemoryBhenguDistributedCache();
 
         if (string.IsNullOrWhiteSpace(_options.CompanyToken))
@@ -74,21 +74,13 @@ public sealed class DPOPaymentProvider : IPaymentGatewayProvider, IPayoutProvide
     }
 
     /// <inheritdoc/>
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
-        var startedAt = DateTime.UtcNow;
-        var outcomeTag = BhenguPaymentDiagnostics.Outcomes.Error;
-        try
+        return RunChargeAsync(request.Currency, async () =>
         {
             var cached = await TryGetCachedAsync<PaymentResponse>(request.IdempotencyKey, "charge", ct).ConfigureAwait(false);
-            if (cached is not null)
-            {
-                outcomeTag = BhenguPaymentDiagnostics.Outcomes.Success;
-                return cached;
-            }
+            if (cached is not null) return cached;
 
             var customerEmail = request.Metadata?.GetValueOrDefault("email") ?? string.Empty;
             var customerFirstName = request.Metadata?.GetValueOrDefault("firstName") ?? string.Empty;
@@ -124,14 +116,11 @@ public sealed class DPOPaymentProvider : IPaymentGatewayProvider, IPayoutProvide
             var body = await SendAsync(HttpMethod.Post, "api/v6/", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<DPOCreateTokenResponse>(body);
 
-            _logger.LogInformation("DPO createToken returned: {Token} result={Result}", response?.TransToken, response?.Result);
+            Logger.LogInformation("DPO createToken returned: {Token} result={Result}", response?.TransToken, response?.Result);
 
             // DPO Result code "000" means success; any other code is an error from the API itself.
             if (response?.Result != "000" && !string.IsNullOrEmpty(response?.Result))
-            {
-                outcomeTag = BhenguPaymentDiagnostics.Outcomes.Declined;
                 throw new PaymentDeclinedException(ProviderName, response.Result, response.ResultExplanation);
-            }
 
             var pr = new PaymentResponse
             {
@@ -144,41 +133,19 @@ public sealed class DPOPaymentProvider : IPaymentGatewayProvider, IPayoutProvide
                 RedirectUrl = string.IsNullOrEmpty(response?.TransToken) ? null : $"{_httpClient.BaseAddress}payv3.php?ID={response.TransToken}"
             };
 
-            outcomeTag = BhenguPaymentDiagnostics.Outcomes.Pending;
             await TrySetCachedAsync(request.IdempotencyKey, "charge", pr, ct).ConfigureAwait(false);
             return pr;
-        }
-        catch (PaymentDeclinedException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        finally
-        {
-            activity.SetOutcome(outcomeTag);
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcomeTag));
-            BhenguPaymentDiagnostics.ChargeDurationMs.Record(
-                (DateTime.UtcNow - startedAt).TotalMilliseconds,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcomeTag));
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
-        var outcomeTag = BhenguPaymentDiagnostics.Outcomes.Error;
-        try
+        return RunRefundAsync(request.GatewayReference, async () =>
         {
             var cached = await TryGetCachedAsync<RefundResponse>(request.IdempotencyKey, "refund", ct).ConfigureAwait(false);
-            if (cached is not null)
-            {
-                outcomeTag = BhenguPaymentDiagnostics.Outcomes.Success;
-                return cached;
-            }
+            if (cached is not null) return cached;
 
             var requestBody = new
             {
@@ -192,7 +159,7 @@ public sealed class DPOPaymentProvider : IPaymentGatewayProvider, IPayoutProvide
             var body = await SendAsync(HttpMethod.Post, "api/v6/", requestBody, ct, "ProcessRefund").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<DPOResultResponse>(body);
 
-            _logger.LogInformation("DPO refundToken returned: {Result} {Explanation}", response?.Result, response?.ResultExplanation);
+            Logger.LogInformation("DPO refundToken returned: {Result} {Explanation}", response?.Result, response?.ResultExplanation);
 
             RefundResponse rr;
             if (response?.Result != "000" && !string.IsNullOrEmpty(response?.Result))
@@ -205,7 +172,6 @@ public sealed class DPOPaymentProvider : IPaymentGatewayProvider, IPayoutProvide
                     ProcessedAt = DateTime.UtcNow,
                     Message = response.ResultExplanation
                 };
-                outcomeTag = BhenguPaymentDiagnostics.Outcomes.Declined;
             }
             else
             {
@@ -217,39 +183,21 @@ public sealed class DPOPaymentProvider : IPaymentGatewayProvider, IPayoutProvide
                     ProcessedAt = DateTime.UtcNow,
                     Message = response?.ResultExplanation
                 };
-                outcomeTag = BhenguPaymentDiagnostics.Outcomes.Success;
             }
 
             await TrySetCachedAsync(request.IdempotencyKey, "refund", rr, ct).ConfigureAwait(false);
             return rr;
-        }
-        catch (PaymentDeclinedException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        finally
-        {
-            activity.SetOutcome(outcomeTag);
-            BhenguPaymentDiagnostics.RefundsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcomeTag));
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, request.Currency);
-        var outcomeTag = BhenguPaymentDiagnostics.Outcomes.Error;
-        try
+        return RunPayoutAsync(request.Currency, async () =>
         {
             var cached = await TryGetCachedAsync<PayoutResponse>(request.IdempotencyKey, "payout", ct).ConfigureAwait(false);
-            if (cached is not null)
-            {
-                outcomeTag = BhenguPaymentDiagnostics.Outcomes.Success;
-                return cached;
-            }
+            if (cached is not null) return cached;
 
             var beneficiaryReference = request.Metadata?.GetValueOrDefault("beneficiaryReference") ?? request.DestinationToken;
             var bankCode = request.Metadata?.GetValueOrDefault("bankCode") ?? string.Empty;
@@ -275,13 +223,10 @@ public sealed class DPOPaymentProvider : IPaymentGatewayProvider, IPayoutProvide
             var body = await SendAsync(HttpMethod.Post, "api/v6/", requestBody, ct, "ProcessPayout").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<DPOTransferResponse>(body);
 
-            _logger.LogInformation("DPO createTransferToken returned: {Token} result={Result}", response?.TransferToken, response?.Result);
+            Logger.LogInformation("DPO createTransferToken returned: {Token} result={Result}", response?.TransferToken, response?.Result);
 
             if (response?.Result != "000" && !string.IsNullOrEmpty(response?.Result))
-            {
-                outcomeTag = BhenguPaymentDiagnostics.Outcomes.Declined;
                 throw new PaymentDeclinedException(ProviderName, response.Result, response.ResultExplanation);
-            }
 
             var pr = new PayoutResponse
             {
@@ -292,20 +237,9 @@ public sealed class DPOPaymentProvider : IPaymentGatewayProvider, IPayoutProvide
                 ProcessedAt = DateTime.UtcNow
             };
 
-            outcomeTag = BhenguPaymentDiagnostics.Outcomes.Pending;
             await TrySetCachedAsync(request.IdempotencyKey, "payout", pr, ct).ConfigureAwait(false);
             return pr;
-        }
-        catch (PaymentDeclinedException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        finally
-        {
-            activity.SetOutcome(outcomeTag);
-            BhenguPaymentDiagnostics.PayoutsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcomeTag));
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>
@@ -314,7 +248,7 @@ public sealed class DPOPaymentProvider : IPaymentGatewayProvider, IPayoutProvide
         // DPO does NOT sign callbacks. Authenticity must be established by calling verifyToken
         // against the TransID from the callback (use the verifyToken endpoint in production code).
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        _logger.LogWarning("DPO does not sign callbacks — authenticity must be established via verifyToken.");
+        Logger.LogWarning("DPO does not sign callbacks — authenticity must be established via verifyToken.");
         return !string.IsNullOrEmpty(signature);
     }
 
@@ -333,7 +267,7 @@ public sealed class DPOPaymentProvider : IPaymentGatewayProvider, IPayoutProvide
                 return Task.FromResult<WebhookEvent?>(null);
             }
 
-            _logger.LogInformation("Parsed DPO callback: TransID={TransID} Status={Status}",
+            Logger.LogInformation("Parsed DPO callback: TransID={TransID} Status={Status}",
                 webhookEvent.TransID, webhookEvent.TransactionFinalStatus);
 
             var typed = MapWebhookEvent(webhookEvent);
@@ -342,7 +276,7 @@ public sealed class DPOPaymentProvider : IPaymentGatewayProvider, IPayoutProvide
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse DPO webhook event");
+            Logger.LogError(ex, "Failed to parse DPO webhook event");
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
             return Task.FromResult<WebhookEvent?>(null);
         }
@@ -453,16 +387,7 @@ public sealed class DPOPaymentProvider : IPaymentGatewayProvider, IPayoutProvide
             Content = new StringContent(json, Encoding.UTF8, "application/json")
         };
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to DPO failed", ex);
-        }
-
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -473,7 +398,7 @@ public sealed class DPOPaymentProvider : IPaymentGatewayProvider, IPayoutProvide
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("DPO {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("DPO {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

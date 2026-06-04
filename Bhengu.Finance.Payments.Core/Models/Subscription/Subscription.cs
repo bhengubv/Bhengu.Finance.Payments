@@ -30,4 +30,12 @@ public sealed record Subscription
 
     /// <summary>Number of cycles billed to date.</summary>
     public int CyclesCompleted { get; init; }
+
+    /// <summary>
+    /// Set when the provider requires the payer to authorise via redirect before the subscription
+    /// becomes active — e.g. PayFast's hosted-page recurring-token flow, MercadoPago Preapproval
+    /// pending-approval URL. Consumers redirect the payer here; status updates arrive via webhook.
+    /// Null for providers whose subscription creation completes server-side.
+    /// </summary>
+    public string? AuthorisationUrl { get; init; }
 }

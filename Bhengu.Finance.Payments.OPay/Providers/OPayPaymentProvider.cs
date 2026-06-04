@@ -12,7 +12,8 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
-using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.OPay.Configuration;
 using Bhengu.Finance.Payments.OPay.Internals;
 using Microsoft.Extensions.Logging;
@@ -25,18 +26,17 @@ namespace Bhengu.Finance.Payments.OPay.Providers;
 /// cashier, refund and payout REST APIs. Requests are HMAC-SHA512 signed with the merchant
 /// SecretKey and the signature is carried in the <c>Authorization</c> header.
 /// </summary>
-public sealed class OPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class OPayPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private const string ProductionBaseUrl = "https://liveapi.opaycheckout.com";
     private const string SandboxBaseUrl = "https://sandboxapi.opaycheckout.com";
 
     private readonly HttpClient _httpClient;
     private readonly OPayOptions _options;
-    private readonly ILogger<OPayPaymentProvider> _logger;
     private readonly OPayIdempotencyCache? _idempotency;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.OPay;
+    public override string ProviderName => ProviderNames.OPay;
 
     /// <inheritdoc />
     public ProviderCapabilities Capabilities =>
@@ -60,10 +60,10 @@ public sealed class OPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvid
         IOptions<OPayOptions> options,
         ILogger<OPayPaymentProvider> logger,
         OPayIdempotencyCache? idempotency = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotency = idempotency;
 
         if (string.IsNullOrWhiteSpace(_options.PublicKey))
@@ -88,87 +88,63 @@ public sealed class OPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvid
     {
         ArgumentNullException.ThrowIfNull(request);
         return _idempotency is null
-            ? ProcessPaymentCoreAsync(request, ct)
+            ? RunChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct), ct)
             : _idempotency.GetOrAddAsync(request.IdempotencyKey, "charge",
-                () => ProcessPaymentCoreAsync(request, ct), ct);
+                () => RunChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct), ct), ct);
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
     {
-        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
-        try
-        {
-            var reference = request.Metadata?.GetValueOrDefault("reference") ?? request.IdempotencyKey ?? $"opay-{Guid.NewGuid():N}";
-            var userId = request.Metadata?.GetValueOrDefault("userId") ?? "anonymous";
-            var userEmail = request.Metadata?.GetValueOrDefault("userEmail") ?? "noreply@bhengu.example";
-            var userMobile = request.Metadata?.GetValueOrDefault("userMobile") ?? string.Empty;
-            var userName = request.Metadata?.GetValueOrDefault("userName") ?? "Bhengu Customer";
+        var reference = request.Metadata?.GetValueOrDefault("reference") ?? request.IdempotencyKey ?? $"opay-{Guid.NewGuid():N}";
+        var userId = request.Metadata?.GetValueOrDefault("userId") ?? "anonymous";
+        var userEmail = request.Metadata?.GetValueOrDefault("userEmail") ?? "noreply@bhengu.example";
+        var userMobile = request.Metadata?.GetValueOrDefault("userMobile") ?? string.Empty;
+        var userName = request.Metadata?.GetValueOrDefault("userName") ?? "Bhengu Customer";
 
-            var amountTotal = (long)(request.Amount * 100);
-            var requestBody = new
+        var amountTotal = (long)(request.Amount * 100);
+        var requestBody = new
+        {
+            publicKey = _options.PublicKey,
+            country = _options.Country,
+            reference,
+            amount = new { total = amountTotal, currency = request.Currency.ToUpperInvariant() },
+            returnUrl = _options.ReturnUrl,
+            callbackUrl = _options.CallbackUrl,
+            expireAt = 30,
+            sn = _options.MerchantId,
+            productList = new[]
             {
-                publicKey = _options.PublicKey,
-                country = _options.Country,
-                reference,
-                amount = new { total = amountTotal, currency = request.Currency.ToUpperInvariant() },
-                returnUrl = _options.ReturnUrl,
-                callbackUrl = _options.CallbackUrl,
-                expireAt = 30,
-                sn = _options.MerchantId,
-                productList = new[]
+                new
                 {
-                    new
-                    {
-                        name = request.Description,
-                        description = request.Description,
-                        quantity = 1,
-                        price = amountTotal,
-                        currency = request.Currency.ToUpperInvariant()
-                    }
-                },
-                userInfo = new { userId, userEmail, userMobile, userName },
-                payMethod = request.PaymentMethodToken
-            };
+                    name = request.Description,
+                    description = request.Description,
+                    quantity = 1,
+                    price = amountTotal,
+                    currency = request.Currency.ToUpperInvariant()
+                }
+            },
+            userInfo = new { userId, userEmail, userMobile, userName },
+            payMethod = request.PaymentMethodToken
+        };
 
-            var body = await SendAsync(HttpMethod.Post, "api/v1/international/cashier/create",
-                requestBody, ct, "ProcessPayment").ConfigureAwait(false);
-            var resp = JsonSerializer.Deserialize<OPayResponse<OPayCashierData>>(body);
+        var body = await SendAsync(HttpMethod.Post, "api/v1/international/cashier/create",
+            requestBody, ct, "ProcessPayment").ConfigureAwait(false);
+        var resp = JsonSerializer.Deserialize<OPayResponse<OPayCashierData>>(body);
 
-            _logger.LogInformation("OPay cashier created: {OrderNo} code={Code}",
-                resp?.Data?.OrderNo, resp?.Code);
+        Logger.LogInformation("OPay cashier created: {OrderNo} code={Code}",
+            resp?.Data?.OrderNo, resp?.Code);
 
-            var status = MapResponseCode(resp?.Code, resp?.Data?.Status);
-            outcome = status switch
-            {
-                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
-                _ => BhenguPaymentDiagnostics.Outcomes.Declined
-            };
-
-            return new PaymentResponse
-            {
-                GatewayReference = resp?.Data?.OrderNo ?? reference,
-                Status = status,
-                Amount = request.Amount,
-                Currency = request.Currency,
-                ProcessedAt = DateTime.UtcNow,
-                RedirectUrl = resp?.Data?.CashierUrl,
-                Message = resp?.Message
-            };
-        }
-        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
-        finally
+        var status = MapResponseCode(resp?.Code, resp?.Data?.Status);
+        return new PaymentResponse
         {
-            activity?.SetOutcome(outcome);
-            sw.Stop();
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
-            BhenguPaymentDiagnostics.ChargeDurationMs.Record(sw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
-        }
+            GatewayReference = resp?.Data?.OrderNo ?? reference,
+            Status = status,
+            Amount = request.Amount,
+            Currency = request.Currency,
+            ProcessedAt = DateTime.UtcNow,
+            RedirectUrl = resp?.Data?.CashierUrl,
+            Message = resp?.Message
+        };
     }
 
     /// <inheritdoc />
@@ -176,62 +152,41 @@ public sealed class OPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvid
     {
         ArgumentNullException.ThrowIfNull(request);
         return _idempotency is null
-            ? ProcessRefundCoreAsync(request, ct)
+            ? RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct), ct)
             : _idempotency.GetOrAddAsync(request.IdempotencyKey, "refund",
-                () => ProcessRefundCoreAsync(request, ct), ct);
+                () => RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct), ct), ct);
     }
 
     private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
     {
-        using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
-        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
-        try
+        var amount = (long)(request.Amount * 100);
+        var requestBody = new
         {
-            var amount = (long)(request.Amount * 100);
-            var requestBody = new
-            {
-                publicKey = _options.PublicKey,
-                country = _options.Country,
-                reference = request.IdempotencyKey ?? $"refund-{Guid.NewGuid():N}",
-                orderNo = request.GatewayReference,
-                refundAmount = new { total = amount, currency = "NGN" },
-                reason = request.Reason,
-                callbackUrl = _options.CallbackUrl
-            };
+            publicKey = _options.PublicKey,
+            country = _options.Country,
+            reference = request.IdempotencyKey ?? $"refund-{Guid.NewGuid():N}",
+            orderNo = request.GatewayReference,
+            refundAmount = new { total = amount, currency = "NGN" },
+            reason = request.Reason,
+            callbackUrl = _options.CallbackUrl
+        };
 
-            var body = await SendAsync(HttpMethod.Post, "api/v1/international/refund/create",
-                requestBody, ct, "ProcessRefund").ConfigureAwait(false);
-            var resp = JsonSerializer.Deserialize<OPayResponse<OPayRefundData>>(body);
+        var body = await SendAsync(HttpMethod.Post, "api/v1/international/refund/create",
+            requestBody, ct, "ProcessRefund").ConfigureAwait(false);
+        var resp = JsonSerializer.Deserialize<OPayResponse<OPayRefundData>>(body);
 
-            _logger.LogInformation("OPay refund created: {RefundId} for order {OrderNo}",
-                resp?.Data?.RefundId, request.GatewayReference);
+        Logger.LogInformation("OPay refund created: {RefundId} for order {OrderNo}",
+            resp?.Data?.RefundId, request.GatewayReference);
 
-            var status = MapResponseCode(resp?.Code, resp?.Data?.Status);
-            outcome = status switch
-            {
-                PaymentStatus.Completed or PaymentStatus.Refunded => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
-                _ => BhenguPaymentDiagnostics.Outcomes.Declined
-            };
-
-            return new RefundResponse
-            {
-                GatewayReference = resp?.Data?.RefundId ?? string.Empty,
-                Amount = request.Amount,
-                Status = status,
-                ProcessedAt = DateTime.UtcNow,
-                Message = resp?.Message
-            };
-        }
-        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
-        finally
+        var status = MapResponseCode(resp?.Code, resp?.Data?.Status);
+        return new RefundResponse
         {
-            activity?.SetOutcome(outcome);
-            BhenguPaymentDiagnostics.RefundsTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
-        }
+            GatewayReference = resp?.Data?.RefundId ?? string.Empty,
+            Amount = request.Amount,
+            Status = status,
+            ProcessedAt = DateTime.UtcNow,
+            Message = resp?.Message
+        };
     }
 
     /// <inheritdoc />
@@ -239,62 +194,41 @@ public sealed class OPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvid
     {
         ArgumentNullException.ThrowIfNull(request);
         return _idempotency is null
-            ? ProcessPayoutCoreAsync(request, ct)
+            ? RunPayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct), ct)
             : _idempotency.GetOrAddAsync(request.IdempotencyKey, "payout",
-                () => ProcessPayoutCoreAsync(request, ct), ct);
+                () => RunPayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct), ct), ct);
     }
 
     private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
     {
-        using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, request.Currency);
-        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
-        try
+        var amountTotal = (long)(request.Amount * 100);
+        var requestBody = new
         {
-            var amountTotal = (long)(request.Amount * 100);
-            var requestBody = new
-            {
-                publicKey = _options.PublicKey,
-                country = _options.Country,
-                reference = request.IdempotencyKey ?? $"payout-{Guid.NewGuid():N}",
-                amount = new { total = amountTotal, currency = request.Currency.ToUpperInvariant() },
-                reason = request.Description,
-                receiver = new { receiverId = request.DestinationToken },
-                callbackUrl = _options.CallbackUrl
-            };
+            publicKey = _options.PublicKey,
+            country = _options.Country,
+            reference = request.IdempotencyKey ?? $"payout-{Guid.NewGuid():N}",
+            amount = new { total = amountTotal, currency = request.Currency.ToUpperInvariant() },
+            reason = request.Description,
+            receiver = new { receiverId = request.DestinationToken },
+            callbackUrl = _options.CallbackUrl
+        };
 
-            var body = await SendAsync(HttpMethod.Post, "api/v1/international/payout/create",
-                requestBody, ct, "ProcessPayout").ConfigureAwait(false);
-            var resp = JsonSerializer.Deserialize<OPayResponse<OPayPayoutData>>(body);
+        var body = await SendAsync(HttpMethod.Post, "api/v1/international/payout/create",
+            requestBody, ct, "ProcessPayout").ConfigureAwait(false);
+        var resp = JsonSerializer.Deserialize<OPayResponse<OPayPayoutData>>(body);
 
-            _logger.LogInformation("OPay payout created: {OrderNo} code={Code}",
-                resp?.Data?.OrderNo, resp?.Code);
+        Logger.LogInformation("OPay payout created: {OrderNo} code={Code}",
+            resp?.Data?.OrderNo, resp?.Code);
 
-            var status = MapResponseCode(resp?.Code, resp?.Data?.Status);
-            outcome = status switch
-            {
-                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
-                _ => BhenguPaymentDiagnostics.Outcomes.Declined
-            };
-
-            return new PayoutResponse
-            {
-                GatewayReference = resp?.Data?.OrderNo ?? string.Empty,
-                Status = status,
-                Amount = request.Amount,
-                Currency = request.Currency,
-                ProcessedAt = DateTime.UtcNow
-            };
-        }
-        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
-        finally
+        var status = MapResponseCode(resp?.Code, resp?.Data?.Status);
+        return new PayoutResponse
         {
-            activity?.SetOutcome(outcome);
-            BhenguPaymentDiagnostics.PayoutsTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
-        }
+            GatewayReference = resp?.Data?.OrderNo ?? string.Empty,
+            Status = status,
+            Amount = request.Amount,
+            Currency = request.Currency,
+            ProcessedAt = DateTime.UtcNow
+        };
     }
 
     /// <inheritdoc />
@@ -303,40 +237,21 @@ public sealed class OPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvid
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        var valid = false;
-        try
+        return RunWebhookVerify(() =>
         {
             if (string.IsNullOrWhiteSpace(_options.SecretKey))
             {
-                _logger.LogWarning("OPay SecretKey not configured — signature verification cannot succeed.");
+                Logger.LogWarning("OPay SecretKey not configured — signature verification cannot succeed.");
                 return false;
             }
-
-            using var hmac = new HMACSHA512(Encoding.UTF8.GetBytes(_options.SecretKey));
-            var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
-            var computedSignature = Convert.ToHexString(computedHash).ToLowerInvariant();
 
             // OPay typically prefixes "Bearer " on the Authorization webhook header — strip if present.
             var normalised = signature.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
                 ? signature["Bearer ".Length..]
                 : signature;
 
-            valid = CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(normalised.ToLowerInvariant()),
-                Encoding.UTF8.GetBytes(computedSignature));
-            return valid;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "OPay webhook signature verification raised");
-            return false;
-        }
-        finally
-        {
-            BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("valid", valid));
-        }
+            return SignatureHelpers.VerifyHmacSha512(payload, normalised, _options.SecretKey);
+        });
     }
 
     /// <inheritdoc />
@@ -344,21 +259,23 @@ public sealed class OPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvid
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
 
-        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
-        try
+        return RunOperationAsync<WebhookEvent?>("parse_webhook", () =>
         {
-            var evt = JsonSerializer.Deserialize<OPayWebhookEvent>(payload);
-            if (evt is null) return Task.FromResult<WebhookEvent?>(null);
+            try
+            {
+                var evt = JsonSerializer.Deserialize<OPayWebhookEvent>(payload);
+                if (evt is null) return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed OPay webhook event: {EventType}", evt.Type);
-            var typed = MapWebhookEvent(evt);
-            return Task.FromResult(typed);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to parse OPay webhook event");
-            return Task.FromResult<WebhookEvent?>(null);
-        }
+                Logger.LogInformation("Parsed OPay webhook event: {EventType}", evt.Type);
+                var typed = MapWebhookEvent(evt);
+                return Task.FromResult(typed);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Failed to parse OPay webhook event");
+                return Task.FromResult<WebhookEvent?>(null);
+            }
+        }, ct);
     }
 
     private static WebhookEvent? MapWebhookEvent(OPayWebhookEvent webhookEvent)
@@ -484,7 +401,15 @@ public sealed class OPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvid
                 };
 
             default:
-                return null;
+                // Unrecognised but verified event — surface as Category=Unknown so consumers can log
+                // and act on new upstream types even before the SDK is taught to classify them.
+                return new WebhookEvent
+                {
+                    GatewayReference = rawReference,
+                    Status = PaymentStatus.Pending,
+                    EventType = webhookEvent.Type,
+                    Category = WebhookEventCategory.Unknown
+                };
         }
     }
 
@@ -502,15 +427,7 @@ public sealed class OPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvid
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", signature);
         req.Headers.TryAddWithoutValidation("MerchantId", _options.MerchantId);
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to OPay failed", ex);
-        }
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
 
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
@@ -522,7 +439,7 @@ public sealed class OPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvid
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("OPay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("OPay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

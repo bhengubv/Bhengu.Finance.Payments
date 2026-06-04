@@ -8,6 +8,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Subscription;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.PayFast.Configuration;
 using Bhengu.Finance.Payments.PayFast.Internals;
 using Microsoft.Extensions.Logging;
@@ -25,24 +26,26 @@ namespace Bhengu.Finance.Payments.PayFast.Providers;
 /// form-post.</para>
 /// <para><see cref="CreateSubscriptionAsync"/> returns a <see cref="Subscription"/> in
 /// <see cref="SubscriptionStatus.Pending"/>-equivalent state (<see cref="SubscriptionStatus.Trialing"/>
-/// is the closest fit because no charge has occurred yet) carrying an <em>AuthorisationUrl</em> the
-/// caller redirects the payer to. The real subscription token arrives later via the IPN webhook
+/// is the closest fit because no charge has occurred yet) carrying an <see cref="Subscription.AuthorisationUrl"/>
+/// the caller redirects the payer to. The real subscription token arrives later via the IPN webhook
 /// (<c>token</c> field). See <see cref="PayFastPaymentProvider.ParseWebhookAsync"/> for the typed
 /// event mapping.</para>
 /// <para>Cancel / Pause / Resume / Get call PayFast's authenticated REST API at
 /// <c>subscriptions/{token}/cancel</c>, <c>/pause</c>, <c>/unpause</c>, and <c>/fetch</c> respectively.
 /// All these accept the subscription token (NOT the m_payment_id) — that's the token returned by
 /// PayFast on the IPN, persisted by the merchant, and supplied as <c>subscriptionReference</c> here.</para>
+/// <para>Pause / Resume are surfaced via the dedicated <see cref="ISubscriptionPauseSupport"/>
+/// add-on contract so consumers can pattern-match support at compile time instead of catching
+/// runtime "not supported" exceptions.</para>
 /// </remarks>
-public sealed class PayFastSubscriptionProvider : ISubscriptionProvider
+public sealed class PayFastSubscriptionProvider : BhenguProviderBase, ISubscriptionProvider, ISubscriptionPauseSupport
 {
     private readonly HttpClient _httpClient;
     private readonly PayFastOptions _options;
-    private readonly ILogger<PayFastSubscriptionProvider> _logger;
     private readonly PayFastPlanCache _planCache;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.PayFast;
+    public override string ProviderName => ProviderNames.PayFast;
 
     /// <summary>Construct a PayFast subscription provider. Designed to be registered via DI.</summary>
     public PayFastSubscriptionProvider(
@@ -50,10 +53,10 @@ public sealed class PayFastSubscriptionProvider : ISubscriptionProvider
         IOptions<PayFastOptions> options,
         ILogger<PayFastSubscriptionProvider> logger,
         PayFastPlanCache planCache)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _planCache = planCache ?? throw new ArgumentNullException(nameof(planCache));
 
         if (string.IsNullOrWhiteSpace(_options.MerchantId))
@@ -71,24 +74,31 @@ public sealed class PayFastSubscriptionProvider : ISubscriptionProvider
     public Task<Plan> CreatePlanAsync(PlanRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        var plan = _planCache.Add(request);
-        _logger.LogInformation("PayFast plan registered in-memory: {Reference} {Name} amount={Amount} {Currency} interval={Interval}",
-            plan.Reference, plan.Name, plan.Amount, plan.Currency, plan.Interval);
-        return Task.FromResult(plan);
+        return RunOperationAsync("create_plan", () =>
+        {
+            var plan = _planCache.Add(request);
+            Logger.LogInformation("PayFast plan registered in-memory: {Reference} {Name} amount={Amount} {Currency} interval={Interval}",
+                plan.Reference, plan.Name, plan.Amount, plan.Currency, plan.Interval);
+            return Task.FromResult(plan);
+        }, ct);
     }
 
     /// <inheritdoc/>
     public Task<Plan?> GetPlanAsync(string planReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(planReference);
-        return Task.FromResult(_planCache.Get(planReference));
+        return RunOperationAsync("get_plan", () => Task.FromResult(_planCache.Get(planReference)), ct);
     }
 
     /// <inheritdoc/>
     public Task<Subscription> CreateSubscriptionAsync(SubscriptionRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return RunOperationAsync("create_subscription", () => CreateSubscriptionCoreAsync(request), ct);
+    }
 
+    private Task<Subscription> CreateSubscriptionCoreAsync(SubscriptionRequest request)
+    {
         var plan = _planCache.Get(request.PlanReference)
             ?? throw new BhenguPaymentException(ProviderName,
                 $"PayFast plan '{request.PlanReference}' not found in plan cache. Call CreatePlanAsync first.",
@@ -136,40 +146,26 @@ public sealed class PayFastSubscriptionProvider : ISubscriptionProvider
             Status = initialStatus,
             StartedAt = startDate,
             NextBillingAt = startDate,
-            CyclesCompleted = 0
+            CyclesCompleted = 0,
+            AuthorisationUrl = authorisationUrl
         };
 
-        // PayFast is a redirect-flow provider — the AuthorisationUrl is where the consumer
-        // sends the payer to authorise the subscription. The current Core Subscription record
-        // does not expose an AuthorisationUrl property; we surface the URL via the logger and
-        // make it retrievable via TryGetAuthorisationUrl() for callers that need it.
-        _lastAuthorisationUrl[mPaymentId] = authorisationUrl;
-        _logger.LogInformation(
+        Logger.LogInformation(
             "PayFast subscription redirect prepared: m_payment_id={MPaymentId} plan={PlanReference} amount={Amount} authorisationUrl={Url}",
             mPaymentId, plan.Reference, plan.Amount, authorisationUrl);
 
         return Task.FromResult(subscription);
     }
 
-    /// <summary>
-    /// Retrieve the PayFast redirect URL associated with the m_payment_id returned by
-    /// <see cref="CreateSubscriptionAsync"/>. The mapping is held in process memory only.
-    /// </summary>
-    /// <param name="subscriptionReference">The subscription reference returned on creation (the m_payment_id).</param>
-    /// <returns>The hosted-checkout redirect URL, or <c>null</c> if not known.</returns>
-    public string? TryGetAuthorisationUrl(string subscriptionReference)
+    /// <inheritdoc/>
+    public Task<Subscription?> GetSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
-        return _lastAuthorisationUrl.TryGetValue(subscriptionReference, out var url) ? url : null;
+        return RunOperationAsync("get_subscription", () => GetSubscriptionCoreAsync(subscriptionReference, ct), ct);
     }
 
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _lastAuthorisationUrl =
-        new(StringComparer.Ordinal);
-
-    /// <inheritdoc/>
-    public async Task<Subscription?> GetSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
+    private async Task<Subscription?> GetSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
     {
-        ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
         var fetched = await SendSignedAsync<PayFastSubscriptionFetchResponse>(
             HttpMethod.Get, $"subscriptions/{Uri.EscapeDataString(subscriptionReference)}/fetch", new Dictionary<string, string>(), ct)
             .ConfigureAwait(false);
@@ -190,23 +186,27 @@ public sealed class PayFastSubscriptionProvider : ISubscriptionProvider
     }
 
     /// <inheritdoc/>
-    public async Task<Subscription> CancelSubscriptionAsync(string subscriptionReference, bool immediately = false, CancellationToken ct = default)
+    public Task<Subscription> CancelSubscriptionAsync(string subscriptionReference, bool immediately = false, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
+        return RunOperationAsync("cancel_subscription", () => CancelSubscriptionCoreAsync(subscriptionReference, ct), ct);
+    }
 
+    private async Task<Subscription> CancelSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
+    {
         try
         {
             await SendSignedAsync<object>(
                 HttpMethod.Put, $"subscriptions/{Uri.EscapeDataString(subscriptionReference)}/cancel", new Dictionary<string, string>(), ct)
                 .ConfigureAwait(false);
-            _logger.LogInformation("PayFast subscription cancelled: {Reference}", subscriptionReference);
+            Logger.LogInformation("PayFast subscription cancelled: {Reference}", subscriptionReference);
         }
         catch (PaymentDeclinedException ex) when (
             ex.ProviderErrorMessage?.Contains("already", StringComparison.OrdinalIgnoreCase) == true ||
             ex.ProviderErrorMessage?.Contains("cancel", StringComparison.OrdinalIgnoreCase) == true)
         {
             // Idempotent: cancelling an already-cancelled subscription is success.
-            _logger.LogInformation("PayFast subscription already cancelled (idempotent): {Reference}", subscriptionReference);
+            Logger.LogInformation("PayFast subscription already cancelled (idempotent): {Reference}", subscriptionReference);
         }
 
         var existing = await SafeGetAsync(subscriptionReference, ct).ConfigureAwait(false);
@@ -219,25 +219,35 @@ public sealed class PayFastSubscriptionProvider : ISubscriptionProvider
     }
 
     /// <inheritdoc/>
-    public async Task<Subscription> PauseSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
+    public Task<Subscription> PauseSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
+        return RunOperationAsync("pause_subscription", () => PauseSubscriptionCoreAsync(subscriptionReference, ct), ct);
+    }
+
+    private async Task<Subscription> PauseSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
+    {
         await SendSignedAsync<object>(
             HttpMethod.Put, $"subscriptions/{Uri.EscapeDataString(subscriptionReference)}/pause", new Dictionary<string, string>(), ct)
             .ConfigureAwait(false);
-        _logger.LogInformation("PayFast subscription paused: {Reference}", subscriptionReference);
+        Logger.LogInformation("PayFast subscription paused: {Reference}", subscriptionReference);
         var existing = await SafeGetAsync(subscriptionReference, ct).ConfigureAwait(false);
         return existing with { Status = SubscriptionStatus.Paused };
     }
 
     /// <inheritdoc/>
-    public async Task<Subscription> ResumeSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
+    public Task<Subscription> ResumeSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
+        return RunOperationAsync("resume_subscription", () => ResumeSubscriptionCoreAsync(subscriptionReference, ct), ct);
+    }
+
+    private async Task<Subscription> ResumeSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
+    {
         await SendSignedAsync<object>(
             HttpMethod.Put, $"subscriptions/{Uri.EscapeDataString(subscriptionReference)}/unpause", new Dictionary<string, string>(), ct)
             .ConfigureAwait(false);
-        _logger.LogInformation("PayFast subscription resumed: {Reference}", subscriptionReference);
+        Logger.LogInformation("PayFast subscription resumed: {Reference}", subscriptionReference);
         var existing = await SafeGetAsync(subscriptionReference, ct).ConfigureAwait(false);
         return existing with { Status = SubscriptionStatus.Active };
     }
@@ -246,7 +256,7 @@ public sealed class PayFastSubscriptionProvider : ISubscriptionProvider
     {
         try
         {
-            var existing = await GetSubscriptionAsync(subscriptionReference, ct).ConfigureAwait(false);
+            var existing = await GetSubscriptionCoreAsync(subscriptionReference, ct).ConfigureAwait(false);
             if (existing is not null) return existing;
         }
         catch (BhenguPaymentException)
@@ -291,15 +301,7 @@ public sealed class PayFastSubscriptionProvider : ISubscriptionProvider
         if (bodyParams.Count > 0 && method != HttpMethod.Get)
             req.Content = new FormUrlEncodedContent(bodyParams);
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "PayFast API HTTP failure", ex);
-        }
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
 
         var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
@@ -311,7 +313,7 @@ public sealed class PayFastSubscriptionProvider : ISubscriptionProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("PayFast {Method} {Path} failed: {Status} {Body}", method, relativePath, response.StatusCode, body);
+            Logger.LogError("PayFast {Method} {Path} failed: {Status} {Body}", method, relativePath, response.StatusCode, body);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), body);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {body}");
@@ -326,7 +328,7 @@ public sealed class PayFastSubscriptionProvider : ISubscriptionProvider
         }
         catch (JsonException ex)
         {
-            _logger.LogWarning(ex, "PayFast {Method} {Path} returned non-JSON body — accepting as ack", method, relativePath);
+            Logger.LogWarning(ex, "PayFast {Method} {Path} returned non-JSON body — accepting as ack", method, relativePath);
             return null;
         }
     }

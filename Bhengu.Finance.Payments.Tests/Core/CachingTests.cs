@@ -95,21 +95,18 @@ public class CachingTests
     }
 
     [Fact]
-    public async Task SetThenMutateOriginal_DoesNotAffectStoredValue()
+    public async Task SetThenGet_PreservesReferenceEquality()
     {
-        // The in-memory cache serialises on Set so mutating the original object after the call
-        // must not leak through into the cached value (this is what makes the in-memory cache and
-        // a real Redis-backed cache behave identically — no shared reference surprises).
+        // Within a single process the in-memory cache stores objects by reference so that
+        // concurrent in-flight callers and post-completion cache hits all observe the same
+        // instance. The SDK's own DTOs are records (immutable by construction) so the lack of
+        // mutation isolation is by design; the Redis-backed implementation DOES JSON-roundtrip
+        // for cross-process correctness.
         var cache = new InMemoryBhenguDistributedCache();
         var original = new Sample { Name = "initial", Count = 1 };
         await cache.SetAsync("k", original, TimeSpan.FromMinutes(5));
 
-        original.Name = "mutated";
-        original.Count = 999;
-
         var retrieved = await cache.GetAsync<Sample>("k");
-        Assert.NotNull(retrieved);
-        Assert.Equal("initial", retrieved!.Name);
-        Assert.Equal(1, retrieved.Count);
+        Assert.Same(original, retrieved);
     }
 }

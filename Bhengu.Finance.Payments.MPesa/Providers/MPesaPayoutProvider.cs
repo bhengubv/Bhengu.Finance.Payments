@@ -7,10 +7,13 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.MPesa.Configuration;
+using Bhengu.Finance.Payments.MPesa.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -43,29 +46,28 @@ namespace Bhengu.Finance.Payments.MPesa.Providers;
 /// "Invalid receiver party" errors — normalise upstream.
 /// </para>
 /// </remarks>
-public sealed class MPesaPayoutProvider : IPayoutProvider
+public sealed class MPesaPayoutProvider : BhenguProviderBase, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly MPesaOptions _options;
-    private readonly ILogger<MPesaPayoutProvider> _logger;
+    private readonly MPesaOAuthCache _tokenCache;
     private readonly string _baseUrl;
 
-    private string? _cachedAccessToken;
-    private DateTime _cachedTokenExpiresUtc = DateTime.MinValue;
-    private readonly SemaphoreSlim _tokenLock = new(1, 1);
-
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.MPesa;
+    public override string ProviderName => ProviderNames.MPesa;
 
-    /// <summary>Construct a standalone M-Pesa payout provider. Designed to be registered via DI.</summary>
+    /// <summary>Construct a standalone M-Pesa payout provider with a distributed OAuth cache.</summary>
     public MPesaPayoutProvider(
         HttpClient httpClient,
         IOptions<MPesaOptions> options,
-        ILogger<MPesaPayoutProvider> logger)
+        ILogger<MPesaPayoutProvider> logger,
+        IBhenguDistributedCache cache)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        ArgumentNullException.ThrowIfNull(cache);
+        _tokenCache = new MPesaOAuthCache(cache);
 
         if (string.IsNullOrWhiteSpace(_options.ConsumerKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(MPesaOptions.ConsumerKey)} is required");
@@ -88,11 +90,24 @@ public sealed class MPesaPayoutProvider : IPayoutProvider
             _httpClient.BaseAddress = new Uri(_baseUrl);
     }
 
+    /// <summary>Back-compat constructor that uses the process-local in-memory cache.</summary>
+    public MPesaPayoutProvider(
+        HttpClient httpClient,
+        IOptions<MPesaOptions> options,
+        ILogger<MPesaPayoutProvider> logger)
+        : this(httpClient, options, logger, new InMemoryBhenguDistributedCache())
+    {
+    }
+
     /// <inheritdoc/>
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return RunPayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct), ct);
+    }
 
+    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+    {
         if (string.IsNullOrWhiteSpace(request.DestinationToken))
             throw new PaymentDeclinedException(ProviderName, "invalid_msisdn",
                 "M-Pesa B2C requires the recipient MSISDN in PayoutRequest.DestinationToken (e.g. 254712345678).");
@@ -123,7 +138,7 @@ public sealed class MPesaPayoutProvider : IPayoutProvider
 
         var b2c = JsonSerializer.Deserialize<MPesaB2CResponse>(responseBody);
 
-        _logger.LogInformation(
+        Logger.LogInformation(
             "M-Pesa B2C accepted: OriginatorConversationID={OriginatorConversationId} ConversationID={ConversationId} ResponseCode={ResponseCode}",
             b2c?.OriginatorConversationID, b2c?.ConversationID, b2c?.ResponseCode);
 
@@ -150,18 +165,10 @@ public sealed class MPesaPayoutProvider : IPayoutProvider
         };
 
         var token = await GetAccessTokenAsync(ct).ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, $"HTTP request to M-Pesa ({operation}) failed", ex);
-        }
-
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -172,7 +179,7 @@ public sealed class MPesaPayoutProvider : IPayoutProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("M-Pesa {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("M-Pesa {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
@@ -183,33 +190,24 @@ public sealed class MPesaPayoutProvider : IPayoutProvider
 
     private async Task<string> GetAccessTokenAsync(CancellationToken ct)
     {
-        if (_cachedAccessToken is not null && _cachedTokenExpiresUtc > DateTime.UtcNow.AddMinutes(1))
-            return _cachedAccessToken;
+        var cached = await _tokenCache.GetAsync(_options.ConsumerKey, ct).ConfigureAwait(false);
+        if (cached is not null) return cached;
 
-        await _tokenLock.WaitAsync(ct).ConfigureAwait(false);
+        await _tokenCache.WaitFetchSlotAsync(ct).ConfigureAwait(false);
         try
         {
-            if (_cachedAccessToken is not null && _cachedTokenExpiresUtc > DateTime.UtcNow.AddMinutes(1))
-                return _cachedAccessToken;
+            cached = await _tokenCache.GetAsync(_options.ConsumerKey, ct).ConfigureAwait(false);
+            if (cached is not null) return cached;
 
             var creds = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{_options.ConsumerKey}:{_options.ConsumerSecret}"));
             using var req = new HttpRequestMessage(HttpMethod.Get, "oauth/v1/generate?grant_type=client_credentials");
             req.Headers.Authorization = new AuthenticationHeaderValue("Basic", creds);
 
-            HttpResponseMessage response;
-            try
-            {
-                response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-            }
-            catch (HttpRequestException ex)
-            {
-                throw new ProviderUnavailableException(ProviderName, "M-Pesa OAuth call failed", ex);
-            }
-
+            var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
             var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
             {
-                _logger.LogError("M-Pesa OAuth failed: {StatusCode} {Body}", response.StatusCode, body);
+                Logger.LogError("M-Pesa OAuth failed: {StatusCode} {Body}", response.StatusCode, body);
                 throw new ProviderUnavailableException(ProviderName, $"M-Pesa OAuth HTTP {(int)response.StatusCode}: {body}");
             }
 
@@ -218,13 +216,13 @@ public sealed class MPesaPayoutProvider : IPayoutProvider
                 throw new ProviderUnavailableException(ProviderName, "M-Pesa OAuth returned an empty token");
 
             var expiresIn = int.TryParse(token.ExpiresIn, NumberStyles.Integer, CultureInfo.InvariantCulture, out var s) ? s : 3599;
-            _cachedAccessToken = token.AccessToken;
-            _cachedTokenExpiresUtc = DateTime.UtcNow.AddSeconds(expiresIn);
-            return _cachedAccessToken;
+            var ttl = TimeSpan.FromSeconds(Math.Max(60, expiresIn - 60));
+            await _tokenCache.SetAsync(_options.ConsumerKey, token.AccessToken, ttl, ct).ConfigureAwait(false);
+            return token.AccessToken;
         }
         finally
         {
-            _tokenLock.Release();
+            _tokenCache.ReleaseFetchSlot();
         }
     }
 

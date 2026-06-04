@@ -43,6 +43,7 @@ public static class ServiceCollectionExtensions
 
         services.AddHttpClient<OPayPaymentProvider>();
         services.AddHttpClient<OPayTokenisationProvider>();
+        services.AddHttpClient<OPayRawCardTokenisationProvider>();
         services.AddHttpClient<OPaySettlementProvider>();
 
         services.AddTransient<IPaymentGatewayProvider, OPayPaymentProvider>(sp =>
@@ -51,6 +52,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<OPayPaymentProvider>());
         services.AddTransient<ITokenisationProvider, OPayTokenisationProvider>(sp =>
             sp.GetRequiredService<OPayTokenisationProvider>());
+        services.AddTransient<IRawCardTokenisationProvider, OPayRawCardTokenisationProvider>(sp =>
+            sp.GetRequiredService<OPayRawCardTokenisationProvider>());
         services.AddTransient<ISettlementProvider, OPaySettlementProvider>(sp =>
             sp.GetRequiredService<OPaySettlementProvider>());
 
@@ -60,6 +63,8 @@ public static class ServiceCollectionExtensions
             (sp, _) => sp.GetRequiredService<OPayPaymentProvider>());
         services.AddKeyedTransient<ITokenisationProvider>(ProviderNames.OPay,
             (sp, _) => sp.GetRequiredService<OPayTokenisationProvider>());
+        services.AddKeyedTransient<IRawCardTokenisationProvider>(ProviderNames.OPay,
+            (sp, _) => sp.GetRequiredService<OPayRawCardTokenisationProvider>());
         services.AddKeyedTransient<ISettlementProvider>(ProviderNames.OPay,
             (sp, _) => sp.GetRequiredService<OPaySettlementProvider>());
 

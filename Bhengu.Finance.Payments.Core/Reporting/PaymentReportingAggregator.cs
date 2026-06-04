@@ -33,12 +33,13 @@ public sealed class PaymentReportingAggregator : IPaymentReportingAggregator
         {
             try
             {
-                var settlements = await provider.ListSettlementsAsync(fromUtc, toUtc, ct).ConfigureAwait(false);
                 var perCurrency = new Dictionary<string, (decimal Gross, decimal Net, decimal Fees)>(StringComparer.OrdinalIgnoreCase);
                 var txCount = 0;
+                var settlementCount = 0;
 
-                foreach (var s in settlements)
+                await foreach (var s in provider.ListSettlementsAsync(fromUtc, toUtc, ct).ConfigureAwait(false))
                 {
+                    settlementCount++;
                     var bucket = perCurrency.GetValueOrDefault(s.Currency);
                     bucket.Net += s.NetAmount;
                     bucket.Gross += s.GrossAmount ?? s.NetAmount;
@@ -56,7 +57,7 @@ public sealed class PaymentReportingAggregator : IPaymentReportingAggregator
                 rows.Add(new ProviderReportRow
                 {
                     ProviderName = provider.ProviderName,
-                    SettlementCount = settlements.Count,
+                    SettlementCount = settlementCount,
                     TransactionCount = txCount,
                     Totals = perCurrency.Select(kv => new CurrencyTotal
                     {

@@ -2,7 +2,6 @@
 
 using System.Net;
 using System.Net.Http.Headers;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -11,8 +10,9 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.Yoco.Configuration;
-using Bhengu.Finance.Payments.Yoco.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -23,13 +23,18 @@ namespace Bhengu.Finance.Payments.Yoco.Providers;
 /// Yoco does NOT expose payouts on the standard merchant API — <see cref="IPayoutProvider"/>
 /// is intentionally not implemented; merchants requiring payouts should use Yoco Business/Marketplace.
 /// </summary>
-public sealed class YocoPaymentProvider : IPaymentGatewayProvider
+public sealed class YocoPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider
 {
+    private static readonly JsonSerializerOptions s_jsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+    };
+
     private readonly HttpClient _httpClient;
     private readonly YocoOptions _options;
-    private readonly ILogger<YocoPaymentProvider> _logger;
 
-    public string ProviderName => ProviderNames.Yoco;
+    /// <inheritdoc/>
+    public override string ProviderName => ProviderNames.Yoco;
 
     /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
@@ -49,10 +54,10 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
         HttpClient httpClient,
         IOptions<YocoOptions> options,
         ILogger<YocoPaymentProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(YocoOptions.SecretKey)} is required");
@@ -67,7 +72,7 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return YocoObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+        return RunChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct), ct);
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
@@ -82,11 +87,11 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
             metadata = request.Metadata ?? new Dictionary<string, string>().AsReadOnly() as IReadOnlyDictionary<string, string>
         };
 
-        var (body, _) = await SendAsync(HttpMethod.Post, "charges/", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
+        var body = await SendAsync(HttpMethod.Post, "charges/", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
 
-        var yocoResponse = JsonSerializer.Deserialize<YocoChargeResponse>(body);
+        var yocoResponse = JsonSerializer.Deserialize<YocoChargeResponse>(body, s_jsonOptions);
 
-        _logger.LogInformation("Yoco charge created: {ChargeId} status={Status}", yocoResponse?.Id, yocoResponse?.Status);
+        Logger.LogInformation("Yoco charge created: {ChargeId} status={Status}", yocoResponse?.Id, yocoResponse?.Status);
 
         return new PaymentResponse
         {
@@ -103,7 +108,7 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return YocoObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+        return RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct), ct);
     }
 
     private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
@@ -115,10 +120,10 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
             amountInCents
         };
 
-        var (body, _) = await SendAsync(HttpMethod.Post, "refunds/", requestBody, ct, "ProcessRefund").ConfigureAwait(false);
-        var refundResponse = JsonSerializer.Deserialize<YocoRefundResponse>(body);
+        var body = await SendAsync(HttpMethod.Post, "refunds/", requestBody, ct, "ProcessRefund").ConfigureAwait(false);
+        var refundResponse = JsonSerializer.Deserialize<YocoRefundResponse>(body, s_jsonOptions);
 
-        _logger.LogInformation("Yoco refund created: {RefundId} for charge {ChargeId}",
+        Logger.LogInformation("Yoco refund created: {RefundId} for charge {ChargeId}",
             refundResponse?.Id, request.GatewayReference);
 
         return new RefundResponse
@@ -137,31 +142,16 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
+        return RunWebhookVerify(() =>
         {
-            _logger.LogWarning("Yoco WebhookSecret not configured — signature verification cannot succeed.");
-            YocoObservability.RecordWebhookVerification(false);
-            return false;
-        }
+            if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
+            {
+                Logger.LogWarning("Yoco WebhookSecret not configured — signature verification cannot succeed.");
+                return false;
+            }
 
-        bool verified;
-        try
-        {
-            using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
-            var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
-            var computedSignature = Convert.ToBase64String(computedHash);
-
-            verified = CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(signature),
-                Encoding.UTF8.GetBytes(computedSignature));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Yoco webhook signature verification raised");
-            verified = false;
-        }
-        YocoObservability.RecordWebhookVerification(verified);
-        return verified;
+            return SignatureHelpers.VerifyHmacSha256(payload, signature, _options.WebhookSecret, SignatureHelpers.Encoding.Base64);
+        });
     }
 
     /// <summary>
@@ -182,25 +172,25 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        return YocoObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+        return RunOperationAsync<WebhookEvent?>("parse_webhook", () => ParseWebhookCoreAsync(payload), ct);
     }
 
-    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload)
     {
         try
         {
-            var webhookEvent = JsonSerializer.Deserialize<YocoWebhookEvent>(payload);
+            var webhookEvent = JsonSerializer.Deserialize<YocoWebhookEvent>(payload, s_jsonOptions);
             if (webhookEvent is null || string.IsNullOrEmpty(webhookEvent.Payload?.Id))
                 return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed Yoco webhook event: {EventType}", webhookEvent.Type);
+            Logger.LogInformation("Parsed Yoco webhook event: {EventType}", webhookEvent.Type);
 
             var type = webhookEvent.Type?.ToLowerInvariant() ?? string.Empty;
             var id = webhookEvent.Payload.Id;
             var amount = webhookEvent.Payload.AmountInCents / 100m;
             var currency = (webhookEvent.Payload.Currency ?? "ZAR").ToUpperInvariant();
 
-            WebhookEvent? typed = type switch
+            WebhookEvent typed = type switch
             {
                 "payment.succeeded" or "charge.succeeded" => new ChargeSucceededEvent
                 {
@@ -269,36 +259,34 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
                     FailureCode = webhookEvent.Payload.FailureCode,
                     FailureMessage = webhookEvent.Payload.FailureMessage
                 },
-                _ => null
+                _ => new WebhookEvent
+                {
+                    GatewayReference = id,
+                    Status = PaymentStatus.Pending,
+                    EventType = webhookEvent.Type,
+                    Category = WebhookEventCategory.Unknown
+                }
             };
 
-            return Task.FromResult(typed);
+            return Task.FromResult<WebhookEvent?>(typed);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogError(ex, "Failed to parse Yoco webhook event");
+            Logger.LogError(ex, "Failed to parse Yoco webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
 
-    private async Task<(string Body, HttpResponseMessage Response)> SendAsync(
+    private async Task<string> SendAsync(
         HttpMethod method, string path, object body, CancellationToken ct, string operation)
     {
-        var json = JsonSerializer.Serialize(body);
+        var json = JsonSerializer.Serialize(body, s_jsonOptions);
         using var req = new HttpRequestMessage(method, path)
         {
             Content = new StringContent(json, Encoding.UTF8, "application/json")
         };
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Yoco failed", ex);
-        }
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
 
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
@@ -310,13 +298,13 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Yoco {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Yoco {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
         }
 
-        return (responseBody, response);
+        return responseBody;
     }
 
     private static PaymentStatus MapStatus(string raw) => raw?.ToLowerInvariant() switch
@@ -333,38 +321,38 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
 
     private sealed class YocoChargeResponse
     {
-        [JsonPropertyName("id")] public string? Id { get; set; }
-        [JsonPropertyName("status")] public string? Status { get; set; }
-        [JsonPropertyName("amountInCents")] public int AmountInCents { get; set; }
-        [JsonPropertyName("currency")] public string? Currency { get; set; }
+        public string? Id { get; set; }
+        public string? Status { get; set; }
+        public int AmountInCents { get; set; }
+        public string? Currency { get; set; }
     }
 
     private sealed class YocoRefundResponse
     {
-        [JsonPropertyName("id")] public string? Id { get; set; }
-        [JsonPropertyName("chargeId")] public string? ChargeId { get; set; }
-        [JsonPropertyName("amountInCents")] public int AmountInCents { get; set; }
-        [JsonPropertyName("status")] public string? Status { get; set; }
+        public string? Id { get; set; }
+        public string? ChargeId { get; set; }
+        public int AmountInCents { get; set; }
+        public string? Status { get; set; }
     }
 
     private sealed class YocoWebhookEvent
     {
-        [JsonPropertyName("type")] public string? Type { get; set; }
-        [JsonPropertyName("payload")] public YocoWebhookPayload? Payload { get; set; }
+        public string? Type { get; set; }
+        public YocoWebhookPayload? Payload { get; set; }
     }
 
     private sealed class YocoWebhookPayload
     {
-        [JsonPropertyName("id")] public string? Id { get; set; }
-        [JsonPropertyName("chargeId")] public string? ChargeId { get; set; }
-        [JsonPropertyName("status")] public string? Status { get; set; }
-        [JsonPropertyName("amountInCents")] public int AmountInCents { get; set; }
-        [JsonPropertyName("currency")] public string? Currency { get; set; }
-        [JsonPropertyName("customerId")] public string? CustomerId { get; set; }
-        [JsonPropertyName("cardId")] public string? CardId { get; set; }
-        [JsonPropertyName("bankAccountId")] public string? BankAccountId { get; set; }
-        [JsonPropertyName("failureCode")] public string? FailureCode { get; set; }
-        [JsonPropertyName("failureMessage")] public string? FailureMessage { get; set; }
-        [JsonPropertyName("isPartial")] public bool IsPartial { get; set; }
+        public string? Id { get; set; }
+        public string? ChargeId { get; set; }
+        public string? Status { get; set; }
+        public int AmountInCents { get; set; }
+        public string? Currency { get; set; }
+        public string? CustomerId { get; set; }
+        public string? CardId { get; set; }
+        public string? BankAccountId { get; set; }
+        public string? FailureCode { get; set; }
+        public string? FailureMessage { get; set; }
+        public bool IsPartial { get; set; }
     }
 }

@@ -1,7 +1,6 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using Bhengu.Finance.Payments.Core;
-using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Validation;
@@ -37,7 +36,8 @@ public static class ServiceCollectionExtensions
         // Register as keyed service so consumers can resolve by name: [FromKeyedServices(ProviderNames.Yoco)]
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Yoco, (sp, _) => sp.GetRequiredService<YocoPaymentProvider>());
 
-        // Optional contracts — Tokenisation, Payout, Settlement.
+        // Optional contracts — Tokenisation (split into read-only ITokenisationProvider and
+        // raw-card-write IRawCardTokenisationProvider), Payout, Settlement.
         services.AddSingleton<YocoTokenCache>();
 
         services.AddHttpClient<YocoTokenisationProvider>();
@@ -45,6 +45,12 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<YocoTokenisationProvider>());
         services.AddKeyedTransient<ITokenisationProvider>(ProviderNames.Yoco, (sp, _) =>
             sp.GetRequiredService<YocoTokenisationProvider>());
+
+        services.AddHttpClient<YocoRawCardTokenisationProvider>();
+        services.AddTransient<IRawCardTokenisationProvider, YocoRawCardTokenisationProvider>(sp =>
+            sp.GetRequiredService<YocoRawCardTokenisationProvider>());
+        services.AddKeyedTransient<IRawCardTokenisationProvider>(ProviderNames.Yoco, (sp, _) =>
+            sp.GetRequiredService<YocoRawCardTokenisationProvider>());
 
         services.AddHttpClient<YocoPayoutProvider>();
         services.AddTransient<IPayoutProvider, YocoPayoutProvider>(sp =>

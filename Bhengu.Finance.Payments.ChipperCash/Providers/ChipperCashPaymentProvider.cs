@@ -14,6 +14,8 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -26,16 +28,15 @@ namespace Bhengu.Finance.Payments.ChipperCash.Providers;
 /// <see cref="PaymentRequest"/> / <see cref="RefundRequest"/> / <see cref="PayoutRequest"/> by
 /// dedup'ing via the shared <see cref="IBhenguDistributedCache"/> for 24 hours.
 /// </summary>
-public sealed class ChipperCashPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class ChipperCashPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly ChipperCashOptions _options;
-    private readonly ILogger<ChipperCashPaymentProvider> _logger;
     private readonly IBhenguDistributedCache _cache;
     private static readonly TimeSpan s_idempotencyTtl = TimeSpan.FromHours(24);
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.ChipperCash;
+    public override string ProviderName => ProviderNames.ChipperCash;
 
     /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
@@ -56,10 +57,10 @@ public sealed class ChipperCashPaymentProvider : IPaymentGatewayProvider, IPayou
         IOptions<ChipperCashOptions> options,
         ILogger<ChipperCashPaymentProvider> logger,
         IBhenguDistributedCache? cache = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _cache = cache ?? new InMemoryBhenguDistributedCache();
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
@@ -74,21 +75,13 @@ public sealed class ChipperCashPaymentProvider : IPaymentGatewayProvider, IPayou
     }
 
     /// <inheritdoc/>
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
-        var startedAt = DateTime.UtcNow;
-        var outcomeTag = BhenguPaymentDiagnostics.Outcomes.Error;
-        try
+        return RunChargeAsync(request.Currency, async () =>
         {
             var cachedResponse = await TryGetCachedAsync<PaymentResponse>(request.IdempotencyKey, "charge", ct).ConfigureAwait(false);
-            if (cachedResponse is not null)
-            {
-                outcomeTag = BhenguPaymentDiagnostics.Outcomes.Success;
-                return cachedResponse;
-            }
+            if (cachedResponse is not null) return cachedResponse;
 
             var reference = request.Metadata?.GetValueOrDefault("reference") ?? $"chp-{Guid.NewGuid():N}";
             var msisdn = request.Metadata?.GetValueOrDefault("msisdn") ?? request.PaymentMethodToken;
@@ -108,7 +101,7 @@ public sealed class ChipperCashPaymentProvider : IPaymentGatewayProvider, IPayou
             var body = await SendAsync(HttpMethod.Post, "v1/collections", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
             var resp = JsonSerializer.Deserialize<ChipperCashCollectionResponse>(body);
 
-            _logger.LogInformation("Chipper collection created: {Id} status={Status}", resp?.Id, resp?.Status);
+            Logger.LogInformation("Chipper collection created: {Id} status={Status}", resp?.Id, resp?.Status);
 
             var status = MapStatus(resp?.Status);
             var paymentResponse = new PaymentResponse
@@ -121,99 +114,49 @@ public sealed class ChipperCashPaymentProvider : IPaymentGatewayProvider, IPayou
                 Message = resp?.Message
             };
 
-            outcomeTag = status switch
-            {
-                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
-                PaymentStatus.Failed => BhenguPaymentDiagnostics.Outcomes.Declined,
-                _ => BhenguPaymentDiagnostics.Outcomes.Pending
-            };
-
             await TrySetCachedAsync(request.IdempotencyKey, "charge", paymentResponse, ct).ConfigureAwait(false);
             return paymentResponse;
-        }
-        catch (PaymentDeclinedException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        finally
-        {
-            activity.SetOutcome(outcomeTag);
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcomeTag));
-            BhenguPaymentDiagnostics.ChargeDurationMs.Record(
-                (DateTime.UtcNow - startedAt).TotalMilliseconds,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcomeTag));
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
-        var outcomeTag = BhenguPaymentDiagnostics.Outcomes.Error;
-        try
+        return RunRefundAsync(request.GatewayReference, async () =>
         {
             var cachedResponse = await TryGetCachedAsync<RefundResponse>(request.IdempotencyKey, "refund", ct).ConfigureAwait(false);
-            if (cachedResponse is not null)
-            {
-                outcomeTag = BhenguPaymentDiagnostics.Outcomes.Success;
-                return cachedResponse;
-            }
+            if (cachedResponse is not null) return cachedResponse;
 
             var requestBody = new { amount = request.Amount, reason = request.Reason };
             var path = $"v1/collections/{Uri.EscapeDataString(request.GatewayReference)}/refund";
             var body = await SendAsync(HttpMethod.Post, path, requestBody, ct, "ProcessRefund").ConfigureAwait(false);
             var resp = JsonSerializer.Deserialize<ChipperCashCollectionResponse>(body);
 
-            _logger.LogInformation("Chipper refund created: {Id} for {OriginalRef}", resp?.Id, request.GatewayReference);
+            Logger.LogInformation("Chipper refund created: {Id} for {OriginalRef}", resp?.Id, request.GatewayReference);
 
-            var status = MapStatus(resp?.Status);
             var refundResponse = new RefundResponse
             {
                 GatewayReference = resp?.Id ?? string.Empty,
                 Amount = request.Amount,
-                Status = status,
+                Status = MapStatus(resp?.Status),
                 ProcessedAt = DateTime.UtcNow,
                 Message = resp?.Message
             };
 
-            outcomeTag = status == PaymentStatus.Failed
-                ? BhenguPaymentDiagnostics.Outcomes.Declined
-                : BhenguPaymentDiagnostics.Outcomes.Success;
             await TrySetCachedAsync(request.IdempotencyKey, "refund", refundResponse, ct).ConfigureAwait(false);
             return refundResponse;
-        }
-        catch (PaymentDeclinedException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        finally
-        {
-            activity.SetOutcome(outcomeTag);
-            BhenguPaymentDiagnostics.RefundsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcomeTag));
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, request.Currency);
-        var outcomeTag = BhenguPaymentDiagnostics.Outcomes.Error;
-        try
+        return RunPayoutAsync(request.Currency, async () =>
         {
             var cachedResponse = await TryGetCachedAsync<PayoutResponse>(request.IdempotencyKey, "payout", ct).ConfigureAwait(false);
-            if (cachedResponse is not null)
-            {
-                outcomeTag = BhenguPaymentDiagnostics.Outcomes.Success;
-                return cachedResponse;
-            }
+            if (cachedResponse is not null) return cachedResponse;
 
             var msisdn = request.DestinationToken;
             var requestBody = new
@@ -234,34 +177,20 @@ public sealed class ChipperCashPaymentProvider : IPaymentGatewayProvider, IPayou
             var body = await SendAsync(HttpMethod.Post, "v1/disbursements", requestBody, ct, "ProcessPayout").ConfigureAwait(false);
             var resp = JsonSerializer.Deserialize<ChipperCashCollectionResponse>(body);
 
-            _logger.LogInformation("Chipper disbursement created: {Id} status={Status}", resp?.Id, resp?.Status);
+            Logger.LogInformation("Chipper disbursement created: {Id} status={Status}", resp?.Id, resp?.Status);
 
-            var status = MapStatus(resp?.Status);
             var payoutResponse = new PayoutResponse
             {
                 GatewayReference = resp?.Id ?? string.Empty,
-                Status = status,
+                Status = MapStatus(resp?.Status),
                 Amount = request.Amount,
                 Currency = request.Currency,
                 ProcessedAt = DateTime.UtcNow
             };
 
-            outcomeTag = status == PaymentStatus.Failed
-                ? BhenguPaymentDiagnostics.Outcomes.Declined
-                : BhenguPaymentDiagnostics.Outcomes.Success;
             await TrySetCachedAsync(request.IdempotencyKey, "payout", payoutResponse, ct).ConfigureAwait(false);
             return payoutResponse;
-        }
-        catch (PaymentDeclinedException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcomeTag = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        finally
-        {
-            activity.SetOutcome(outcomeTag);
-            BhenguPaymentDiagnostics.PayoutsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcomeTag));
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>
@@ -270,27 +199,15 @@ public sealed class ChipperCashPaymentProvider : IPaymentGatewayProvider, IPayou
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        if (string.IsNullOrWhiteSpace(_options.ApiSecret))
+        return RunWebhookVerify(() =>
         {
-            _logger.LogWarning("Chipper ApiSecret not configured — signature verification cannot succeed.");
-            return false;
-        }
-
-        try
-        {
-            using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.ApiSecret));
-            var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
-            var computedSignature = Convert.ToHexString(computedHash).ToLowerInvariant();
-
-            return CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
-                Encoding.UTF8.GetBytes(computedSignature));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Chipper webhook signature verification raised");
-            return false;
-        }
+            if (string.IsNullOrWhiteSpace(_options.ApiSecret))
+            {
+                Logger.LogWarning("Chipper ApiSecret not configured — signature verification cannot succeed.");
+                return false;
+            }
+            return SignatureHelpers.VerifyHmacSha256(payload, signature, _options.ApiSecret);
+        });
     }
 
     /// <inheritdoc/>
@@ -308,14 +225,14 @@ public sealed class ChipperCashPaymentProvider : IPaymentGatewayProvider, IPayou
                 return Task.FromResult<WebhookEvent?>(null);
             }
 
-            _logger.LogInformation("Parsed Chipper webhook event: {EventType}", evt.Event);
+            Logger.LogInformation("Parsed Chipper webhook event: {EventType}", evt.Event);
             var typed = MapWebhookEvent(evt);
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             return Task.FromResult(typed);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse Chipper webhook event");
+            Logger.LogError(ex, "Failed to parse Chipper webhook event");
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
             return Task.FromResult<WebhookEvent?>(null);
         }
@@ -437,16 +354,7 @@ public sealed class ChipperCashPaymentProvider : IPaymentGatewayProvider, IPayou
         if (!string.IsNullOrWhiteSpace(_options.MerchantId))
             req.Headers.TryAddWithoutValidation("X-Chipper-Merchant-Id", _options.MerchantId);
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Chipper Cash failed", ex);
-        }
-
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -457,7 +365,7 @@ public sealed class ChipperCashPaymentProvider : IPaymentGatewayProvider, IPayou
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Chipper {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Chipper {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(System.Globalization.CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
@@ -480,7 +388,7 @@ public sealed class ChipperCashPaymentProvider : IPaymentGatewayProvider, IPayou
         await _cache.SetAsync(cacheKey, value, s_idempotencyTtl, ct).ConfigureAwait(false);
     }
 
-    private string BuildCacheKey(string idempotencyKey, string operation)
+    private static string BuildCacheKey(string idempotencyKey, string operation)
     {
         var hashBytes = SHA256.HashData(Encoding.UTF8.GetBytes(idempotencyKey));
         var hash = Convert.ToHexString(hashBytes).ToLowerInvariant();
