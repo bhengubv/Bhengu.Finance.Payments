@@ -355,7 +355,8 @@ public sealed class UnionPayPaymentProvider : IPaymentGatewayProvider
                 {
                     GatewayReference = reference,
                     Status = status,
-                    EventType = txnType
+                    EventType = txnType,
+                    Category = WebhookEventCategory.Unknown
                 }
             };
 

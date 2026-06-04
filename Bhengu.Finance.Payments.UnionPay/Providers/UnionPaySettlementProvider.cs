@@ -3,6 +3,7 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using Bhengu.Finance.Payments.Core;
@@ -64,13 +65,18 @@ public sealed class UnionPaySettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+    public async IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, [EnumeratorCancellation] CancellationToken ct = default)
     {
+        // UnionPay returns one settlement file per day — iterate the date range and stream each
+        // day's batch as a Settlement. Diagnostics activity wraps the whole iteration; any
+        // upstream errors propagate, but PaymentDeclined-for-this-day is treated as "no file" and skipped.
         using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list");
-        try
+        int yielded = 0;
+        for (var d = fromUtc.Date; d <= toUtc.Date; d = d.AddDays(1))
         {
-            var settlements = new List<Settlement>();
-            for (var d = fromUtc.Date; d <= toUtc.Date; d = d.AddDays(1))
+            ct.ThrowIfCancellationRequested();
+            Settlement? next = null;
+            try
             {
                 var settlementDate = d.ToString("yyyyMMdd", CultureInfo.InvariantCulture);
                 var fields = new Dictionary<string, string>
@@ -108,7 +114,7 @@ public sealed class UnionPaySettlementProvider : ISettlementProvider
                 var grossAmtMinor = long.TryParse(responseFields.GetValueOrDefault("totalAmt"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var gross) ? gross : (long?)null;
                 var txnCount = int.TryParse(responseFields.GetValueOrDefault("totalQty"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var qty) ? qty : 0;
 
-                settlements.Add(new Settlement
+                next = new Settlement
                 {
                     Reference = settlementId,
                     NetAmount = netAmtMinor / 100m,
@@ -118,20 +124,22 @@ public sealed class UnionPaySettlementProvider : ISettlementProvider
                     SettledAt = d,
                     BankAccountReference = responseFields.GetValueOrDefault("settleAcct"),
                     TransactionCount = txnCount
-                });
+                };
             }
-
-            _logger.LogInformation("UnionPay listed {Count} settlements between {From:o} and {To:o}",
-                settlements.Count, fromUtc, toUtc);
-
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return settlements;
+            catch
+            {
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
+                throw;
+            }
+            if (next is not null)
+            {
+                yielded++;
+                yield return next;
+            }
         }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+
+        _logger.LogInformation("UnionPay listed {Count} settlements between {From:o} and {To:o}", yielded, fromUtc, toUtc);
+        activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
     }
 
     /// <inheritdoc />
@@ -144,9 +152,16 @@ public sealed class UnionPaySettlementProvider : ISettlementProvider
             // UnionPay's settlement reference is the batch number; treat it as a YYYYMMDD-derived id
             // for the trailing 8 digits (other formats fall back to today).
             var date = TryParseSettlementDate(settlementReference) ?? DateTime.UtcNow.Date;
-            var list = await ListSettlementsAsync(date, date, ct).ConfigureAwait(false);
+            await foreach (var s in ListSettlementsAsync(date, date, ct).ConfigureAwait(false))
+            {
+                if (s.Reference.Equals(settlementReference, StringComparison.Ordinal))
+                {
+                    activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+                    return s;
+                }
+            }
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return list.FirstOrDefault(s => s.Reference.Equals(settlementReference, StringComparison.Ordinal));
+            return null;
         }
         catch
         {
@@ -156,69 +171,68 @@ public sealed class UnionPaySettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
+    public async IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(string settlementReference, [EnumeratorCancellation] CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(settlementReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.transactions");
-        try
+        string? raw;
+        using (var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.transactions"))
         {
-            var fields = new Dictionary<string, string>
+            try
             {
-                ["version"] = "5.1.0",
-                ["encoding"] = _options.Encoding,
-                ["certId"] = _options.CertId,
-                ["signMethod"] = "01",
-                ["txnType"] = "76",
-                ["txnSubType"] = "02",
-                ["bizType"] = "000000",
-                ["accessType"] = "0",
-                ["merId"] = _options.MerId,
-                ["batchNo"] = settlementReference,
-                ["txnTime"] = DateTime.UtcNow.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture)
-            };
-
-            SignFields(fields);
-            var responseFields = await PostFormAsync(QueryPath, fields, ct, "ListSettlementTransactions").ConfigureAwait(false);
-
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-
-            // UnionPay returns CSV-encoded line items in the `breakDownInfo` field. We split on
-            // either "\n" or "|" and treat the first 6 columns as gatewayRef, type, amount, fee,
-            // currency, createdAt (yyyyMMddHHmmss).
-            var raw = responseFields.GetValueOrDefault("breakDownInfo");
-            if (string.IsNullOrWhiteSpace(raw))
-                return Array.Empty<SettlementTransaction>();
-
-            var lines = raw.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
-            var list = new List<SettlementTransaction>(lines.Length);
-            foreach (var line in lines)
-            {
-                var cols = line.Split(',');
-                if (cols.Length < 5) continue;
-
-                var amt = long.TryParse(cols[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out var a) ? a : 0L;
-                var fee = cols.Length > 3 && long.TryParse(cols[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out var f) ? f : 0L;
-                var createdAt = cols.Length > 5 && DateTime.TryParseExact(cols[5], "yyyyMMddHHmmss", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var dt)
-                    ? dt
-                    : DateTime.UtcNow;
-
-                list.Add(new SettlementTransaction
+                var fields = new Dictionary<string, string>
                 {
-                    GatewayReference = cols[0],
-                    Kind = MapKind(cols[1]),
-                    NetAmount = (amt - fee) / 100m,
-                    GrossAmount = amt / 100m,
-                    Fee = fee / 100m,
-                    Currency = cols.Length > 4 ? cols[4] : _options.Currency,
-                    CreatedAt = createdAt
-                });
+                    ["version"] = "5.1.0",
+                    ["encoding"] = _options.Encoding,
+                    ["certId"] = _options.CertId,
+                    ["signMethod"] = "01",
+                    ["txnType"] = "76",
+                    ["txnSubType"] = "02",
+                    ["bizType"] = "000000",
+                    ["accessType"] = "0",
+                    ["merId"] = _options.MerId,
+                    ["batchNo"] = settlementReference,
+                    ["txnTime"] = DateTime.UtcNow.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture)
+                };
+
+                SignFields(fields);
+                var responseFields = await PostFormAsync(QueryPath, fields, ct, "ListSettlementTransactions").ConfigureAwait(false);
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+
+                // UnionPay returns CSV-encoded line items in the `breakDownInfo` field.
+                raw = responseFields.GetValueOrDefault("breakDownInfo");
             }
-            return list;
+            catch
+            {
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
+                throw;
+            }
         }
-        catch
+
+        if (string.IsNullOrWhiteSpace(raw)) yield break;
+
+        var lines = raw.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+        foreach (var line in lines)
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
+            ct.ThrowIfCancellationRequested();
+            var cols = line.Split(',');
+            if (cols.Length < 5) continue;
+
+            var amt = long.TryParse(cols[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out var a) ? a : 0L;
+            var fee = cols.Length > 3 && long.TryParse(cols[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out var f) ? f : 0L;
+            var createdAt = cols.Length > 5 && DateTime.TryParseExact(cols[5], "yyyyMMddHHmmss", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var dt)
+                ? dt
+                : DateTime.UtcNow;
+
+            yield return new SettlementTransaction
+            {
+                GatewayReference = cols[0],
+                Kind = MapKind(cols[1]),
+                NetAmount = (amt - fee) / 100m,
+                GrossAmount = amt / 100m,
+                Fee = fee / 100m,
+                Currency = cols.Length > 4 ? cols[4] : _options.Currency,
+                CreatedAt = createdAt
+            };
         }
     }
 

@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
@@ -56,34 +57,35 @@ public sealed class PesapalSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+    public async IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list");
-        try
+        List<PesapalStatementData>? items;
+        using (var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list"))
         {
-            var path = $"api/Statements/GetStatement?startDate={fromUtc:yyyy-MM-dd}&endDate={toUtc:yyyy-MM-dd}";
-            var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, _logger, _options, _tokenCache, ct).ConfigureAwait(false);
-            var responseBody = await PesapalHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get, path, body: null, token, ct, "ListSettlements").ConfigureAwait(false);
-            var envelope = JsonSerializer.Deserialize<PesapalStatementListResponse>(responseBody);
-            if (envelope?.Data is null)
+            try
             {
+                var path = $"api/Statements/GetStatement?startDate={fromUtc:yyyy-MM-dd}&endDate={toUtc:yyyy-MM-dd}";
+                var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, _logger, _options, _tokenCache, ct).ConfigureAwait(false);
+                var responseBody = await PesapalHttpClient.SendAsync(
+                    _httpClient, _logger, HttpMethod.Get, path, body: null, token, ct, "ListSettlements").ConfigureAwait(false);
+                var envelope = JsonSerializer.Deserialize<PesapalStatementListResponse>(responseBody);
+                items = envelope?.Data;
+
+                _logger.LogInformation("Pesapal statements listed: {Count} between {From:O} and {To:O}", items?.Count ?? 0, fromUtc, toUtc);
                 activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-                return Array.Empty<Settlement>();
             }
-
-            var settlements = new List<Settlement>(envelope.Data.Count);
-            foreach (var d in envelope.Data)
-                settlements.Add(ToSettlement(d));
-
-            _logger.LogInformation("Pesapal statements listed: {Count} between {From:O} and {To:O}", settlements.Count, fromUtc, toUtc);
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return settlements;
+            catch (Exception ex)
+            {
+                activity.SetOutcome(ClassifyOutcome(ex));
+                throw;
+            }
         }
-        catch (Exception ex)
+
+        if (items is null) yield break;
+        foreach (var d in items)
         {
-            activity.SetOutcome(ClassifyOutcome(ex));
-            throw;
+            ct.ThrowIfCancellationRequested();
+            yield return ToSettlement(d);
         }
     }
 
@@ -116,35 +118,35 @@ public sealed class PesapalSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
+    public async IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(string settlementReference, [EnumeratorCancellation] CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
 
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list_transactions");
-        try
+        List<PesapalTransactionData>? items;
+        using (var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list_transactions"))
         {
-            var path = $"api/Statements/GetSettlementTransactions?settlementId={Uri.EscapeDataString(settlementReference)}";
-            var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, _logger, _options, _tokenCache, ct).ConfigureAwait(false);
-            var responseBody = await PesapalHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get, path, body: null, token, ct, "ListSettlementTransactions").ConfigureAwait(false);
-            var envelope = JsonSerializer.Deserialize<PesapalTransactionListResponse>(responseBody);
-            if (envelope?.Data is null)
+            try
             {
+                var path = $"api/Statements/GetSettlementTransactions?settlementId={Uri.EscapeDataString(settlementReference)}";
+                var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, _logger, _options, _tokenCache, ct).ConfigureAwait(false);
+                var responseBody = await PesapalHttpClient.SendAsync(
+                    _httpClient, _logger, HttpMethod.Get, path, body: null, token, ct, "ListSettlementTransactions").ConfigureAwait(false);
+                var envelope = JsonSerializer.Deserialize<PesapalTransactionListResponse>(responseBody);
+                items = envelope?.Data;
                 activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-                return Array.Empty<SettlementTransaction>();
             }
-
-            var txns = new List<SettlementTransaction>(envelope.Data.Count);
-            foreach (var d in envelope.Data)
-                txns.Add(ToTransaction(d));
-
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return txns;
+            catch (Exception ex)
+            {
+                activity.SetOutcome(ClassifyOutcome(ex));
+                throw;
+            }
         }
-        catch (Exception ex)
+
+        if (items is null) yield break;
+        foreach (var d in items)
         {
-            activity.SetOutcome(ClassifyOutcome(ex));
-            throw;
+            ct.ThrowIfCancellationRequested();
+            yield return ToTransaction(d);
         }
     }
 
