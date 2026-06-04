@@ -7,6 +7,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Settlement;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Razorpay.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -21,22 +22,21 @@ namespace Bhengu.Finance.Payments.Razorpay.Providers;
 /// Razorpay settles funds to the merchant's bank account on T+2 (or T+1 with instant settlements).
 /// The recon endpoint returns line-items inside a single settlement batch — used for ledger reconciliation.
 /// </remarks>
-public sealed class RazorpaySettlementProvider : ISettlementProvider
+public sealed class RazorpaySettlementProvider : BhenguProviderBase, ISettlementProvider
 {
     private readonly RazorpayHttpClient _http;
-    private readonly ILogger<RazorpaySettlementProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Razorpay;
+    public override string ProviderName => ProviderNames.Razorpay;
 
     /// <summary>Create a new settlement provider bound to the supplied HTTP client and options.</summary>
     public RazorpaySettlementProvider(
         HttpClient httpClient,
         IOptions<RazorpayOptions> options,
         ILogger<RazorpaySettlementProvider> logger)
+        : base(logger)
     {
         ArgumentNullException.ThrowIfNull(options);
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _http = new RazorpayHttpClient(httpClient, options.Value, ProviderName, logger);
     }
 
@@ -50,7 +50,7 @@ public sealed class RazorpaySettlementProvider : ISettlementProvider
         var raw = await _http.GetAsync(path, ct, "ListSettlements").ConfigureAwait(false);
         var collection = RazorpayHttpClient.DeserialiseOrThrow<RazorpaySettlementCollection>(raw, ProviderName, "ListSettlements");
 
-        _logger.LogInformation("Razorpay listed {Count} settlements between {From:o} and {To:o}",
+        Logger.LogInformation("Razorpay listed {Count} settlements between {From:o} and {To:o}",
             collection.Items?.Count ?? 0, fromUtc, toUtc);
 
         if (collection.Items is null) yield break;

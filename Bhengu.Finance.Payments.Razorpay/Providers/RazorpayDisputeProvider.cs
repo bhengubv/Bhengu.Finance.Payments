@@ -7,6 +7,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Dispute;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Razorpay.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -17,22 +18,21 @@ namespace Bhengu.Finance.Payments.Razorpay.Providers;
 /// Razorpay disputes / chargebacks provider. Wraps the <c>/v1/disputes</c>,
 /// <c>/v1/disputes/{id}/contest</c>, and <c>/v1/disputes/{id}/accept</c> endpoints.
 /// </summary>
-public sealed class RazorpayDisputeProvider : IDisputeProvider
+public sealed class RazorpayDisputeProvider : BhenguProviderBase, IDisputeProvider
 {
     private readonly RazorpayHttpClient _http;
-    private readonly ILogger<RazorpayDisputeProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Razorpay;
+    public override string ProviderName => ProviderNames.Razorpay;
 
     /// <summary>Create a new dispute provider bound to the supplied HTTP client and options.</summary>
     public RazorpayDisputeProvider(
         HttpClient httpClient,
         IOptions<RazorpayOptions> options,
         ILogger<RazorpayDisputeProvider> logger)
+        : base(logger)
     {
         ArgumentNullException.ThrowIfNull(options);
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _http = new RazorpayHttpClient(httpClient, options.Value, ProviderName, logger);
     }
 
@@ -100,7 +100,7 @@ public sealed class RazorpayDisputeProvider : IDisputeProvider
         var raw = await _http.SendAsync(HttpMethod.Patch, $"v1/disputes/{Uri.EscapeDataString(disputeReference)}/contest", body, ct, "ContestDispute").ConfigureAwait(false);
         var d = RazorpayHttpClient.DeserialiseOrThrow<RazorpayDispute>(raw, ProviderName, "ContestDispute");
 
-        _logger.LogInformation("Razorpay dispute contested: {DisputeId}", d.Id);
+        Logger.LogInformation("Razorpay dispute contested: {DisputeId}", d.Id);
         return MapDispute(d);
     }
 
@@ -112,7 +112,7 @@ public sealed class RazorpayDisputeProvider : IDisputeProvider
         var raw = await _http.SendAsync(HttpMethod.Post, $"v1/disputes/{Uri.EscapeDataString(disputeReference)}/accept", body: null, ct, "AcceptDispute").ConfigureAwait(false);
         var d = RazorpayHttpClient.DeserialiseOrThrow<RazorpayDispute>(raw, ProviderName, "AcceptDispute");
 
-        _logger.LogInformation("Razorpay dispute accepted: {DisputeId}", d.Id);
+        Logger.LogInformation("Razorpay dispute accepted: {DisputeId}", d.Id);
         return MapDispute(d);
     }
 

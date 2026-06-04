@@ -7,8 +7,8 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Marketplace;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Razorpay.Configuration;
-using Bhengu.Finance.Payments.Razorpay.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -27,17 +27,16 @@ namespace Bhengu.Finance.Payments.Razorpay.Providers;
 /// can be referenced by <see cref="ChargeWithSplitAsync"/>; consumers wanting persistence should
 /// store them in their own DB and pass <see cref="ChargeWithSplitRequest.InlineRules"/> directly.
 /// </remarks>
-public sealed class RazorpayMarketplaceProvider : IMarketplaceProvider
+public sealed class RazorpayMarketplaceProvider : BhenguProviderBase, IMarketplaceProvider
 {
     private const string SplitKeyPrefix = "razorpay:split:";
     private static readonly TimeSpan SplitTtl = TimeSpan.FromDays(365);
 
     private readonly RazorpayHttpClient _http;
-    private readonly ILogger<RazorpayMarketplaceProvider> _logger;
     private readonly IBhenguDistributedCache _cache;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Razorpay;
+    public override string ProviderName => ProviderNames.Razorpay;
 
     /// <summary>Create a new marketplace provider bound to the supplied HTTP client, options, and distributed cache for split definitions.</summary>
     public RazorpayMarketplaceProvider(
@@ -45,9 +44,9 @@ public sealed class RazorpayMarketplaceProvider : IMarketplaceProvider
         IOptions<RazorpayOptions> options,
         ILogger<RazorpayMarketplaceProvider> logger,
         IBhenguDistributedCache cache)
+        : base(logger)
     {
         ArgumentNullException.ThrowIfNull(options);
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _cache = cache ?? throw new ArgumentNullException(nameof(cache));
         _http = new RazorpayHttpClient(httpClient, options.Value, ProviderName, logger);
     }
@@ -65,7 +64,7 @@ public sealed class RazorpayMarketplaceProvider : IMarketplaceProvider
     public Task<SubAccount> CreateSubAccountAsync(SubAccountRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return RazorpayObservability.ObserveAsync("create_sub_account", () => CreateSubAccountCoreAsync(request, ct));
+        return RunOperationAsync("create_sub_account", () => CreateSubAccountCoreAsync(request, ct), ct);
     }
 
     private async Task<SubAccount> CreateSubAccountCoreAsync(SubAccountRequest request, CancellationToken ct)
@@ -98,7 +97,7 @@ public sealed class RazorpayMarketplaceProvider : IMarketplaceProvider
         var raw = await _http.SendAsync(HttpMethod.Post, "v2/accounts", body, ct, "CreateAccount", request.IdempotencyKey).ConfigureAwait(false);
         var account = RazorpayHttpClient.DeserialiseOrThrow<RazorpayLinkedAccount>(raw, ProviderName, "CreateAccount");
 
-        _logger.LogInformation("Razorpay linked account created: {AccountId}", account.Id);
+        Logger.LogInformation("Razorpay linked account created: {AccountId}", account.Id);
 
         return new SubAccount
         {
@@ -116,7 +115,7 @@ public sealed class RazorpayMarketplaceProvider : IMarketplaceProvider
     public Task<SubAccount?> GetSubAccountAsync(string subAccountReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(subAccountReference);
-        return RazorpayObservability.ObserveAsync("get_sub_account", () => GetSubAccountCoreAsync(subAccountReference, ct));
+        return RunOperationAsync("get_sub_account", () => GetSubAccountCoreAsync(subAccountReference, ct), ct);
     }
 
     private async Task<SubAccount?> GetSubAccountCoreAsync(string subAccountReference, CancellationToken ct)
@@ -148,7 +147,7 @@ public sealed class RazorpayMarketplaceProvider : IMarketplaceProvider
     {
         // Razorpay's v2 Accounts API doesn't expose a public list endpoint — accounts are looked up
         // by id. Consumers that need a roster should mirror it in their own DB on creation.
-        _logger.LogDebug("Razorpay does not expose a public account-list endpoint; returning empty");
+        Logger.LogDebug("Razorpay does not expose a public account-list endpoint; returning empty");
         yield break;
     }
 #pragma warning restore CS1998
@@ -157,7 +156,7 @@ public sealed class RazorpayMarketplaceProvider : IMarketplaceProvider
     public Task<SplitDefinition> CreateSplitAsync(SplitDefinitionRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return RazorpayObservability.ObserveAsync("create_split", () => CreateSplitCoreAsync(request, ct));
+        return RunOperationAsync("create_split", () => CreateSplitCoreAsync(request, ct), ct);
     }
 
     private async Task<SplitDefinition> CreateSplitCoreAsync(SplitDefinitionRequest request, CancellationToken ct)
@@ -174,7 +173,7 @@ public sealed class RazorpayMarketplaceProvider : IMarketplaceProvider
 
         await _cache.SetAsync(SplitKeyPrefix + reference, split, SplitTtl, ct).ConfigureAwait(false);
 
-        _logger.LogInformation("Razorpay split cached as {SplitId} ({RuleCount} beneficiaries)", reference, request.Rules.Count);
+        Logger.LogInformation("Razorpay split cached as {SplitId} ({RuleCount} beneficiaries)", reference, request.Rules.Count);
         return split;
     }
 
@@ -182,15 +181,16 @@ public sealed class RazorpayMarketplaceProvider : IMarketplaceProvider
     public Task<SplitDefinition?> GetSplitAsync(string splitReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(splitReference);
-        return RazorpayObservability.ObserveAsync("get_split", () =>
-            _cache.GetAsync<SplitDefinition>(SplitKeyPrefix + splitReference, ct));
+        return RunOperationAsync("get_split",
+            () => _cache.GetAsync<SplitDefinition>(SplitKeyPrefix + splitReference, ct),
+            ct);
     }
 
     /// <inheritdoc />
     public Task<PaymentResponse> ChargeWithSplitAsync(ChargeWithSplitRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return RazorpayObservability.ObserveChargeAsync(request.Payment.Currency, () => ChargeWithSplitCoreAsync(request, ct));
+        return RunChargeAsync(request.Payment.Currency, () => ChargeWithSplitCoreAsync(request, ct), ct);
     }
 
     private async Task<PaymentResponse> ChargeWithSplitCoreAsync(ChargeWithSplitRequest request, CancellationToken ct)
@@ -231,7 +231,7 @@ public sealed class RazorpayMarketplaceProvider : IMarketplaceProvider
             $"v1/payments/{Uri.EscapeDataString(capture.Id ?? payment.PaymentMethodToken)}/transfers",
             new { transfers }, ct, "CreateTransfers", payment.IdempotencyKey).ConfigureAwait(false);
 
-        _logger.LogInformation("Razorpay split captured: payment={PaymentId} beneficiaries={BeneficiaryCount}",
+        Logger.LogInformation("Razorpay split captured: payment={PaymentId} beneficiaries={BeneficiaryCount}",
             capture.Id, rules.Count);
 
         return new PaymentResponse

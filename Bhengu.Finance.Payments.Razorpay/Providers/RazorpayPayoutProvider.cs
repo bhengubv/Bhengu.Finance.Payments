@@ -5,6 +5,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Razorpay.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -20,24 +21,23 @@ namespace Bhengu.Finance.Payments.Razorpay.Providers;
 /// <see cref="RazorpayPaymentProvider"/> also implements <see cref="IPayoutProvider"/> for
 /// backwards-compatibility; new consumers should prefer this provider via DI keyed lookup.
 /// </remarks>
-public sealed class RazorpayPayoutProvider : IPayoutProvider
+public sealed class RazorpayPayoutProvider : BhenguProviderBase, IPayoutProvider
 {
     private readonly RazorpayHttpClient _http;
     private readonly RazorpayOptions _options;
-    private readonly ILogger<RazorpayPayoutProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Razorpay;
+    public override string ProviderName => ProviderNames.Razorpay;
 
     /// <summary>Create a new payout provider bound to the supplied HTTP client and options.</summary>
     public RazorpayPayoutProvider(
         HttpClient httpClient,
         IOptions<RazorpayOptions> options,
         ILogger<RazorpayPayoutProvider> logger)
+        : base(logger)
     {
         ArgumentNullException.ThrowIfNull(options);
         _options = options.Value;
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _http = new RazorpayHttpClient(httpClient, _options, ProviderName, logger);
     }
 
@@ -72,7 +72,7 @@ public sealed class RazorpayPayoutProvider : IPayoutProvider
         var raw = await _http.SendAsync(HttpMethod.Post, "v1/payouts", body, ct, "ProcessPayout", request.IdempotencyKey).ConfigureAwait(false);
         var payout = RazorpayHttpClient.DeserialiseOrThrow<RazorpayPayout>(raw, ProviderName, "ProcessPayout");
 
-        _logger.LogInformation("Razorpay payout created: {PayoutId} status={Status}", payout.Id, payout.Status);
+        Logger.LogInformation("Razorpay payout created: {PayoutId} status={Status}", payout.Id, payout.Status);
 
         return new PayoutResponse
         {

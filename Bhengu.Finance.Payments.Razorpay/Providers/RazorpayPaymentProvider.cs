@@ -2,7 +2,6 @@
 
 using System.Net;
 using System.Net.Http.Headers;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -11,6 +10,8 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.Razorpay.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -29,13 +30,12 @@ namespace Bhengu.Finance.Payments.Razorpay.Providers;
 /// To use the Orders flow instead, pass <c>"order"</c> as the <c>flow</c> key in Metadata
 /// and the SDK will create an order and surface the order_id + checkout URL in the response.
 /// </remarks>
-public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class RazorpayPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly RazorpayOptions _options;
-    private readonly ILogger<RazorpayPaymentProvider> _logger;
 
-    public string ProviderName => ProviderNames.Razorpay;
+    public override string ProviderName => ProviderNames.Razorpay;
 
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
@@ -59,10 +59,10 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         HttpClient httpClient,
         IOptions<RazorpayOptions> options,
         ILogger<RazorpayPaymentProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.KeyId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(RazorpayOptions.KeyId)} is required");
@@ -80,7 +80,7 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return Internals.RazorpayObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+        return RunChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct), ct);
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
@@ -108,7 +108,7 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
             var orderRaw = await SendAsync(HttpMethod.Post, "v1/orders", orderBody, ct, "CreateOrder", request.IdempotencyKey).ConfigureAwait(false);
             var order = JsonSerializer.Deserialize<RazorpayOrderResponse>(orderRaw);
 
-            _logger.LogInformation("Razorpay order created: {OrderId} status={Status}", order?.Id, order?.Status);
+            Logger.LogInformation("Razorpay order created: {OrderId} status={Status}", order?.Id, order?.Status);
 
             return new PaymentResponse
             {
@@ -134,7 +134,7 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
             captureBody, ct, "CapturePayment", request.IdempotencyKey).ConfigureAwait(false);
         var payment = JsonSerializer.Deserialize<RazorpayPaymentResponse>(raw);
 
-        _logger.LogInformation("Razorpay payment captured: {PaymentId} status={Status}", payment?.Id, payment?.Status);
+        Logger.LogInformation("Razorpay payment captured: {PaymentId} status={Status}", payment?.Id, payment?.Status);
 
         return new PaymentResponse
         {
@@ -151,7 +151,7 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return Internals.RazorpayObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+        return RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct), ct);
     }
 
     private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
@@ -170,7 +170,7 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
             refundBody, ct, "ProcessRefund", request.IdempotencyKey).ConfigureAwait(false);
         var refund = JsonSerializer.Deserialize<RazorpayRefundResponse>(raw);
 
-        _logger.LogInformation("Razorpay refund created: {RefundId} for payment {PaymentId}",
+        Logger.LogInformation("Razorpay refund created: {RefundId} for payment {PaymentId}",
             refund?.Id, request.GatewayReference);
 
         return new RefundResponse
@@ -187,7 +187,7 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return Internals.RazorpayObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+        return RunPayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct), ct);
     }
 
     private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
@@ -217,7 +217,7 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         var raw = await SendAsync(HttpMethod.Post, "v1/payouts", payoutBody, ct, "ProcessPayout", request.IdempotencyKey).ConfigureAwait(false);
         var payout = JsonSerializer.Deserialize<RazorpayPayoutResponse>(raw);
 
-        _logger.LogInformation("Razorpay payout created: {PayoutId} status={Status}", payout?.Id, payout?.Status);
+        Logger.LogInformation("Razorpay payout created: {PayoutId} status={Status}", payout?.Id, payout?.Status);
 
         return new PayoutResponse
         {
@@ -237,36 +237,18 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
 
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
-            _logger.LogWarning("Razorpay WebhookSecret not configured — signature verification cannot succeed.");
-            Internals.RazorpayObservability.RecordWebhookVerification(false);
-            return false;
+            Logger.LogWarning("Razorpay WebhookSecret not configured — signature verification cannot succeed.");
+            return RunWebhookVerify(() => false);
         }
 
-        bool verified;
-        try
-        {
-            using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
-            var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
-            var computedSignature = Convert.ToHexString(computedHash).ToLowerInvariant();
-
-            verified = CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
-                Encoding.UTF8.GetBytes(computedSignature));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Razorpay webhook signature verification raised");
-            verified = false;
-        }
-        Internals.RazorpayObservability.RecordWebhookVerification(verified);
-        return verified;
+        return RunWebhookVerify(() => SignatureHelpers.VerifyHmacSha256(payload, signature, _options.WebhookSecret));
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        return Internals.RazorpayObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+        return RunOperationAsync("parse_webhook", () => ParseWebhookCoreAsync(payload, ct), ct);
     }
 
     private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
@@ -276,14 +258,14 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
             var webhookEvent = JsonSerializer.Deserialize<RazorpayWebhookEvent>(payload);
             if (webhookEvent is null) return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed Razorpay webhook event: {EventType}", webhookEvent.Event);
+            Logger.LogInformation("Parsed Razorpay webhook event: {EventType}", webhookEvent.Event);
 
             var typed = MapTypedEvent(webhookEvent);
             return Task.FromResult(typed);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse Razorpay webhook event");
+            Logger.LogError(ex, "Failed to parse Razorpay webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -562,16 +544,8 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         if (!string.IsNullOrWhiteSpace(idempotencyKey))
             req.Headers.TryAddWithoutValidation("X-Razorpay-IdempotencyKey", idempotencyKey);
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Razorpay failed", ex);
-        }
-
+        // HttpRequestException is auto-translated to ProviderUnavailableException by BhenguProviderBase.
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -582,7 +556,7 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Razorpay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Razorpay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

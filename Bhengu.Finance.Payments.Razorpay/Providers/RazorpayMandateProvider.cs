@@ -6,6 +6,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Mandate;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Razorpay.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -22,22 +23,21 @@ namespace Bhengu.Finance.Payments.Razorpay.Providers;
 /// the resulting token. We expose that two-step under the SDK's unified
 /// <see cref="IMandateProvider"/> shape.
 /// </remarks>
-public sealed class RazorpayMandateProvider : IMandateProvider
+public sealed class RazorpayMandateProvider : BhenguProviderBase, IMandateProvider
 {
     private readonly RazorpayHttpClient _http;
-    private readonly ILogger<RazorpayMandateProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Razorpay;
+    public override string ProviderName => ProviderNames.Razorpay;
 
     /// <summary>Create a new mandate provider bound to the supplied HTTP client and options.</summary>
     public RazorpayMandateProvider(
         HttpClient httpClient,
         IOptions<RazorpayOptions> options,
         ILogger<RazorpayMandateProvider> logger)
+        : base(logger)
     {
         ArgumentNullException.ThrowIfNull(options);
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _http = new RazorpayHttpClient(httpClient, options.Value, ProviderName, logger);
     }
 
@@ -68,7 +68,7 @@ public sealed class RazorpayMandateProvider : IMandateProvider
         var raw = await _http.SendAsync(HttpMethod.Post, "v1/orders", orderBody, ct, "CreateMandateOrder", request.IdempotencyKey).ConfigureAwait(false);
         var order = RazorpayHttpClient.DeserialiseOrThrow<RazorpayMandateOrder>(raw, ProviderName, "CreateMandateOrder");
 
-        _logger.LogInformation("Razorpay mandate registration order created: {OrderId}", order.Id);
+        Logger.LogInformation("Razorpay mandate registration order created: {OrderId}", order.Id);
 
         return new Mandate
         {
@@ -149,7 +149,7 @@ public sealed class RazorpayMandateProvider : IMandateProvider
         var raw = await _http.SendAsync(HttpMethod.Post, "v1/payments/create/recurring", body, ct, "ChargeMandate", request.IdempotencyKey).ConfigureAwait(false);
         var p = RazorpayHttpClient.DeserialiseOrThrow<RazorpayRecurringPayment>(raw, ProviderName, "ChargeMandate");
 
-        _logger.LogInformation("Razorpay mandate debit created: {PaymentId} status={Status}", p.Id, p.Status);
+        Logger.LogInformation("Razorpay mandate debit created: {PaymentId} status={Status}", p.Id, p.Status);
 
         return new PaymentResponse
         {

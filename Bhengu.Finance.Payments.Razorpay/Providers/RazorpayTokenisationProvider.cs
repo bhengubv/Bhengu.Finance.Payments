@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Vault;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Razorpay.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -26,22 +27,21 @@ namespace Bhengu.Finance.Payments.Razorpay.Providers;
 /// flows where the merchant is already PCI-DSS Level-1 SAQ-D and for orchestrating token deletion
 /// + listing from the merchant backend.
 /// </remarks>
-public sealed class RazorpayTokenisationProvider : ITokenisationProvider
+public sealed class RazorpayTokenisationProvider : BhenguProviderBase, ITokenisationProvider
 {
     private readonly RazorpayHttpClient _http;
-    private readonly ILogger<RazorpayTokenisationProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Razorpay;
+    public override string ProviderName => ProviderNames.Razorpay;
 
     /// <summary>Create a new tokenisation provider bound to the supplied HTTP client and options.</summary>
     public RazorpayTokenisationProvider(
         HttpClient httpClient,
         IOptions<RazorpayOptions> options,
         ILogger<RazorpayTokenisationProvider> logger)
+        : base(logger)
     {
         ArgumentNullException.ThrowIfNull(options);
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _http = new RazorpayHttpClient(httpClient, options.Value, ProviderName, logger);
     }
 
@@ -174,29 +174,33 @@ public sealed class RazorpayTokenisationProvider : ITokenisationProvider
 /// one call. Prefer Razorpay Standard Checkout on the client where possible — only use this where
 /// the merchant is already PCI-DSS Level-1 SAQ-D.
 /// </summary>
-public sealed class RazorpayRawCardTokenisationProvider : IRawCardTokenisationProvider
+public sealed class RazorpayRawCardTokenisationProvider : BhenguProviderBase, IRawCardTokenisationProvider
 {
     private readonly RazorpayHttpClient _http;
-    private readonly ILogger<RazorpayRawCardTokenisationProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Razorpay;
+    public override string ProviderName => ProviderNames.Razorpay;
 
     /// <summary>Create a new raw-card tokenisation provider bound to the supplied HTTP client and options.</summary>
     public RazorpayRawCardTokenisationProvider(
         HttpClient httpClient,
         IOptions<RazorpayOptions> options,
         ILogger<RazorpayRawCardTokenisationProvider> logger)
+        : base(logger)
     {
         ArgumentNullException.ThrowIfNull(options);
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _http = new RazorpayHttpClient(httpClient, options.Value, ProviderName, logger);
     }
 
     /// <inheritdoc />
-    public async Task<PaymentMethod> TokeniseAsync(TokeniseRequest request, CancellationToken ct = default)
+    public Task<PaymentMethod> TokeniseAsync(TokeniseRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return RunOperationAsync("tokenise", () => TokeniseCoreAsync(request, ct), ct);
+    }
+
+    private async Task<PaymentMethod> TokeniseCoreAsync(TokeniseRequest request, CancellationToken ct)
+    {
 
         // 1) ensure a customer exists. Razorpay doesn't let tokens live unattached.
         var customerId = request.CustomerId;
@@ -230,7 +234,7 @@ public sealed class RazorpayRawCardTokenisationProvider : IRawCardTokenisationPr
         var tokenRaw = await _http.SendAsync(HttpMethod.Post, "v1/tokens", tokenBody, ct, "CreateToken", request.IdempotencyKey).ConfigureAwait(false);
         var token = RazorpayHttpClient.DeserialiseOrThrow<RazorpayTokenisationProvider.RazorpayToken>(tokenRaw, ProviderName, "CreateToken");
 
-        _logger.LogInformation("Razorpay token created: {TokenId} for customer {CustomerId}", token.Id, customerId);
+        Logger.LogInformation("Razorpay token created: {TokenId} for customer {CustomerId}", token.Id, customerId);
 
         return RazorpayTokenisationProvider.MapToken(token, customerId, request.DisplayName, request.SetAsDefault);
     }

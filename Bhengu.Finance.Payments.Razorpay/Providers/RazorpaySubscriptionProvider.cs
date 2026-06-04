@@ -5,6 +5,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Subscription;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Razorpay.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -21,22 +22,21 @@ namespace Bhengu.Finance.Payments.Razorpay.Providers;
 /// of billing cycles. Razorpay only supports <c>cancel_at_cycle_end</c> via the <c>cancel_at_cycle_end</c>
 /// query parameter on cancel — pass <c>immediately=false</c> to use it.
 /// </remarks>
-public sealed class RazorpaySubscriptionProvider : ISubscriptionProvider
+public sealed class RazorpaySubscriptionProvider : BhenguProviderBase, ISubscriptionProvider
 {
     private readonly RazorpayHttpClient _http;
-    private readonly ILogger<RazorpaySubscriptionProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Razorpay;
+    public override string ProviderName => ProviderNames.Razorpay;
 
     /// <summary>Create a new subscription provider bound to the supplied HTTP client and options.</summary>
     public RazorpaySubscriptionProvider(
         HttpClient httpClient,
         IOptions<RazorpayOptions> options,
         ILogger<RazorpaySubscriptionProvider> logger)
+        : base(logger)
     {
         ArgumentNullException.ThrowIfNull(options);
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _http = new RazorpayHttpClient(httpClient, options.Value, ProviderName, logger);
     }
 
@@ -65,7 +65,7 @@ public sealed class RazorpaySubscriptionProvider : ISubscriptionProvider
         var raw = await _http.SendAsync(HttpMethod.Post, "v1/plans", body, ct, "CreatePlan", request.IdempotencyKey).ConfigureAwait(false);
         var plan = RazorpayHttpClient.DeserialiseOrThrow<RazorpayPlan>(raw, ProviderName, "CreatePlan");
 
-        _logger.LogInformation("Razorpay plan created: {PlanId} period={Period}x{Interval}", plan.Id, period, interval);
+        Logger.LogInformation("Razorpay plan created: {PlanId} period={Period}x{Interval}", plan.Id, period, interval);
 
         return MapPlan(plan, request.TotalCycles, request.Description);
     }
@@ -111,7 +111,7 @@ public sealed class RazorpaySubscriptionProvider : ISubscriptionProvider
         var raw = await _http.SendAsync(HttpMethod.Post, "v1/subscriptions", body, ct, "CreateSubscription", request.IdempotencyKey).ConfigureAwait(false);
         var sub = RazorpayHttpClient.DeserialiseOrThrow<RazorpaySubscription>(raw, ProviderName, "CreateSubscription");
 
-        _logger.LogInformation("Razorpay subscription created: {SubId} plan={PlanId} status={Status}",
+        Logger.LogInformation("Razorpay subscription created: {SubId} plan={PlanId} status={Status}",
             sub.Id, sub.PlanId, sub.Status);
 
         return MapSubscription(sub, request.CustomerId);
