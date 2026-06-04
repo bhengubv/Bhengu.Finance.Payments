@@ -1,6 +1,6 @@
 # Bhengu.Finance.Payments.PayFast
 
-PayFast (South Africa) provider for the [Bhengu.Finance.Payments](https://github.com/bhengubv/Bhengu.Finance.Payments) SDK family.
+PayFast adapter for the Bhengu.Finance.Payments family — South Africa's leading hosted-checkout and ad-hoc-subscription gateway. Charge, webhook (ITN) verification, recurring subscriptions with pause/resume, and debit-order mandates behind the Bhengu canonical contracts.
 
 ## Install
 
@@ -8,9 +8,24 @@ PayFast (South Africa) provider for the [Bhengu.Finance.Payments](https://github
 dotnet add package Bhengu.Finance.Payments.PayFast
 ```
 
-## Configuration
+## What this package gives you
 
-```json
+| Contract | Provider class | Notes |
+|---|---|---|
+| `IPaymentGatewayProvider` | `PayFastPaymentProvider` | Charge (redirect) / ITN webhook verify; refunds via dashboard |
+| `ISubscriptionProvider` | `PayFastSubscriptionProvider` | Ad-hoc tokenisation-based subscriptions |
+| `ISubscriptionPauseSupport` | `PayFastSubscriptionProvider` | Pause / resume billing |
+| `IMandateProvider` | `PayFastMandateProvider` | Debit-order / pull-payment mandates |
+
+## Wiring
+
+```csharp
+builder.Services.AddPayFastPayments(builder.Configuration);
+```
+
+Bind options from `Bhengu:Finance:Payments:PayFast`:
+
+```jsonc
 {
   "Bhengu": {
     "Finance": {
@@ -18,11 +33,13 @@ dotnet add package Bhengu.Finance.Payments.PayFast
         "PayFast": {
           "MerchantId": "10000100",
           "MerchantKey": "46f0cd694581a",
-          "Passphrase": "jt7NOE43FZPn",
+          "Passphrase": "...",
           "UseSandbox": true,
-          "ReturnUrl": "https://yoursite.co.za/payfast/return",
-          "CancelUrl": "https://yoursite.co.za/payfast/cancel",
-          "NotifyUrl": "https://yoursite.co.za/payfast/itn"
+          "ReturnUrl": "https://example.co.za/payfast/return",   // optional
+          "CancelUrl": "https://example.co.za/payfast/cancel",   // optional
+          "NotifyUrl": "https://example.co.za/payfast/itn",      // optional
+          "BaseUrl": null,        // optional override
+          "SandboxUrl": null      // optional override
         }
       }
     }
@@ -30,85 +47,37 @@ dotnet add package Bhengu.Finance.Payments.PayFast
 }
 ```
 
-## Wire it up
+## Usage
 
 ```csharp
-builder.Services.AddPayFastPayments(builder.Configuration);
-```
-
-Validates `MerchantId` is set at registration. Registers the provider keyed by `ProviderNames.PayFast`, and a startup-validation hosted service.
-
-## `PaymentMethodToken` semantics
-
-PayFast's ad-hoc subscription token (the `pf_token` returned after a customer completes a `subscription_type=2` agreement on PayFast's hosted page). Obtain it by sending the customer through `PayFastFormBuilder.BuildTokenisationUrl()` first.
-
-```csharp
-var formBuilder = sp.GetRequiredService<PayFastFormBuilder>();
-var tokenisationUrl = formBuilder.BuildTokenisationUrl(
-    returnUrl: "https://yoursite.co.za/onboarded",
-    cancelUrl: "https://yoursite.co.za/cancelled",
-    notifyUrl: "https://yoursite.co.za/payfast/itn");
-// Redirect customer to tokenisationUrl; on success, PayFast posts the token back via ITN.
-```
-
-## Metadata keys read
-
-- `payment_id` *(optional)* — merchant payment reference (set on `m_payment_id`)
-- `transaction_id` *(optional, alternative)* — same purpose
-
-## Settlement
-
-**Asynchronous.** `ProcessPaymentAsync` returns `Pending`; the real outcome arrives via the ITN webhook posted to your `NotifyUrl`. Treat the immediate response as "accepted for processing" and the webhook as the source of truth.
-
-## Refunds
-
-PayFast doesn't expose a refund API — `ProcessRefundAsync` returns a manual tracking reference with `Status = Pending`. Process the refund manually in the PayFast merchant dashboard, then update your DB with the manual tracking ref.
-
-## Webhook (ITN)
-
-PayFast posts form-urlencoded ITN data to `NotifyUrl`. The signature is in the `signature` form field — extract it before calling `VerifyWebhookSignature`:
-
-```csharp
-app.MapPost("/webhooks/payfast", async (HttpContext ctx,
-    [FromKeyedServices(ProviderNames.PayFast)] IPaymentGatewayProvider provider) =>
+[ApiController]
+public class CheckoutController(
+    [FromKeyedServices(ProviderNames.PayFast)] IPaymentGatewayProvider gateway) : ControllerBase
 {
-    using var reader = new StreamReader(ctx.Request.Body);
-    var body = await reader.ReadToEndAsync();
-    var parsed = QueryHelpers.ParseQuery(body); // body is form-urlencoded
-    var signature = parsed.GetValueOrDefault("signature").ToString();
-
-    if (!provider.VerifyWebhookSignature(body, signature))
-        return Results.Unauthorized();
-
-    var evt = await provider.ParseWebhookAsync(body);
-    // ... act on evt.GatewayReference + evt.Status
-    return Results.Ok();
-});
+    [HttpPost("charge")]
+    public async Task<PaymentResponse> Charge([FromBody] PaymentRequest request)
+        => await gateway.ProcessPaymentAsync(request);
+}
 ```
 
-## Browser-redirect flow (separate from IPaymentGatewayProvider)
+For first-time customers (no token yet), use `PayFastFormBuilder` (also registered)
+to build a hosted-redirect URL.
 
-For first-time customers (no token yet) use `PayFastFormBuilder` which is registered alongside the provider:
+## Capabilities at runtime
 
 ```csharp
-var formBuilder = sp.GetRequiredService<PayFastFormBuilder>();
-var redirectUrl = formBuilder.BuildOnceOffPaymentUrl(
-    mPaymentId: orderId.ToString(),
-    amount: 99.99m,
-    itemName: "Order #123",
-    emailAddress: "buyer@example.com");
-// Redirect customer to redirectUrl.
+if (gateway.Capabilities.HasFlag(ProviderCapabilities.Webhook))
+    var evt = await gateway.ParseWebhookAsync(body);
+
+if (gateway is ISubscriptionPauseSupport pause)
+    await pause.PauseSubscriptionAsync(subscriptionId);
 ```
 
-## Provider-specific extras
+## Status
 
-`PayFastPaymentProvider` exposes server-to-server methods beyond the generic interface:
-- `FetchTokenAsync(token)` — get a tokenisation agreement's status
-- `CancelTokenAsync(token)` — cancel an ad-hoc subscription
-- `QueryTransactionAsync(txnOrPaymentId)` — server-side transaction lookup
+- Apache-2.0
+- Multi-target: net8.0 + net10.0
+- Source: https://github.com/bhengubv/Bhengu.Finance.Payments
 
-Inject the concrete `PayFastPaymentProvider` (not just `IPaymentGatewayProvider`) to use these.
-
-## License
-
-Apache 2.0. © 2026 The Other Bhengu (Pty) Ltd t/a The Geek.
+For full SDK docs, observability wiring, resilience configuration and the family map see
+the [main README](https://github.com/bhengubv/Bhengu.Finance.Payments).

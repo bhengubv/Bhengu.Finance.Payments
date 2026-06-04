@@ -1,8 +1,6 @@
 # Bhengu.Finance.Payments.Pesapal
 
-Pesapal (East Africa) provider for the [Bhengu.Finance.Payments](https://github.com/bhengubv/Bhengu.Finance.Payments) SDK family.
-
-Countries: Kenya · Uganda · Tanzania · Rwanda · Zambia · Malawi. Hosted-payment-page checkout (cards, M-Pesa, Airtel Money, EFT) via Pesapal API 3.0.
+Pesapal adapter for the Bhengu.Finance.Payments family — hosted-payment-page checkout (cards, M-Pesa, Airtel Money, EFT) across Kenya, Uganda, Tanzania, Rwanda, Zambia and Malawi via Pesapal API 3.0. Charge, refund, IPN webhook verification, recurring subscriptions, and settlement reconciliation behind the Bhengu canonical contracts.
 
 ## Install
 
@@ -10,9 +8,23 @@ Countries: Kenya · Uganda · Tanzania · Rwanda · Zambia · Malawi. Hosted-pay
 dotnet add package Bhengu.Finance.Payments.Pesapal
 ```
 
-## Configuration
+## What this package gives you
 
-```json
+| Contract | Provider class | Notes |
+|---|---|---|
+| `IPaymentGatewayProvider` | `PesapalPaymentProvider` | Charge (redirect) / refund / IPN verify |
+| `ISubscriptionProvider` | `PesapalSubscriptionProvider` | Plans + subscriptions |
+| `ISettlementProvider` | `PesapalSettlementProvider` | Reconciliation feed |
+
+## Wiring
+
+```csharp
+builder.Services.AddPesapalPayments(builder.Configuration);
+```
+
+Bind options from `Bhengu:Finance:Payments:Pesapal`:
+
+```jsonc
 {
   "Bhengu": {
     "Finance": {
@@ -21,10 +33,12 @@ dotnet add package Bhengu.Finance.Payments.Pesapal
           "ConsumerKey": "...",
           "ConsumerSecret": "...",
           "IpnId": "...",
-          "CallbackUrl": "https://yoursite.example/pesapal/return",
-          "IpnUrl": "https://yoursite.example/webhooks/pesapal",
+          "CallbackUrl": "https://example.com/pesapal/return",
+          "IpnUrl": "https://example.com/webhooks/pesapal",
           "Currency": "KES",
-          "UseSandbox": true
+          "UseSandbox": true,
+          "BaseUrl": null,        // optional override
+          "SandboxUrl": null      // optional override
         }
       }
     }
@@ -32,69 +46,31 @@ dotnet add package Bhengu.Finance.Payments.Pesapal
 }
 ```
 
-Required: `ConsumerKey` and `ConsumerSecret` (used to obtain a 5-min Bearer token via `api/Auth/RequestToken`). `IpnId` is required on `ProcessPaymentAsync` — obtain it once via `api/URLSetup/RegisterIPN`.
-
-## Wire it up
+## Usage
 
 ```csharp
-builder.Services.AddPesapalPayments(builder.Configuration);
-```
-
-Validates `ConsumerKey` and `ConsumerSecret` at registration. Access tokens refreshed every 4.5 minutes.
-
-## `PaymentMethodToken` semantics
-
-The merchant **order `id`** sent on `SubmitOrderRequest` — your reference.
-
-## Metadata keys
-
-| Key | Required | Format | Example |
-| --- | --- | --- | --- |
-| `email` | Optional | E-mail | `buyer@example.com` |
-| `phone_number` | Optional | Phone number | `+254712345678` |
-| `country_code` | Optional | ISO-3166 alpha-2 (defaults to `KE`) | `UG` |
-| `first_name` | Optional | Given name | `Thandi` |
-| `last_name` | Optional | Family name | `Bhengu` |
-
-## Settlement
-
-**Asynchronous.** `ProcessPaymentAsync` returns `Pending` plus the Pesapal hosted-page `RedirectUrl` and the `OrderTrackingId` as `GatewayReference`. Real outcome arrives via IPN to your registered IPN URL.
-
-Missing `IpnId` throws `ProviderConfigurationException`.
-
-## Refunds
-
-Yes — `ProcessRefundAsync` calls `POST api/Transactions/RefundRequest` with `confirmation_code`, `amount`, and `remarks`. Pesapal status `200` → Refunded; otherwise Failed.
-
-## Payouts
-
-**Not supported.** Pesapal doesn't expose payouts on the standard merchant API.
-
-## Webhook
-
-**Pesapal does NOT HMAC IPN payloads.** `VerifyWebhookSignature` does a constant-time comparison between the supplied signature and the configured `ConsumerSecret` — callers must source the signature from a trusted reverse-proxy header. **Production callers SHOULD additionally call `api/Transactions/GetTransactionStatus`** with the `OrderTrackingId`.
-
-```csharp
-app.MapPost("/webhooks/pesapal", async (HttpContext ctx,
-    [FromKeyedServices(ProviderNames.Pesapal)] IPaymentGatewayProvider provider) =>
+[ApiController]
+public class CheckoutController(
+    [FromKeyedServices(ProviderNames.Pesapal)] IPaymentGatewayProvider gateway) : ControllerBase
 {
-    using var reader = new StreamReader(ctx.Request.Body);
-    var body = await reader.ReadToEndAsync();
-
-    var evt = await provider.ParseWebhookAsync(body);
-    if (evt is null) return Results.Ok();
-
-    // Confirm via GetTransactionStatus(evt.GatewayReference) before treating as authoritative.
-    return Results.Ok();
-});
+    [HttpPost("charge")]
+    public async Task<PaymentResponse> Charge([FromBody] PaymentRequest request)
+        => await gateway.ProcessPaymentAsync(request);
+}
 ```
 
-The IPN body carries `OrderTrackingId` and `OrderNotificationType` — parsed events always have `Status = Pending` (canonical settlement state comes from `GetTransactionStatus`).
+## Capabilities at runtime
 
-## Capabilities
+```csharp
+if (gateway.Capabilities.HasFlag(ProviderCapabilities.Refund))
+    await gateway.ProcessRefundAsync(refundRequest);
+```
 
-`Charge | Refund | Webhook | RedirectFlow | Cards | MobileMoney`.
+## Status
 
-## License
+- Apache-2.0
+- Multi-target: net8.0 + net10.0
+- Source: https://github.com/bhengubv/Bhengu.Finance.Payments
 
-Apache 2.0. © 2026 The Other Bhengu (Pty) Ltd t/a The Geek.
+For full SDK docs, observability wiring, resilience configuration and the family map see
+the [main README](https://github.com/bhengubv/Bhengu.Finance.Payments).

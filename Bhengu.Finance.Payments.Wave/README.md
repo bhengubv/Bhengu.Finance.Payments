@@ -1,8 +1,6 @@
 # Bhengu.Finance.Payments.Wave
 
-Wave provider for the [Bhengu.Finance.Payments](https://github.com/bhengubv/Bhengu.Finance.Payments) SDK family.
-
-Countries: Senegal · Côte d'Ivoire · Mali · Uganda. Wave's hosted Checkout Sessions for collections and Payouts for disbursements via the Wave Business REST API.
+Wave adapter for the Bhengu.Finance.Payments family — hosted Checkout Sessions for collections and Payouts for disbursements across Senegal, Côte d'Ivoire, Mali, and Uganda via the Wave Business REST API. Charge, refund, webhook verification, and payouts behind the Bhengu canonical contracts.
 
 ## Install
 
@@ -10,9 +8,23 @@ Countries: Senegal · Côte d'Ivoire · Mali · Uganda. Wave's hosted Checkout S
 dotnet add package Bhengu.Finance.Payments.Wave
 ```
 
-## Configuration
+## What this package gives you
 
-```json
+| Contract | Provider class | Notes |
+|---|---|---|
+| `IPaymentGatewayProvider` | `WavePaymentProvider` | Checkout Session charge / refund / webhook verify |
+| `IPayoutProvider` | `WavePaymentProvider` | Wallet disbursement |
+| `IPayoutProvider` | `WavePayoutProvider` | Standalone payout adapter |
+
+## Wiring
+
+```csharp
+builder.Services.AddWavePayments(builder.Configuration);
+```
+
+Bind options from `Bhengu:Finance:Payments:Wave`:
+
+```jsonc
 {
   "Bhengu": {
     "Finance": {
@@ -21,8 +33,9 @@ dotnet add package Bhengu.Finance.Payments.Wave
           "ApiKey": "wave_sn_test_...",
           "WebhookSecret": "...",
           "Currency": "XOF",
-          "SuccessUrl": "https://yoursite.example/wave/success",
-          "ErrorUrl": "https://yoursite.example/wave/error"
+          "SuccessUrl": "https://example.com/wave/success",   // optional
+          "ErrorUrl": "https://example.com/wave/error",       // optional
+          "BaseUrl": null                                      // optional override
         }
       }
     }
@@ -30,73 +43,34 @@ dotnet add package Bhengu.Finance.Payments.Wave
 }
 ```
 
-Required: `ApiKey` (Bearer token on every request). `WebhookSecret` is HMAC-SHA256 secret for signature verification.
-
-## Wire it up
+## Usage
 
 ```csharp
-builder.Services.AddWavePayments(builder.Configuration);
-```
-
-Validates `ApiKey` at registration.
-
-## `PaymentMethodToken` semantics
-
-**Client reference** — Wave stamps it on the Checkout Session as `client_reference`. Use your order id or any merchant string; Wave doesn't tokenise the payer's wallet.
-
-## Metadata
-
-`Metadata` is not read by the provider. Pass merchant metadata via `PaymentMethodToken` (as `client_reference`) instead.
-
-## `PayoutRequest.DestinationToken` format
-
-Either `"<countryCode>:<phone>"` or just `<phone>` (defaults to `SN` country).
-
-Examples:
-- `"SN:221761234567"` — Senegal
-- `"CI:2250712345678"` — Côte d'Ivoire
-- `"221761234567"` — defaults to Senegal
-
-## Settlement
-
-**Asynchronous.** `ProcessPaymentAsync` returns `Pending` plus a `RedirectUrl` (`wave_launch_url` — open in the Wave app or browser). Final outcome arrives via webhook.
-
-Amounts are sent as integer whole-units (XOF/XAF are not subunit currencies).
-
-## Refunds
-
-Yes — `ProcessRefundAsync` calls `POST v1/checkout/sessions/{sessionId}/refund` with an empty body. Wave refunds the full session amount.
-
-## Payouts
-
-**Yes.** `IPayoutProvider.ProcessPayoutAsync` calls `POST v1/payouts` with the recipient's MSISDN and country.
-
-## Webhook
-
-HMAC-SHA256 of `<timestamp>.<payload>`, hex-encoded lowercase. The header format is `Wave-Signature: t=<unix>,v1=<sig>`.
-
-```csharp
-app.MapPost("/webhooks/wave", async (HttpContext ctx,
-    [FromKeyedServices(ProviderNames.Wave)] IPaymentGatewayProvider provider) =>
+[ApiController]
+public class CheckoutController(
+    [FromKeyedServices(ProviderNames.Wave)] IPaymentGatewayProvider gateway) : ControllerBase
 {
-    using var reader = new StreamReader(ctx.Request.Body);
-    var body = await reader.ReadToEndAsync();
-    var signature = ctx.Request.Headers["Wave-Signature"].ToString();  // "t=...,v1=..."
-
-    if (!provider.VerifyWebhookSignature(body, signature))
-        return Results.Unauthorized();
-
-    var evt = await provider.ParseWebhookAsync(body);
-    return Results.Ok();
-});
+    [HttpPost("charge")]
+    public async Task<PaymentResponse> Charge([FromBody] PaymentRequest request)
+        => await gateway.ProcessPaymentAsync(request);
+}
 ```
 
-Recognised event types: `checkout.session.completed`, `checkout.session.payment_succeeded`, `checkout.session.payment_failed`, `merchant.payment_refunded`, `checkout.session.refunded`, `payout.completed`, `payout.failed`.
+`PayoutRequest.DestinationToken` format: `"<countryCode>:<phone>"` or just `<phone>`
+(defaults to `SN`). Example: `"SN:221761234567"`.
 
-## Capabilities
+## Capabilities at runtime
 
-`Charge | Refund | Payout | Webhook | MobileMoney | RedirectFlow`.
+```csharp
+if (gateway.Capabilities.HasFlag(ProviderCapabilities.Refund))
+    await gateway.ProcessRefundAsync(refundRequest);
+```
 
-## License
+## Status
 
-Apache 2.0. © 2026 The Other Bhengu (Pty) Ltd t/a The Geek.
+- Apache-2.0
+- Multi-target: net8.0 + net10.0
+- Source: https://github.com/bhengubv/Bhengu.Finance.Payments
+
+For full SDK docs, observability wiring, resilience configuration and the family map see
+the [main README](https://github.com/bhengubv/Bhengu.Finance.Payments).

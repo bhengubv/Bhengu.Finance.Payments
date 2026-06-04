@@ -1,8 +1,6 @@
 # Bhengu.Finance.Payments.Yoco
 
-Yoco (South Africa) provider for the [Bhengu.Finance.Payments](https://github.com/bhengubv/Bhengu.Finance.Payments) SDK family.
-
-Server-to-server card charges and refunds via Yoco's Online REST API. South Africa's largest local-merchant card acquirer.
+Yoco adapter for the Bhengu.Finance.Payments family — South Africa's largest local-merchant card acquirer. Server-to-server card charges, refunds, payouts, tokenisation (vaulted + SAQ-D raw card), 3-D Secure step-up, and settlement reconciliation via Yoco's Online REST API, behind the Bhengu canonical contracts.
 
 ## Install
 
@@ -10,16 +8,34 @@ Server-to-server card charges and refunds via Yoco's Online REST API. South Afri
 dotnet add package Bhengu.Finance.Payments.Yoco
 ```
 
-## Configuration
+## What this package gives you
 
-```json
+| Contract | Provider class | Notes |
+|---|---|---|
+| `IPaymentGatewayProvider` | `YocoPaymentProvider` | Charge / refund / webhook verify |
+| `IPayoutProvider` | `YocoPayoutProvider` | Merchant payouts |
+| `ITokenisationProvider` | `YocoTokenisationProvider` | Read vaulted card tokens |
+| `IRawCardTokenisationProvider` | `YocoRawCardTokenisationProvider` | SAQ-D — accepts raw PAN+CVV |
+| `IThreeDSecureProvider` | `YocoThreeDSecureProvider` | SCA step-up flow |
+| `ISettlementProvider` | `YocoSettlementProvider` | Reconciliation feed |
+
+## Wiring
+
+```csharp
+builder.Services.AddYocoPayments(builder.Configuration);
+```
+
+Bind options from `Bhengu:Finance:Payments:Yoco`:
+
+```jsonc
 {
   "Bhengu": {
     "Finance": {
       "Payments": {
         "Yoco": {
           "SecretKey": "sk_test_...",
-          "WebhookSecret": "whsec_..."
+          "WebhookSecret": "whsec_...",
+          "BaseUrl": null         // optional override
         }
       }
     }
@@ -27,74 +43,37 @@ dotnet add package Bhengu.Finance.Payments.Yoco
 }
 ```
 
-Required: `SecretKey` (Bearer token on every request).
-
-## Wire it up
+## Usage
 
 ```csharp
-builder.Services.AddYocoPayments(builder.Configuration);
-```
-
-Validates `SecretKey` at registration. Registers the provider keyed by `ProviderNames.Yoco`, plus startup validation.
-
-## `PaymentMethodToken` semantics
-
-A **Yoco card token** (e.g. `tok_visa_...`) produced by client-side tokenisation in Yoco's Web/Mobile SDK. Pass it directly:
-
-```csharp
-var response = await provider.ProcessPaymentAsync(new PaymentRequest
+[ApiController]
+public class CheckoutController(
+    [FromKeyedServices(ProviderNames.Yoco)] IPaymentGatewayProvider gateway) : ControllerBase
 {
-    PaymentMethodToken = "tok_visa_...",
-    Amount = 99.99m,
-    Currency = "ZAR",
-    Description = "Order #123"
-});
+    [HttpPost("charge")]
+    public async Task<PaymentResponse> Charge([FromBody] PaymentRequest request)
+        => await gateway.ProcessPaymentAsync(request);
+}
 ```
 
-The provider POSTs to `charges/` with `amountInCents` (Amount × 100) and the token.
+`PaymentRequest.PaymentMethodToken` is a Yoco card token (e.g. `tok_visa_...`)
+from client-side tokenisation in Yoco's Web/Mobile SDK.
 
-## Metadata
-
-All keys in `PaymentRequest.Metadata` are forwarded verbatim on the `metadata` field of the charge — visible in the Yoco dashboard.
-
-## Settlement
-
-**Synchronous.** `ProcessPaymentAsync` returns `Completed`, `Pending`, or `Failed` directly from the HTTP response. The webhook is still your source of truth for any async state changes (disputes, refunds processed out-of-band).
-
-## Refunds
-
-Yes — `ProcessRefundAsync` calls `POST refunds/` with `chargeId` and `amountInCents`.
-
-## Payouts
-
-**Not supported.** Yoco's standard merchant API doesn't expose payouts; the provider intentionally does NOT implement `IPayoutProvider`. Merchants needing payouts should use Yoco Business / Marketplace tooling outside this SDK.
-
-## Webhook
-
-HMAC-SHA256 of the raw body using `WebhookSecret`, base64-encoded, supplied in the `Yoco-Signature` header.
+## Capabilities at runtime
 
 ```csharp
-app.MapPost("/webhooks/yoco", async (HttpContext ctx,
-    [FromKeyedServices(ProviderNames.Yoco)] IPaymentGatewayProvider provider) =>
-{
-    using var reader = new StreamReader(ctx.Request.Body);
-    var body = await reader.ReadToEndAsync();
-    var signature = ctx.Request.Headers["Yoco-Signature"].ToString();
+if (gateway.Capabilities.HasFlag(ProviderCapabilities.Refund))
+    await gateway.ProcessRefundAsync(refundRequest);
 
-    if (!provider.VerifyWebhookSignature(body, signature))
-        return Results.Unauthorized();
-
-    var evt = await provider.ParseWebhookAsync(body);
-    return Results.Ok();
-});
+if (gateway is IThreeDSecureProvider tds)
+    var challenge = await tds.StartAuthenticationAsync(intent);
 ```
 
-Recognised event types: `payment.succeeded`, `payment.failed`, `refund.succeeded`. Other event types return `null` from `ParseWebhookAsync`.
+## Status
 
-## Capabilities
+- Apache-2.0
+- Multi-target: net8.0 + net10.0
+- Source: https://github.com/bhengubv/Bhengu.Finance.Payments
 
-`Charge | Refund | Webhook | SyncSettlement | Cards`.
-
-## License
-
-Apache 2.0. © 2026 The Other Bhengu (Pty) Ltd t/a The Geek.
+For full SDK docs, observability wiring, resilience configuration and the family map see
+the [main README](https://github.com/bhengubv/Bhengu.Finance.Payments).

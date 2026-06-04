@@ -1,8 +1,6 @@
 # Bhengu.Finance.Payments.Razorpay
 
-Razorpay (India) provider for the [Bhengu.Finance.Payments](https://github.com/bhengubv/Bhengu.Finance.Payments) SDK family.
-
-India's most popular gateway. Cards, UPI, netbanking, EMI, wallets via the Razorpay REST API. Server-side capture of pre-authorised payments, refunds, and RazorpayX payouts.
+Razorpay adapter for the Bhengu.Finance.Payments family — India's most popular gateway covering cards, UPI, netbanking, EMI, and wallets via the Razorpay REST API. Server-side capture, refunds, RazorpayX payouts, vaulted card tokenisation, 3-D Secure step-up, recurring subscriptions, mandates (eNACH/UPI AutoPay), dispute lifecycle, marketplace Route splits, and settlement reconciliation behind the Bhengu canonical contracts.
 
 ## Install
 
@@ -10,9 +8,30 @@ India's most popular gateway. Cards, UPI, netbanking, EMI, wallets via the Razor
 dotnet add package Bhengu.Finance.Payments.Razorpay
 ```
 
-## Configuration
+## What this package gives you
 
-```json
+| Contract | Provider class | Notes |
+|---|---|---|
+| `IPaymentGatewayProvider` | `RazorpayPaymentProvider` | Charge / refund / webhook verify |
+| `IPayoutProvider` | `RazorpayPaymentProvider` | RazorpayX IMPS payouts |
+| `IPayoutProvider` | `RazorpayPayoutProvider` | Standalone payout adapter |
+| `ITokenisationProvider` | `RazorpayTokenisationProvider` | Read vaulted card tokens |
+| `IThreeDSecureProvider` | `RazorpayThreeDSecureProvider` | SCA step-up flow |
+| `ISubscriptionProvider` | `RazorpaySubscriptionProvider` | Plans + subscriptions |
+| `IMandateProvider` | `RazorpayMandateProvider` | eNACH / UPI AutoPay mandates |
+| `IDisputeProvider` | `RazorpayDisputeProvider` | Chargeback lifecycle |
+| `IMarketplaceProvider` | `RazorpayMarketplaceProvider` | Route split payments + sub-accounts |
+| `ISettlementProvider` | `RazorpaySettlementProvider` | Reconciliation feed |
+
+## Wiring
+
+```csharp
+builder.Services.AddRazorpayPayments(builder.Configuration);
+```
+
+Bind options from `Bhengu:Finance:Payments:Razorpay`:
+
+```jsonc
 {
   "Bhengu": {
     "Finance": {
@@ -21,8 +40,10 @@ dotnet add package Bhengu.Finance.Payments.Razorpay
           "KeyId": "rzp_test_...",
           "KeySecret": "...",
           "WebhookSecret": "...",
-          "RazorpayXAccountNumber": "2323230012345678",
-          "Currency": "INR"
+          "RazorpayXAccountNumber": "2323230012345678",   // required for payouts
+          "Currency": "INR",
+          "UseSandbox": false,
+          "BaseUrl": null         // optional override
         }
       }
     }
@@ -30,73 +51,37 @@ dotnet add package Bhengu.Finance.Payments.Razorpay
 }
 ```
 
-Required: `KeyId` and `KeySecret` (Basic-auth on every request). `RazorpayXAccountNumber` is the virtual account funding payouts (required for `IPayoutProvider`).
-
-## Wire it up
+## Usage
 
 ```csharp
-builder.Services.AddRazorpayPayments(builder.Configuration);
-```
-
-Validates `KeyId` and `KeySecret` at registration.
-
-## `PaymentMethodToken` semantics
-
-A **Razorpay `payment_id`** (`pay_...`) returned by the client-side Razorpay Checkout. The provider issues `POST v1/payments/{paymentId}/capture` to settle a pre-authorised payment.
-
-To use the **Orders flow** instead (where the SDK creates the order and the customer is redirected to checkout with the `order_id`), set `metadata["flow"] = "order"` — the SDK calls `POST v1/orders` and returns the order id as `GatewayReference`.
-
-## Metadata keys
-
-| Key | Required | Format | Example |
-| --- | --- | --- | --- |
-| `flow` | Optional | `order` to use the Orders flow; omit for direct capture | `order` |
-| `receipt` | Optional | Merchant receipt (defaults to `rcpt_<guid>`) | `order-123` |
-
-Full `Metadata` is forwarded as `notes` on the order.
-
-## `PayoutRequest.DestinationToken` format
-
-A RazorpayX **`fund_account_id`** (`fa_...`) — create fund accounts beforehand via `/v1/fund_accounts`. The SDK posts an IMPS payout against `RazorpayXAccountNumber`.
-
-## Settlement
-
-**Synchronous** for capture flow — `ProcessPaymentAsync` returns `Completed` or `Failed` directly after capture. Orders flow returns `Pending` plus the order id. Amounts sent in paise (Amount × 100).
-
-## Refunds
-
-Yes — `ProcessRefundAsync` calls `POST v1/payments/{paymentId}/refund` with `amount` (paise), `speed=normal`, and `notes.reason`.
-
-## Payouts
-
-**Yes.** `IPayoutProvider.ProcessPayoutAsync` calls `POST v1/payouts` against the RazorpayX virtual account (IMPS). Missing `RazorpayXAccountNumber` throws `ProviderConfigurationException`.
-
-## Webhook
-
-HMAC-SHA256 of the body, hex-encoded lowercase, in the `X-Razorpay-Signature` header.
-
-```csharp
-app.MapPost("/webhooks/razorpay", async (HttpContext ctx,
-    [FromKeyedServices(ProviderNames.Razorpay)] IPaymentGatewayProvider provider) =>
+[ApiController]
+public class CheckoutController(
+    [FromKeyedServices(ProviderNames.Razorpay)] IPaymentGatewayProvider gateway) : ControllerBase
 {
-    using var reader = new StreamReader(ctx.Request.Body);
-    var body = await reader.ReadToEndAsync();
-    var signature = ctx.Request.Headers["X-Razorpay-Signature"].ToString();
-
-    if (!provider.VerifyWebhookSignature(body, signature))
-        return Results.Unauthorized();
-
-    var evt = await provider.ParseWebhookAsync(body);
-    return Results.Ok();
-});
+    [HttpPost("charge")]
+    public async Task<PaymentResponse> Charge([FromBody] PaymentRequest request)
+        => await gateway.ProcessPaymentAsync(request);
+}
 ```
 
-Recognised event types: `payment.captured`, `payment.authorized`, `order.paid` → Completed; `payment.failed` → Failed; `refund.created`, `refund.processed` → Refunded; `payout.processed` → Completed.
+`PaymentRequest.PaymentMethodToken` is a Razorpay `payment_id` (`pay_...`) from
+client-side Razorpay Checkout for server-side capture.
 
-## Capabilities
+## Capabilities at runtime
 
-`Charge | Refund | Payout | Webhook | Cards | BankTransfer`.
+```csharp
+if (gateway.Capabilities.HasFlag(ProviderCapabilities.Refund))
+    await gateway.ProcessRefundAsync(refundRequest);
 
-## License
+if (gateway is IMarketplaceProvider marketplace)
+    var split = await marketplace.CreateSplitAsync(splitRequest);
+```
 
-Apache 2.0. © 2026 The Other Bhengu (Pty) Ltd t/a The Geek.
+## Status
+
+- Apache-2.0
+- Multi-target: net8.0 + net10.0
+- Source: https://github.com/bhengubv/Bhengu.Finance.Payments
+
+For full SDK docs, observability wiring, resilience configuration and the family map see
+the [main README](https://github.com/bhengubv/Bhengu.Finance.Payments).

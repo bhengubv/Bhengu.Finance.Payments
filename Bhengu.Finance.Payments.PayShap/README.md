@@ -1,8 +1,6 @@
 # Bhengu.Finance.Payments.PayShap
 
-PayShap (South Africa) provider for the [Bhengu.Finance.Payments](https://github.com/bhengubv/Bhengu.Finance.Payments) SDK family.
-
-South Africa's real-time interbank rail (RTC) — instant ZAR account-to-account transfers using either explicit account numbers or proxy aliases (MSISDN / ID / e-mail).
+PayShap adapter for the Bhengu.Finance.Payments family — South Africa's BankservAfrica RTC real-time interbank rail. Instant ZAR account-to-account transfers using explicit account numbers or proxy aliases (MSISDN / e-mail / ID / business), with QR generation for merchant-presented pay flows, behind the Bhengu canonical contracts.
 
 ## Install
 
@@ -10,92 +8,73 @@ South Africa's real-time interbank rail (RTC) — instant ZAR account-to-account
 dotnet add package Bhengu.Finance.Payments.PayShap
 ```
 
-## Configuration
+## What this package gives you
 
-```json
+| Contract | Provider class | Notes |
+|---|---|---|
+| `IPaymentGatewayProvider` | `PayShapPaymentProvider` | Real-time A2A credit transfer / webhook verify |
+| `IQrCodeProvider` | `PayShapQrCodeProvider` | Merchant-presented PayShap QR generation |
+
+PayShap also ships a richer `IPayShapService` for proxy resolution, account
+verification, and multi-step settlement — inject it directly when the generic
+`IPaymentGatewayProvider` surface isn't enough.
+
+## Wiring
+
+```csharp
+builder.Services.AddPayShapServices(builder.Configuration);
+```
+
+Bind options from the `PayShapSettings` root section (the rich service and the
+gateway adapter share one config block):
+
+```jsonc
 {
   "PayShapSettings": {
     "ApiBaseUrl": "https://api.payshap.co.za",
     "ApiKey": "...",
     "ApiSecret": "...",
     "SignatureKey": "...",
-    "MerchantId": "..."
+    "MerchantId": "...",
+    "Payee": {                       // optional, used by the QR provider
+      "BankCode": "250655",
+      "Account": "1234567890",
+      "Name": "Vendor Co.",
+      "IdentifierType": "MSISDN",
+      "IdentifierValue": "+27821234567"
+    }
   }
 }
 ```
 
-Note: PayShap binds from the root section name `PayShapSettings` (not the `Bhengu:Finance:Payments` namespace used by other providers) so the rich `IPayShapService` and the gateway adapter share one config.
-
-## Wire it up
+## Usage
 
 ```csharp
-builder.Services.AddPayShapServices(builder.Configuration);
-```
-
-Registers both `IPayShapService` (proxy resolution, account verification, EFT, multi-step settlement) and a `PayShapPaymentProvider` adapter that exposes PayShap via the generic `IPaymentGatewayProvider`.
-
-## `PaymentMethodToken` semantics
-
-Used as a **fallback proxy alias** for the payee — only consulted when `payshap.payee.identifier_value` metadata is absent. For account-to-account transfers the payee is fully specified via metadata (see below).
-
-## Metadata keys
-
-PayShap is a bank rail; the generic `PaymentRequest` doesn't carry everything it needs, so the adapter pulls it from `Metadata`. All keys below are read by `ProcessPaymentAsync`.
-
-| Key | Required | Format | Example |
-| --- | --- | --- | --- |
-| `payshap.reference` | Optional | Merchant txn ref (defaults to GUID) | `order-123` |
-| `payshap.payer.account` | Required | Account number | `1234567890` |
-| `payshap.payer.bank_code` | Required | Bank code | `250655` |
-| `payshap.payer.name` | Required | Display name | `Thandi Bhengu` |
-| `payshap.payee.account` | Required | Account number | `9876543210` |
-| `payshap.payee.bank_code` | Required | Bank code | `198765` |
-| `payshap.payee.name` | Required | Display name | `Vendor Co.` |
-| `payshap.payee.identifier_type` | Optional | `MSISDN`, `EMAIL`, `ID`, `BUSINESS`, `ACCOUNT` | `MSISDN` |
-| `payshap.payee.identifier_value` | Optional | Proxy alias (defaults to `PaymentMethodToken`) | `+27821234567` |
-
-Missing a required metadata key throws `PaymentDeclinedException` with `ProviderErrorCode = "missing_metadata"`.
-
-## Settlement
-
-**Synchronous.** PayShap is a real-time rail; `ProcessPaymentAsync` returns `Completed`, `Pending`, `Failed`, or `Cancelled` directly from the RTC response.
-
-## Refunds
-
-**Not supported as a concept.** `ProcessRefundAsync` throws `BhenguPaymentException` directing the caller to initiate a new RTC payment with payer and payee swapped — PayShap reversals are simply transfers in the opposite direction.
-
-## Payouts
-
-**Not supported via `IPayoutProvider`.** Use `ProcessPaymentAsync` with the merchant account as payer for outbound transfers, or use `IPayShapService` directly for richer disbursement flows.
-
-## Webhook
-
-HMAC-SHA256 via the `PayShapSignatureHelper`, lowercased hex, in the `X-PayShap-Signature` header (configurable). Verify with the SignatureKey.
-
-```csharp
-app.MapPost("/webhooks/payshap", async (HttpContext ctx,
-    [FromKeyedServices(ProviderNames.PayShap)] IPaymentGatewayProvider provider) =>
+[ApiController]
+public class CheckoutController(
+    [FromKeyedServices(ProviderNames.PayShap)] IPaymentGatewayProvider gateway) : ControllerBase
 {
-    using var reader = new StreamReader(ctx.Request.Body);
-    var body = await reader.ReadToEndAsync();
-    var signature = ctx.Request.Headers["X-PayShap-Signature"].ToString();
-
-    if (!provider.VerifyWebhookSignature(body, signature))
-        return Results.Unauthorized();
-
-    var evt = await provider.ParseWebhookAsync(body);
-    return Results.Ok();
-});
+    [HttpPost("charge")]
+    public async Task<PaymentResponse> Charge([FromBody] PaymentRequest request)
+        => await gateway.ProcessPaymentAsync(request);
+}
 ```
 
-## Provider-specific extras
+## Capabilities at runtime
 
-For proxy resolution, account verification, multi-step settlement, and richer RTC operations, inject `IPayShapService` directly instead of the adapter.
+```csharp
+if (gateway.Capabilities.HasFlag(ProviderCapabilities.Webhook))
+    var evt = await gateway.ParseWebhookAsync(body);
 
-## Capabilities
+if (gateway is IQrCodeProvider qr)
+    var image = await qr.GenerateAsync(qrRequest);
+```
 
-`Charge | Webhook | SyncSettlement | BankTransfer`.
+## Status
 
-## License
+- Apache-2.0
+- Multi-target: net8.0 + net10.0
+- Source: https://github.com/bhengubv/Bhengu.Finance.Payments
 
-Apache 2.0. © 2026 The Other Bhengu (Pty) Ltd t/a The Geek.
+For full SDK docs, observability wiring, resilience configuration and the family map see
+the [main README](https://github.com/bhengubv/Bhengu.Finance.Payments).
