@@ -61,7 +61,7 @@ public class RazorpayDisputeProviderTests
                 """);
         });
         var provider = Create(handler);
-        var disputes = await provider.ListDisputesAsync();
+        var disputes = await provider.ListDisputesAsync().ToListAsync();
 
         Assert.Equal(2, disputes.Count);
         Assert.Equal(DisputeStatus.NeedsResponse, disputes[0].Status);
@@ -78,7 +78,7 @@ public class RazorpayDisputeProviderTests
             return StubHttpMessageHandler.Json(HttpStatusCode.OK, """{"entity":"collection","count":0,"items":[]}""");
         });
         var provider = Create(handler);
-        var disputes = await provider.ListDisputesAsync(new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc), new DateTime(2026, 1, 31, 0, 0, 0, DateTimeKind.Utc));
+        var disputes = await provider.ListDisputesAsync(new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc), new DateTime(2026, 1, 31, 0, 0, 0, DateTimeKind.Utc)).ToListAsync();
         Assert.Empty(disputes);
     }
 

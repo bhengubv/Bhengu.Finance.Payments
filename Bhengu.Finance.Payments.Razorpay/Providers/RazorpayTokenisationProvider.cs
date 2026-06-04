@@ -2,6 +2,7 @@
 
 using System.Net;
 using System.Net.Http.Headers;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -45,48 +46,6 @@ public sealed class RazorpayTokenisationProvider : ITokenisationProvider
     }
 
     /// <inheritdoc />
-    public async Task<PaymentMethod> TokeniseAsync(TokeniseRequest request, CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(request);
-
-        // 1) ensure a customer exists. Razorpay doesn't let tokens live unattached.
-        var customerId = request.CustomerId;
-        if (string.IsNullOrWhiteSpace(customerId))
-        {
-            var customerBody = new
-            {
-                name = request.Card.CardholderName,
-                fail_existing = "0"
-            };
-            var customerRaw = await _http.SendAsync(HttpMethod.Post, "v1/customers", customerBody, ct, "CreateCustomer", request.IdempotencyKey).ConfigureAwait(false);
-            var customer = RazorpayHttpClient.DeserialiseOrThrow<RazorpayCustomer>(customerRaw, ProviderName, "CreateCustomer");
-            customerId = customer.Id;
-        }
-
-        // 2) attach a token. Razorpay tokens are scoped to a customer + method.
-        var tokenBody = new
-        {
-            customer_id = customerId,
-            method = "card",
-            card = new
-            {
-                number = request.Card.CardNumber,
-                name = request.Card.CardholderName,
-                expiry_month = request.Card.ExpiryMonth,
-                expiry_year = request.Card.ExpiryYear,
-                cvv = request.Card.Cvv
-            }
-        };
-
-        var tokenRaw = await _http.SendAsync(HttpMethod.Post, "v1/tokens", tokenBody, ct, "CreateToken", request.IdempotencyKey).ConfigureAwait(false);
-        var token = RazorpayHttpClient.DeserialiseOrThrow<RazorpayToken>(tokenRaw, ProviderName, "CreateToken");
-
-        _logger.LogInformation("Razorpay token created: {TokenId} for customer {CustomerId}", token.Id, customerId);
-
-        return MapToken(token, customerId, request.DisplayName, request.SetAsDefault);
-    }
-
-    /// <inheritdoc />
     public async Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(token);
@@ -104,19 +63,19 @@ public sealed class RazorpayTokenisationProvider : ITokenisationProvider
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<PaymentMethod>> ListPaymentMethodsAsync(string customerId, CancellationToken ct = default)
+    public async IAsyncEnumerable<PaymentMethod> ListPaymentMethodsAsync(string customerId, [EnumeratorCancellation] CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(customerId);
 
         var raw = await _http.GetAsync($"v1/customers/{Uri.EscapeDataString(customerId)}/tokens", ct, "ListTokens").ConfigureAwait(false);
         var collection = RazorpayHttpClient.DeserialiseOrThrow<RazorpayTokenCollection>(raw, ProviderName, "ListTokens");
 
-        var methods = new List<PaymentMethod>(collection.Items?.Count ?? 0);
-        if (collection.Items is not null)
-            foreach (var t in collection.Items)
-                methods.Add(MapToken(t, customerId, displayName: null, isDefault: false));
-
-        return methods;
+        if (collection.Items is null) yield break;
+        foreach (var t in collection.Items)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return MapToken(t, customerId, displayName: null, isDefault: false);
+        }
     }
 
     /// <inheritdoc />
@@ -140,7 +99,7 @@ public sealed class RazorpayTokenisationProvider : ITokenisationProvider
         }
     }
 
-    private static PaymentMethod MapToken(RazorpayToken t, string? customerId, string? displayName, bool isDefault)
+    internal static PaymentMethod MapToken(RazorpayToken t, string? customerId, string? displayName, bool isDefault)
     {
         var kind = t.Method?.ToLowerInvariant() switch
         {
@@ -168,7 +127,7 @@ public sealed class RazorpayTokenisationProvider : ITokenisationProvider
 
     // === Razorpay API response shapes (internal) ===
 
-    private sealed class RazorpayCustomer
+    internal sealed class RazorpayCustomer
     {
         [JsonPropertyName("id")] public string? Id { get; set; }
         [JsonPropertyName("entity")] public string? Entity { get; set; }
@@ -176,7 +135,7 @@ public sealed class RazorpayTokenisationProvider : ITokenisationProvider
         [JsonPropertyName("email")] public string? Email { get; set; }
     }
 
-    private sealed class RazorpayToken
+    internal sealed class RazorpayToken
     {
         [JsonPropertyName("id")] public string? Id { get; set; }
         [JsonPropertyName("entity")] public string? Entity { get; set; }
@@ -188,7 +147,7 @@ public sealed class RazorpayTokenisationProvider : ITokenisationProvider
         [JsonPropertyName("created_at")] public long? CreatedAt { get; set; }
     }
 
-    private sealed class RazorpayTokenCard
+    internal sealed class RazorpayTokenCard
     {
         [JsonPropertyName("last4")] public string? Last4 { get; set; }
         [JsonPropertyName("network")] public string? Network { get; set; }
@@ -196,16 +155,83 @@ public sealed class RazorpayTokenisationProvider : ITokenisationProvider
         [JsonPropertyName("expiry_year")] public int? ExpiryYear { get; set; }
     }
 
-    private sealed class RazorpayTokenBankAccount
+    internal sealed class RazorpayTokenBankAccount
     {
         [JsonPropertyName("last4")] public string? Last4 { get; set; }
         [JsonPropertyName("ifsc")] public string? Ifsc { get; set; }
     }
 
-    private sealed class RazorpayTokenCollection
+    internal sealed class RazorpayTokenCollection
     {
         [JsonPropertyName("entity")] public string? Entity { get; set; }
         [JsonPropertyName("count")] public int Count { get; set; }
         [JsonPropertyName("items")] public List<RazorpayToken>? Items { get; set; }
+    }
+}
+
+/// <summary>
+/// PCI-DSS SAQ-D-scope Razorpay tokenisation. Accepts raw PAN and creates a customer + token in
+/// one call. Prefer Razorpay Standard Checkout on the client where possible — only use this where
+/// the merchant is already PCI-DSS Level-1 SAQ-D.
+/// </summary>
+public sealed class RazorpayRawCardTokenisationProvider : IRawCardTokenisationProvider
+{
+    private readonly RazorpayHttpClient _http;
+    private readonly ILogger<RazorpayRawCardTokenisationProvider> _logger;
+
+    /// <inheritdoc />
+    public string ProviderName => ProviderNames.Razorpay;
+
+    /// <summary>Create a new raw-card tokenisation provider bound to the supplied HTTP client and options.</summary>
+    public RazorpayRawCardTokenisationProvider(
+        HttpClient httpClient,
+        IOptions<RazorpayOptions> options,
+        ILogger<RazorpayRawCardTokenisationProvider> logger)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _http = new RazorpayHttpClient(httpClient, options.Value, ProviderName, logger);
+    }
+
+    /// <inheritdoc />
+    public async Task<PaymentMethod> TokeniseAsync(TokeniseRequest request, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        // 1) ensure a customer exists. Razorpay doesn't let tokens live unattached.
+        var customerId = request.CustomerId;
+        if (string.IsNullOrWhiteSpace(customerId))
+        {
+            var customerBody = new
+            {
+                name = request.Card.CardholderName,
+                fail_existing = "0"
+            };
+            var customerRaw = await _http.SendAsync(HttpMethod.Post, "v1/customers", customerBody, ct, "CreateCustomer", request.IdempotencyKey).ConfigureAwait(false);
+            var customer = RazorpayHttpClient.DeserialiseOrThrow<RazorpayTokenisationProvider.RazorpayCustomer>(customerRaw, ProviderName, "CreateCustomer");
+            customerId = customer.Id;
+        }
+
+        // 2) attach a token. Razorpay tokens are scoped to a customer + method.
+        var tokenBody = new
+        {
+            customer_id = customerId,
+            method = "card",
+            card = new
+            {
+                number = request.Card.CardNumber,
+                name = request.Card.CardholderName,
+                expiry_month = request.Card.ExpiryMonth,
+                expiry_year = request.Card.ExpiryYear,
+                cvv = request.Card.Cvv
+            }
+        };
+
+        var tokenRaw = await _http.SendAsync(HttpMethod.Post, "v1/tokens", tokenBody, ct, "CreateToken", request.IdempotencyKey).ConfigureAwait(false);
+        var token = RazorpayHttpClient.DeserialiseOrThrow<RazorpayTokenisationProvider.RazorpayToken>(tokenRaw, ProviderName, "CreateToken");
+
+        _logger.LogInformation("Razorpay token created: {TokenId} for customer {CustomerId}", token.Id, customerId);
+
+        return RazorpayTokenisationProvider.MapToken(token, customerId, request.DisplayName, request.SetAsDefault);
     }
 }

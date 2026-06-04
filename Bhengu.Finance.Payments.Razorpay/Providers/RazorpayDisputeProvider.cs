@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
@@ -53,7 +54,7 @@ public sealed class RazorpayDisputeProvider : IDisputeProvider
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<Dispute>> ListDisputesAsync(DateTime? fromUtc = null, DateTime? toUtc = null, CancellationToken ct = default)
+    public async IAsyncEnumerable<Dispute> ListDisputesAsync(DateTime? fromUtc = null, DateTime? toUtc = null, [EnumeratorCancellation] CancellationToken ct = default)
     {
         var query = new List<string> { "count=100" };
         if (fromUtc.HasValue)
@@ -65,11 +66,12 @@ public sealed class RazorpayDisputeProvider : IDisputeProvider
         var raw = await _http.GetAsync(path, ct, "ListDisputes").ConfigureAwait(false);
         var collection = RazorpayHttpClient.DeserialiseOrThrow<RazorpayDisputeCollection>(raw, ProviderName, "ListDisputes");
 
-        var list = new List<Dispute>(collection.Items?.Count ?? 0);
-        if (collection.Items is not null)
-            foreach (var d in collection.Items)
-                list.Add(MapDispute(d));
-        return list;
+        if (collection.Items is null) yield break;
+        foreach (var d in collection.Items)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return MapDispute(d);
+        }
     }
 
     /// <inheritdoc />

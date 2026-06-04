@@ -57,6 +57,10 @@ public static class ServiceCollectionExtensions
         services.AddTransient<ITokenisationProvider, RazorpayTokenisationProvider>(sp => sp.GetRequiredService<RazorpayTokenisationProvider>());
         services.AddKeyedTransient<ITokenisationProvider>(ProviderNames.Razorpay, (sp, _) => sp.GetRequiredService<RazorpayTokenisationProvider>());
 
+        services.AddHttpClient<RazorpayRawCardTokenisationProvider>();
+        services.AddTransient<IRawCardTokenisationProvider, RazorpayRawCardTokenisationProvider>(sp => sp.GetRequiredService<RazorpayRawCardTokenisationProvider>());
+        services.AddKeyedTransient<IRawCardTokenisationProvider>(ProviderNames.Razorpay, (sp, _) => sp.GetRequiredService<RazorpayRawCardTokenisationProvider>());
+
         services.AddHttpClient<RazorpaySubscriptionProvider>();
         services.AddTransient<ISubscriptionProvider, RazorpaySubscriptionProvider>(sp => sp.GetRequiredService<RazorpaySubscriptionProvider>());
         services.AddKeyedTransient<ISubscriptionProvider>(ProviderNames.Razorpay, (sp, _) => sp.GetRequiredService<RazorpaySubscriptionProvider>());

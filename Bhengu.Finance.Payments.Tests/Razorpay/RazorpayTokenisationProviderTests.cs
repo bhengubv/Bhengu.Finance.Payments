@@ -19,6 +19,11 @@ public class RazorpayTokenisationProviderTests
             Options.Create(new RazorpayOptions { KeyId = "rzp_test_x", KeySecret = "secret_x" }),
             NullLogger<RazorpayTokenisationProvider>.Instance);
 
+    private static RazorpayRawCardTokenisationProvider CreateRaw(StubHttpMessageHandler handler) =>
+        new(new HttpClient(handler),
+            Options.Create(new RazorpayOptions { KeyId = "rzp_test_x", KeySecret = "secret_x" }),
+            NullLogger<RazorpayRawCardTokenisationProvider>.Instance);
+
     private static TokeniseRequest SampleRequest(string? customerId = null) => new()
     {
         Card = new CardDetails
@@ -54,7 +59,7 @@ public class RazorpayTokenisationProviderTests
             throw new InvalidOperationException($"Unexpected: {req.RequestUri}");
         });
 
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         var method = await provider.TokeniseAsync(SampleRequest());
 
         Assert.Equal(2, calls.Count);
@@ -78,7 +83,7 @@ public class RazorpayTokenisationProviderTests
                 """{"id":"token_def","entity":"token","customer_id":"cust_pre","method":"card","card":{"last4":"4242","network":"Visa"}}""");
         });
 
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         var method = await provider.TokeniseAsync(SampleRequest(customerId: "cust_pre"));
 
         Assert.Single(calls);
@@ -92,7 +97,7 @@ public class RazorpayTokenisationProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) =>
             StubHttpMessageHandler.Text(HttpStatusCode.BadRequest, """{"error":{"code":"BAD_REQUEST_ERROR","description":"Invalid card"}}"""));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -100,7 +105,7 @@ public class RazorpayTokenisationProviderTests
     public async Task TokeniseAsync_Throws_OnRateLimit()
     {
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "throttled"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderRateLimitException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -108,7 +113,7 @@ public class RazorpayTokenisationProviderTests
     public async Task TokeniseAsync_Throws_OnNetworkFailure()
     {
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("connect timeout"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.TokeniseAsync(SampleRequest(customerId: "cust_pre")));
     }
 
@@ -152,7 +157,7 @@ public class RazorpayTokenisationProviderTests
                 """);
         });
         var provider = Create(handler);
-        var methods = await provider.ListPaymentMethodsAsync("cust_abc");
+        var methods = await provider.ListPaymentMethodsAsync("cust_abc").ToListAsync();
 
         Assert.Equal(2, methods.Count);
         Assert.Equal("token_1", methods[0].Token);

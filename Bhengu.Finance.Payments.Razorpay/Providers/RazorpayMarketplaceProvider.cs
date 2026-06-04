@@ -143,16 +143,15 @@ public sealed class RazorpayMarketplaceProvider : IMarketplaceProvider
     }
 
     /// <inheritdoc />
-    public Task<IReadOnlyList<SubAccount>> ListSubAccountsAsync(CancellationToken ct = default)
+#pragma warning disable CS1998 // intentionally async with no awaits — Razorpay has no public list endpoint, but the contract demands IAsyncEnumerable.
+    public async IAsyncEnumerable<SubAccount> ListSubAccountsAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
-        return RazorpayObservability.ObserveAsync("list_sub_accounts", () =>
-        {
-            // Razorpay's v2 Accounts API doesn't expose a public list endpoint — accounts are looked up
-            // by id. Consumers that need a roster should mirror it in their own DB on creation.
-            _logger.LogDebug("Razorpay does not expose a public account-list endpoint; returning empty");
-            return Task.FromResult<IReadOnlyList<SubAccount>>(Array.Empty<SubAccount>());
-        });
+        // Razorpay's v2 Accounts API doesn't expose a public list endpoint — accounts are looked up
+        // by id. Consumers that need a roster should mirror it in their own DB on creation.
+        _logger.LogDebug("Razorpay does not expose a public account-list endpoint; returning empty");
+        yield break;
     }
+#pragma warning restore CS1998
 
     /// <inheritdoc />
     public Task<SplitDefinition> CreateSplitAsync(SplitDefinitionRequest request, CancellationToken ct = default)

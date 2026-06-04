@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
@@ -40,7 +41,7 @@ public sealed class RazorpaySettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+    public async IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, [EnumeratorCancellation] CancellationToken ct = default)
     {
         var fromEpoch = new DateTimeOffset(DateTime.SpecifyKind(fromUtc, DateTimeKind.Utc)).ToUnixTimeSeconds();
         var toEpoch = new DateTimeOffset(DateTime.SpecifyKind(toUtc, DateTimeKind.Utc)).ToUnixTimeSeconds();
@@ -52,12 +53,12 @@ public sealed class RazorpaySettlementProvider : ISettlementProvider
         _logger.LogInformation("Razorpay listed {Count} settlements between {From:o} and {To:o}",
             collection.Items?.Count ?? 0, fromUtc, toUtc);
 
-        var list = new List<Settlement>(collection.Items?.Count ?? 0);
-        if (collection.Items is not null)
-            foreach (var s in collection.Items)
-                list.Add(MapSettlement(s));
-
-        return list;
+        if (collection.Items is null) yield break;
+        foreach (var s in collection.Items)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return MapSettlement(s);
+        }
     }
 
     /// <inheritdoc />
@@ -78,7 +79,7 @@ public sealed class RazorpaySettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
+    public async IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(string settlementReference, [EnumeratorCancellation] CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(settlementReference);
 
@@ -87,12 +88,12 @@ public sealed class RazorpaySettlementProvider : ISettlementProvider
         var raw = await _http.GetAsync(path, ct, "ListSettlementTransactions").ConfigureAwait(false);
         var collection = RazorpayHttpClient.DeserialiseOrThrow<RazorpayReconCollection>(raw, ProviderName, "ListSettlementTransactions");
 
-        var list = new List<SettlementTransaction>(collection.Items?.Count ?? 0);
-        if (collection.Items is not null)
-            foreach (var t in collection.Items)
-                list.Add(MapTransaction(t));
-
-        return list;
+        if (collection.Items is null) yield break;
+        foreach (var t in collection.Items)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return MapTransaction(t);
+        }
     }
 
     private static Settlement MapSettlement(RazorpaySettlement s)

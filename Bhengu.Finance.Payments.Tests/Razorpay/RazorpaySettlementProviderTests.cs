@@ -36,7 +36,7 @@ public class RazorpaySettlementProviderTests
                 """);
         });
         var provider = Create(handler);
-        var settlements = await provider.ListSettlementsAsync(new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc), new DateTime(2026, 1, 31, 0, 0, 0, DateTimeKind.Utc));
+        var settlements = await provider.ListSettlementsAsync(new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc), new DateTime(2026, 1, 31, 0, 0, 0, DateTimeKind.Utc)).ToListAsync();
 
         Assert.Equal(2, settlements.Count);
         Assert.Equal("setl_1", settlements[0].Reference);
@@ -86,7 +86,7 @@ public class RazorpaySettlementProviderTests
                 """);
         });
         var provider = Create(handler);
-        var txns = await provider.ListTransactionsAsync("setl_1");
+        var txns = await provider.ListTransactionsAsync("setl_1").ToListAsync();
 
         Assert.Equal(2, txns.Count);
         Assert.Equal(SettlementTransactionKind.Charge, txns[0].Kind);
@@ -100,8 +100,8 @@ public class RazorpaySettlementProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "throttled"));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<ProviderRateLimitException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-7), DateTime.UtcNow));
+        await Assert.ThrowsAsync<ProviderRateLimitException>(async () =>
+            await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-7), DateTime.UtcNow).ToListAsync());
     }
 
     [Fact]
@@ -109,7 +109,7 @@ public class RazorpaySettlementProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("connect"));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<ProviderUnavailableException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-7), DateTime.UtcNow));
+        await Assert.ThrowsAsync<ProviderUnavailableException>(async () =>
+            await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-7), DateTime.UtcNow).ToListAsync());
     }
 }

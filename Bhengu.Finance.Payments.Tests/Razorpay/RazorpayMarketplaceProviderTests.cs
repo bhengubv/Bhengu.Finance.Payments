@@ -57,7 +57,7 @@ public class RazorpayMarketplaceProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) => throw new InvalidOperationException("Should not be called"));
         var provider = Create(handler);
-        var list = await provider.ListSubAccountsAsync();
+        var list = await provider.ListSubAccountsAsync().ToListAsync();
         Assert.Empty(list);
     }
 
