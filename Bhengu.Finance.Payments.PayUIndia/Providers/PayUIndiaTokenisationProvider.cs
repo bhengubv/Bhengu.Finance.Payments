@@ -9,6 +9,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models.Vault;
 using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.PayUIndia.Configuration;
@@ -28,26 +29,25 @@ namespace Bhengu.Finance.Payments.PayUIndia.Providers;
 /// <c>user_credentials</c>; if null we synthesise from the cardholder name. Tokens are returned
 /// as PayU India <c>card_token</c> strings (e.g. <c>0d09a3a8a8a8...</c>).
 /// </remarks>
-public sealed class PayUIndiaTokenisationProvider : ITokenisationProvider
+public sealed class PayUIndiaTokenisationProvider : BhenguProviderBase, ITokenisationProvider
 {
     internal static readonly JsonSerializerOptions DeserializeOptions = new() { PropertyNameCaseInsensitive = true };
 
     private readonly HttpClient _httpClient;
     private readonly PayUIndiaOptions _options;
-    private readonly ILogger<PayUIndiaTokenisationProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.PayUIndia;
+    public override string ProviderName => ProviderNames.PayUIndia;
 
     /// <summary>Create a new PayU India tokenisation provider bound to the supplied HTTP client and options.</summary>
     public PayUIndiaTokenisationProvider(
         HttpClient httpClient,
         IOptions<PayUIndiaOptions> options,
         ILogger<PayUIndiaTokenisationProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.MerchantKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PayUIndiaOptions.MerchantKey)} is required");
@@ -78,7 +78,7 @@ public sealed class PayUIndiaTokenisationProvider : ITokenisationProvider
                 ["hash"] = hash
             };
 
-            var raw = await PayUIndiaHttp.PostFormAsync(_httpClient, _logger, ProviderName, "merchant/postservice.php?form=2", form, ct, "GetCard").ConfigureAwait(false);
+            var raw = await PayUIndiaHttp.PostFormAsync(_httpClient, Logger, ProviderName, "merchant/postservice.php?form=2", form, ct, "GetCard").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<PayUIndiaCardResponse>(raw, DeserializeOptions);
 
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
@@ -131,7 +131,7 @@ public sealed class PayUIndiaTokenisationProvider : ITokenisationProvider
                     ["hash"] = hash
                 };
 
-                var raw = await PayUIndiaHttp.PostFormAsync(_httpClient, _logger, ProviderName, "merchant/postservice.php?form=2", form, ct, "ListCards").ConfigureAwait(false);
+                var raw = await PayUIndiaHttp.PostFormAsync(_httpClient, Logger, ProviderName, "merchant/postservice.php?form=2", form, ct, "ListCards").ConfigureAwait(false);
                 var response = JsonSerializer.Deserialize<PayUIndiaCardListResponse>(raw, DeserializeOptions);
                 items = response?.UserCards;
                 activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
@@ -182,7 +182,7 @@ public sealed class PayUIndiaTokenisationProvider : ITokenisationProvider
                 ["hash"] = hash
             };
 
-            var raw = await PayUIndiaHttp.PostFormAsync(_httpClient, _logger, ProviderName, "merchant/postservice.php?form=2", form, ct, "DeleteCard").ConfigureAwait(false);
+            var raw = await PayUIndiaHttp.PostFormAsync(_httpClient, Logger, ProviderName, "merchant/postservice.php?form=2", form, ct, "DeleteCard").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<PayUIndiaCardResponse>(raw, DeserializeOptions);
 
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
@@ -268,24 +268,23 @@ internal static class PayUIndiaHttp
 /// <c>save_user_card</c> command and returns the resulting card token. Prefer the client-side
 /// PayU Money / PayU India hosted checkout where possible.
 /// </summary>
-public sealed class PayUIndiaRawCardTokenisationProvider : IRawCardTokenisationProvider
+public sealed class PayUIndiaRawCardTokenisationProvider : BhenguProviderBase, IRawCardTokenisationProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PayUIndiaOptions _options;
-    private readonly ILogger<PayUIndiaRawCardTokenisationProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.PayUIndia;
+    public override string ProviderName => ProviderNames.PayUIndia;
 
     /// <summary>Create a new PayU India raw-card tokenisation provider.</summary>
     public PayUIndiaRawCardTokenisationProvider(
         HttpClient httpClient,
         IOptions<PayUIndiaOptions> options,
         ILogger<PayUIndiaRawCardTokenisationProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.MerchantKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PayUIndiaOptions.MerchantKey)} is required");
@@ -325,10 +324,10 @@ public sealed class PayUIndiaRawCardTokenisationProvider : IRawCardTokenisationP
                 ["hash"] = hash
             };
 
-            var raw = await PayUIndiaHttp.PostFormAsync(_httpClient, _logger, ProviderName, "merchant/postservice.php?form=2", form, ct, "TokeniseCard").ConfigureAwait(false);
+            var raw = await PayUIndiaHttp.PostFormAsync(_httpClient, Logger, ProviderName, "merchant/postservice.php?form=2", form, ct, "TokeniseCard").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<PayUIndiaTokenisationProvider.PayUIndiaCardResponse>(raw, PayUIndiaTokenisationProvider.DeserializeOptions);
 
-            _logger.LogInformation("PayU India card vaulted: token={Token} customerId={CustomerId} status={Status}",
+            Logger.LogInformation("PayU India card vaulted: token={Token} customerId={CustomerId} status={Status}",
                 response?.CardToken ?? cardToken, userCredentials, response?.Status);
 
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);

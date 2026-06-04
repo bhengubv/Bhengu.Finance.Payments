@@ -6,6 +6,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models.Subscription;
 using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Paymob.Configuration;
@@ -23,15 +24,14 @@ namespace Bhengu.Finance.Payments.Paymob.Providers;
 /// Paymob exposes pause / resume via a single <c>state</c> field on the subscription; the
 /// adapter normalises those into <see cref="SubscriptionStatus.Paused"/>/<see cref="SubscriptionStatus.Active"/>.
 /// </remarks>
-public sealed class PaymobSubscriptionProvider : ISubscriptionProvider
+public sealed class PaymobSubscriptionProvider : BhenguProviderBase, ISubscriptionProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PaymobOptions _options;
-    private readonly ILogger<PaymobSubscriptionProvider> _logger;
     private readonly PaymobIdempotencyCache _idempotency;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Paymob;
+    public override string ProviderName => ProviderNames.Paymob;
 
     /// <summary>Construct a subscription provider. Designed to be registered via DI.</summary>
     public PaymobSubscriptionProvider(
@@ -39,10 +39,10 @@ public sealed class PaymobSubscriptionProvider : ISubscriptionProvider
         IOptions<PaymobOptions> options,
         ILogger<PaymobSubscriptionProvider> logger,
         PaymobIdempotencyCache idempotency)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotency = idempotency ?? throw new ArgumentNullException(nameof(idempotency));
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
@@ -61,7 +61,7 @@ public sealed class PaymobSubscriptionProvider : ISubscriptionProvider
     private async Task<Plan> CreatePlanCoreAsync(PlanRequest request, CancellationToken ct)
     {
         using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "createPlan");
-        var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
+        var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
 
         var body = new
         {
@@ -77,7 +77,7 @@ public sealed class PaymobSubscriptionProvider : ISubscriptionProvider
         };
 
         var responseBody = await PaymobHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, "api/acceptance/plans", body, "CreatePlan", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Post, "api/acceptance/plans", body, "CreatePlan", ct).ConfigureAwait(false);
         var plan = JsonSerializer.Deserialize<PaymobPlanResponse>(responseBody, PaymobHttpClient.Json)
             ?? throw new BhenguPaymentException(ProviderName, "Paymob plan create returned no payload", "no_plan_data");
 
@@ -91,9 +91,9 @@ public sealed class PaymobSubscriptionProvider : ISubscriptionProvider
         using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "getPlan");
         try
         {
-            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
+            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
             var responseBody = await PaymobHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get,
+                _httpClient, Logger, HttpMethod.Get,
                 $"api/acceptance/plans/{Uri.EscapeDataString(planReference)}?auth_token={Uri.EscapeDataString(authToken)}",
                 null, "GetPlan", ct).ConfigureAwait(false);
 
@@ -116,7 +116,7 @@ public sealed class PaymobSubscriptionProvider : ISubscriptionProvider
     private async Task<Subscription> CreateSubscriptionCoreAsync(SubscriptionRequest request, CancellationToken ct)
     {
         using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "createSubscription");
-        var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
+        var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
 
         var body = new
         {
@@ -129,7 +129,7 @@ public sealed class PaymobSubscriptionProvider : ISubscriptionProvider
         };
 
         var responseBody = await PaymobHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, "api/acceptance/subscriptions", body, "CreateSubscription", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Post, "api/acceptance/subscriptions", body, "CreateSubscription", ct).ConfigureAwait(false);
         var sub = JsonSerializer.Deserialize<PaymobSubscriptionResponse>(responseBody, PaymobHttpClient.Json)
             ?? throw new BhenguPaymentException(ProviderName, "Paymob subscription create returned no payload", "no_subscription_data");
 
@@ -143,9 +143,9 @@ public sealed class PaymobSubscriptionProvider : ISubscriptionProvider
         using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "getSubscription");
         try
         {
-            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
+            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
             var responseBody = await PaymobHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get,
+                _httpClient, Logger, HttpMethod.Get,
                 $"api/acceptance/subscriptions/{Uri.EscapeDataString(subscriptionReference)}?auth_token={Uri.EscapeDataString(authToken)}",
                 null, "GetSubscription", ct).ConfigureAwait(false);
 
@@ -182,13 +182,13 @@ public sealed class PaymobSubscriptionProvider : ISubscriptionProvider
     private async Task<Subscription> TransitionAsync(string subscriptionReference, string action, SubscriptionStatus expected, CancellationToken ct)
     {
         using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, $"subscription.{action}");
-        var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
+        var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
         var body = new { auth_token = authToken, action };
 
         try
         {
             var responseBody = await PaymobHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Post,
+                _httpClient, Logger, HttpMethod.Post,
                 $"api/acceptance/subscriptions/{Uri.EscapeDataString(subscriptionReference)}/action",
                 body, $"Subscription.{action}", ct).ConfigureAwait(false);
             var sub = JsonSerializer.Deserialize<PaymobSubscriptionResponse>(responseBody, PaymobHttpClient.Json);

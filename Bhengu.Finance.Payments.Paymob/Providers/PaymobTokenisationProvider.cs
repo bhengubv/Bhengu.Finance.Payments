@@ -7,6 +7,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models.Vault;
 using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Paymob.Configuration;
@@ -29,24 +30,23 @@ namespace Bhengu.Finance.Payments.Paymob.Providers;
 /// Paymob's iframe with <c>save_card_token=true</c> and call <see cref="GetPaymentMethodAsync"/>
 /// with the token surfaced via webhook.</para>
 /// </remarks>
-public sealed class PaymobTokenisationProvider : ITokenisationProvider
+public sealed class PaymobTokenisationProvider : BhenguProviderBase, ITokenisationProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PaymobOptions _options;
-    private readonly ILogger<PaymobTokenisationProvider> _logger;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Paymob;
+    public override string ProviderName => ProviderNames.Paymob;
 
     /// <summary>Construct a tokenisation provider. Designed to be registered via DI.</summary>
     public PaymobTokenisationProvider(
         HttpClient httpClient,
         IOptions<PaymobOptions> options,
         ILogger<PaymobTokenisationProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PaymobOptions.ApiKey)} is required");
@@ -62,9 +62,9 @@ public sealed class PaymobTokenisationProvider : ITokenisationProvider
         using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise.get");
         try
         {
-            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
+            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
             var responseBody = await PaymobHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get,
+                _httpClient, Logger, HttpMethod.Get,
                 $"api/acceptance/saved_cards/{Uri.EscapeDataString(token)}?auth_token={Uri.EscapeDataString(authToken)}",
                 null, "GetPaymentMethod", ct).ConfigureAwait(false);
 
@@ -95,9 +95,9 @@ public sealed class PaymobTokenisationProvider : ITokenisationProvider
         {
             try
             {
-                var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
+                var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
                 var path = $"api/acceptance/saved_cards?identifier={Uri.EscapeDataString(customerId)}&auth_token={Uri.EscapeDataString(authToken)}";
-                var responseBody = await PaymobHttpClient.SendAsync(_httpClient, _logger, HttpMethod.Get, path, null, "ListPaymentMethods", ct).ConfigureAwait(false);
+                var responseBody = await PaymobHttpClient.SendAsync(_httpClient, Logger, HttpMethod.Get, path, null, "ListPaymentMethods", ct).ConfigureAwait(false);
 
                 var response = JsonSerializer.Deserialize<PaymobSavedCardList>(responseBody, PaymobHttpClient.Json);
                 items = response?.Results;
@@ -126,9 +126,9 @@ public sealed class PaymobTokenisationProvider : ITokenisationProvider
         using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise.delete");
         try
         {
-            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
+            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
             await PaymobHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Delete,
+                _httpClient, Logger, HttpMethod.Delete,
                 $"api/acceptance/saved_cards/{Uri.EscapeDataString(token)}?auth_token={Uri.EscapeDataString(authToken)}",
                 null, "DeletePaymentMethod", ct).ConfigureAwait(false);
             return true;
@@ -194,15 +194,14 @@ public sealed class PaymobTokenisationProvider : ITokenisationProvider
 /// PCI-DSS SAQ-D-scope Paymob raw-card tokenisation. Sends raw PAN to Paymob's
 /// <c>/api/acceptance/tokenization</c> endpoint and returns the reusable card token.
 /// </summary>
-public sealed class PaymobRawCardTokenisationProvider : IRawCardTokenisationProvider
+public sealed class PaymobRawCardTokenisationProvider : BhenguProviderBase, IRawCardTokenisationProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PaymobOptions _options;
-    private readonly ILogger<PaymobRawCardTokenisationProvider> _logger;
     private readonly PaymobIdempotencyCache _idempotency;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Paymob;
+    public override string ProviderName => ProviderNames.Paymob;
 
     /// <summary>Construct a raw-card tokenisation provider.</summary>
     public PaymobRawCardTokenisationProvider(
@@ -210,10 +209,10 @@ public sealed class PaymobRawCardTokenisationProvider : IRawCardTokenisationProv
         IOptions<PaymobOptions> options,
         ILogger<PaymobRawCardTokenisationProvider> logger,
         PaymobIdempotencyCache idempotency)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotency = idempotency ?? throw new ArgumentNullException(nameof(idempotency));
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
@@ -234,7 +233,7 @@ public sealed class PaymobRawCardTokenisationProvider : IRawCardTokenisationProv
         using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise");
         try
         {
-            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
+            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
 
             var body = new
             {
@@ -250,7 +249,7 @@ public sealed class PaymobRawCardTokenisationProvider : IRawCardTokenisationProv
             };
 
             var responseBody = await PaymobHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Post, "api/acceptance/tokenization", body, "Tokenise", ct).ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Post, "api/acceptance/tokenization", body, "Tokenise", ct).ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<PaymobTokenisationProvider.PaymobTokenisationResponse>(responseBody, PaymobHttpClient.Json);
 
             var token = response?.CardToken ?? response?.Token;
@@ -258,7 +257,7 @@ public sealed class PaymobRawCardTokenisationProvider : IRawCardTokenisationProv
                 throw new PaymentDeclinedException(ProviderName, "no_card_token",
                     "Paymob did not return a card_token — card may have been declined or 3DS authentication is required.");
 
-            _logger.LogInformation("Paymob tokenised card for customer {CustomerId} → token={Token}",
+            Logger.LogInformation("Paymob tokenised card for customer {CustomerId} → token={Token}",
                 request.CustomerId, token);
 
             return new PaymentMethod

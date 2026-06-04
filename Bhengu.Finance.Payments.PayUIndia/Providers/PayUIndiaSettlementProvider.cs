@@ -10,6 +10,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models.Settlement;
 using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.PayUIndia.Configuration;
@@ -27,26 +28,25 @@ namespace Bhengu.Finance.Payments.PayUIndia.Providers;
 /// settlement when enabled). The settlement-details endpoint returns line items inside a single
 /// settlement batch — used for ledger reconciliation.
 /// </remarks>
-public sealed class PayUIndiaSettlementProvider : ISettlementProvider
+public sealed class PayUIndiaSettlementProvider : BhenguProviderBase, ISettlementProvider
 {
     private static readonly JsonSerializerOptions DeserializeOptions = new() { PropertyNameCaseInsensitive = true };
 
     private readonly HttpClient _httpClient;
     private readonly PayUIndiaOptions _options;
-    private readonly ILogger<PayUIndiaSettlementProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.PayUIndia;
+    public override string ProviderName => ProviderNames.PayUIndia;
 
     /// <summary>Create a new PayU India settlement provider bound to the supplied HTTP client and options.</summary>
     public PayUIndiaSettlementProvider(
         HttpClient httpClient,
         IOptions<PayUIndiaOptions> options,
         ILogger<PayUIndiaSettlementProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.MerchantKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PayUIndiaOptions.MerchantKey)} is required");
@@ -85,7 +85,7 @@ public sealed class PayUIndiaSettlementProvider : ISettlementProvider
                 var response = JsonSerializer.Deserialize<PayUIndiaSettlementListResponse>(raw, DeserializeOptions);
                 items = response?.Settlements;
 
-                _logger.LogInformation("PayU India listed {Count} settlements between {From:o} and {To:o}", items?.Count ?? 0, fromUtc, toUtc);
+                Logger.LogInformation("PayU India listed {Count} settlements between {From:o} and {To:o}", items?.Count ?? 0, fromUtc, toUtc);
                 activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             }
             catch
@@ -242,7 +242,7 @@ public sealed class PayUIndiaSettlementProvider : ISettlementProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("PayU India {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("PayU India {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

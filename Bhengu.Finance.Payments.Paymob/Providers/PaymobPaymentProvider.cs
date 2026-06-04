@@ -9,6 +9,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Core.Observability;
@@ -29,15 +30,14 @@ namespace Bhengu.Finance.Payments.Paymob.Providers;
 /// Accept payment-key API; explicit step-up flow is exposed via the sibling
 /// <see cref="PaymobThreeDSecureProvider"/> for consumers that want to pre-flight authentication.
 /// </remarks>
-public sealed class PaymobPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class PaymobPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PaymobOptions _options;
-    private readonly ILogger<PaymobPaymentProvider> _logger;
     private readonly PaymobIdempotencyCache _idempotency;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Paymob;
+    public override string ProviderName => ProviderNames.Paymob;
 
     /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
@@ -61,10 +61,10 @@ public sealed class PaymobPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         IOptions<PaymobOptions> options,
         ILogger<PaymobPaymentProvider> logger,
         PaymobIdempotencyCache idempotency)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotency = idempotency ?? throw new ArgumentNullException(nameof(idempotency));
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
@@ -109,7 +109,7 @@ public sealed class PaymobPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         try
         {
             // 1. Authenticate
-            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
+            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
 
             // 2. Create order
             var orderBody = new
@@ -121,7 +121,7 @@ public sealed class PaymobPaymentProvider : IPaymentGatewayProvider, IPayoutProv
                 items = Array.Empty<object>(),
                 merchant_order_id = request.Metadata?.GetValueOrDefault("merchant_order_id")
             };
-            var orderJson = await PaymobHttpClient.SendAsync(_httpClient, _logger, HttpMethod.Post, "api/ecommerce/orders", orderBody, "CreateOrder", ct).ConfigureAwait(false);
+            var orderJson = await PaymobHttpClient.SendAsync(_httpClient, Logger, HttpMethod.Post, "api/ecommerce/orders", orderBody, "CreateOrder", ct).ConfigureAwait(false);
             var orderResponse = JsonSerializer.Deserialize<PaymobOrderResponse>(orderJson, PaymobHttpClient.Json);
             var orderId = orderResponse?.Id;
             if (orderId is null || orderId == 0)
@@ -142,13 +142,13 @@ public sealed class PaymobPaymentProvider : IPaymentGatewayProvider, IPayoutProv
                 lock_order_when_paid = true,
                 request_3d_secure = requestThreeDs
             };
-            var keyJson = await PaymobHttpClient.SendAsync(_httpClient, _logger, HttpMethod.Post, "api/acceptance/payment_keys", keyBody, "CreatePaymentKey", ct).ConfigureAwait(false);
+            var keyJson = await PaymobHttpClient.SendAsync(_httpClient, Logger, HttpMethod.Post, "api/acceptance/payment_keys", keyBody, "CreatePaymentKey", ct).ConfigureAwait(false);
             var keyResponse = JsonSerializer.Deserialize<PaymobPaymentKeyResponse>(keyJson, PaymobHttpClient.Json);
             var paymentKey = keyResponse?.Token;
             if (string.IsNullOrEmpty(paymentKey))
                 throw new ProviderUnavailableException(ProviderName, "Paymob payment_keys returned no token");
 
-            _logger.LogInformation("Paymob 4-step flow complete: order={OrderId} integration={IntegrationId} 3ds={ThreeDs}",
+            Logger.LogInformation("Paymob 4-step flow complete: order={OrderId} integration={IntegrationId} 3ds={ThreeDs}",
                 orderId, integrationId, requestThreeDs);
 
             var iframeUrl = iframeId > 0
@@ -209,7 +209,7 @@ public sealed class PaymobPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
         try
         {
-            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
+            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
             var amountCents = (long)(request.Amount * 100);
             var refundBody = new
             {
@@ -218,10 +218,10 @@ public sealed class PaymobPaymentProvider : IPaymentGatewayProvider, IPayoutProv
                 amount_cents = amountCents
             };
 
-            var body = await PaymobHttpClient.SendAsync(_httpClient, _logger, HttpMethod.Post, "api/acceptance/void_refund/refund", refundBody, "ProcessRefund", ct).ConfigureAwait(false);
+            var body = await PaymobHttpClient.SendAsync(_httpClient, Logger, HttpMethod.Post, "api/acceptance/void_refund/refund", refundBody, "ProcessRefund", ct).ConfigureAwait(false);
             var refund = JsonSerializer.Deserialize<PaymobTransactionResponse>(body, PaymobHttpClient.Json);
 
-            _logger.LogInformation("Paymob refund completed for transaction {Transaction} success={Success}",
+            Logger.LogInformation("Paymob refund completed for transaction {Transaction} success={Success}",
                 request.GatewayReference, refund?.Success);
 
             var status = refund?.Success == true ? PaymentStatus.Refunded : PaymentStatus.Pending;
@@ -259,7 +259,7 @@ public sealed class PaymobPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, request.Currency);
         try
         {
-            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
+            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
             var amountCents = (long)(request.Amount * 100);
             var disbursementBody = new
             {
@@ -270,10 +270,10 @@ public sealed class PaymobPaymentProvider : IPaymentGatewayProvider, IPayoutProv
                 description = request.Description
             };
 
-            var body = await PaymobHttpClient.SendAsync(_httpClient, _logger, HttpMethod.Post, "api/disbursements/transactions", disbursementBody, "ProcessPayout", ct).ConfigureAwait(false);
+            var body = await PaymobHttpClient.SendAsync(_httpClient, Logger, HttpMethod.Post, "api/disbursements/transactions", disbursementBody, "ProcessPayout", ct).ConfigureAwait(false);
             var disbursement = JsonSerializer.Deserialize<PaymobTransactionResponse>(body, PaymobHttpClient.Json);
 
-            _logger.LogInformation("Paymob disbursement created id={Id} success={Success}",
+            Logger.LogInformation("Paymob disbursement created id={Id} success={Success}",
                 disbursement?.Id, disbursement?.Success);
 
             var status = disbursement?.Success == true ? PaymentStatus.Completed : PaymentStatus.Pending;
@@ -308,7 +308,7 @@ public sealed class PaymobPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         bool valid;
         if (string.IsNullOrWhiteSpace(_options.HmacSecret))
         {
-            _logger.LogWarning("Paymob HmacSecret not configured — webhook signature verification cannot succeed.");
+            Logger.LogWarning("Paymob HmacSecret not configured — webhook signature verification cannot succeed.");
             valid = false;
         }
         else
@@ -325,7 +325,7 @@ public sealed class PaymobPaymentProvider : IPaymentGatewayProvider, IPayoutProv
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Paymob webhook signature verification raised");
+                Logger.LogError(ex, "Paymob webhook signature verification raised");
                 valid = false;
             }
         }
@@ -347,7 +347,7 @@ public sealed class PaymobPaymentProvider : IPaymentGatewayProvider, IPayoutProv
             var callback = JsonSerializer.Deserialize<PaymobWebhookCallback>(payload, PaymobHttpClient.Json);
             if (callback?.Obj is null) return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed Paymob webhook: type={Type} success={Success} id={Id}",
+            Logger.LogInformation("Parsed Paymob webhook: type={Type} success={Success} id={Id}",
                 callback.Type, callback.Obj.Success, callback.Obj.Id);
 
             var obj = callback.Obj;
@@ -465,7 +465,7 @@ public sealed class PaymobPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse Paymob webhook callback");
+            Logger.LogError(ex, "Failed to parse Paymob webhook callback");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }

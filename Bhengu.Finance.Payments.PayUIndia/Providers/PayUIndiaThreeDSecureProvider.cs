@@ -9,6 +9,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.ThreeDSecure;
 using Bhengu.Finance.Payments.Core.Observability;
@@ -32,27 +33,26 @@ namespace Bhengu.Finance.Payments.PayUIndia.Providers;
 /// <see cref="ThreeDSecureCompletion"/> returned by the issuer is supplied back on
 /// <c>PaymentRequest.ThreeDSecureCompletion</c> and PayU India settles automatically.</para>
 /// </remarks>
-public sealed class PayUIndiaThreeDSecureProvider : IThreeDSecureProvider
+public sealed class PayUIndiaThreeDSecureProvider : BhenguProviderBase, IThreeDSecureProvider
 {
     private static readonly JsonSerializerOptions DeserializeOptions = new() { PropertyNameCaseInsensitive = true };
 
     private readonly HttpClient _httpClient;
     private readonly PayUIndiaOptions _options;
-    private readonly ILogger<PayUIndiaThreeDSecureProvider> _logger;
     private readonly string _baseUrl;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.PayUIndia;
+    public override string ProviderName => ProviderNames.PayUIndia;
 
     /// <summary>Create a new PayU India 3DS provider bound to the supplied HTTP client and options.</summary>
     public PayUIndiaThreeDSecureProvider(
         HttpClient httpClient,
         IOptions<PayUIndiaOptions> options,
         ILogger<PayUIndiaThreeDSecureProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.MerchantKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PayUIndiaOptions.MerchantKey)} is required");
@@ -112,7 +112,7 @@ public sealed class PayUIndiaThreeDSecureProvider : IThreeDSecureProvider
             var raw = await PostFormAsync("_payment", form, ct, "StartAuthentication").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<PayUIndia3DSResponse>(raw, DeserializeOptions);
 
-            _logger.LogInformation("PayU India 3DS challenge: txnid={Txnid} status={Status} authRequired={AuthRequired}",
+            Logger.LogInformation("PayU India 3DS challenge: txnid={Txnid} status={Status} authRequired={AuthRequired}",
                 txnid, response?.Status, response?.MetaData?.TxnStatus);
 
             var status = (response?.MetaData?.TxnStatus ?? response?.Status ?? string.Empty).ToLowerInvariant();
@@ -223,7 +223,7 @@ public sealed class PayUIndiaThreeDSecureProvider : IThreeDSecureProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("PayU India {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("PayU India {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

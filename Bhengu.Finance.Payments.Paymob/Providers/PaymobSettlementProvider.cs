@@ -7,6 +7,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models.Settlement;
 using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Paymob.Configuration;
@@ -20,24 +21,23 @@ namespace Bhengu.Finance.Payments.Paymob.Providers;
 /// Paymob implementation of <see cref="ISettlementProvider"/>. Wraps Paymob's settlement-feed
 /// endpoint (<c>/api/acceptance/settlements</c>) for per-day batch reconciliation.
 /// </summary>
-public sealed class PaymobSettlementProvider : ISettlementProvider
+public sealed class PaymobSettlementProvider : BhenguProviderBase, ISettlementProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PaymobOptions _options;
-    private readonly ILogger<PaymobSettlementProvider> _logger;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Paymob;
+    public override string ProviderName => ProviderNames.Paymob;
 
     /// <summary>Construct a settlement provider. Designed to be registered via DI.</summary>
     public PaymobSettlementProvider(
         HttpClient httpClient,
         IOptions<PaymobOptions> options,
         ILogger<PaymobSettlementProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PaymobOptions.ApiKey)} is required");
@@ -51,11 +51,11 @@ public sealed class PaymobSettlementProvider : ISettlementProvider
         List<PaymobSettlement>? items;
         using (BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list"))
         {
-            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
+            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
             var from = fromUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
             var to = toUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
             var responseBody = await PaymobHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get,
+                _httpClient, Logger, HttpMethod.Get,
                 $"api/acceptance/settlements?from={from}&to={to}&auth_token={Uri.EscapeDataString(authToken)}",
                 null, "ListSettlements", ct).ConfigureAwait(false);
 
@@ -78,9 +78,9 @@ public sealed class PaymobSettlementProvider : ISettlementProvider
         using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.get");
         try
         {
-            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
+            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
             var responseBody = await PaymobHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get,
+                _httpClient, Logger, HttpMethod.Get,
                 $"api/acceptance/settlements/{Uri.EscapeDataString(settlementReference)}?auth_token={Uri.EscapeDataString(authToken)}",
                 null, "GetSettlement", ct).ConfigureAwait(false);
 
@@ -100,9 +100,9 @@ public sealed class PaymobSettlementProvider : ISettlementProvider
         List<PaymobSettlementTxn>? items;
         using (BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.transactions"))
         {
-            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
+            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
             var responseBody = await PaymobHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get,
+                _httpClient, Logger, HttpMethod.Get,
                 $"api/acceptance/settlements/{Uri.EscapeDataString(settlementReference)}/transactions?auth_token={Uri.EscapeDataString(authToken)}",
                 null, "SettlementTransactions", ct).ConfigureAwait(false);
 

@@ -10,6 +10,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models.Subscription;
 using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.PayUIndia.Configuration;
@@ -30,7 +31,7 @@ namespace Bhengu.Finance.Payments.PayUIndia.Providers;
 /// returns a synthetic plan reference (<c>payu_plan_*</c>). <see cref="CreateSubscriptionAsync"/>
 /// resolves the cached plan and inlines the recurring block.
 /// </remarks>
-public sealed class PayUIndiaSubscriptionProvider : ISubscriptionProvider
+public sealed class PayUIndiaSubscriptionProvider : BhenguProviderBase, ISubscriptionProvider
 {
     private static readonly JsonSerializerOptions DeserializeOptions = new() { PropertyNameCaseInsensitive = true };
 
@@ -39,20 +40,19 @@ public sealed class PayUIndiaSubscriptionProvider : ISubscriptionProvider
 
     private readonly HttpClient _httpClient;
     private readonly PayUIndiaOptions _options;
-    private readonly ILogger<PayUIndiaSubscriptionProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.PayUIndia;
+    public override string ProviderName => ProviderNames.PayUIndia;
 
     /// <summary>Create a new PayU India subscription provider bound to the supplied HTTP client and options.</summary>
     public PayUIndiaSubscriptionProvider(
         HttpClient httpClient,
         IOptions<PayUIndiaOptions> options,
         ILogger<PayUIndiaSubscriptionProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.MerchantKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PayUIndiaOptions.MerchantKey)} is required");
@@ -84,7 +84,7 @@ public sealed class PayUIndiaSubscriptionProvider : ISubscriptionProvider
         };
 
         PlanCache[reference] = plan;
-        _logger.LogInformation("PayU India plan cached locally as {PlanId} ({Amount} {Currency}/{Interval})",
+        Logger.LogInformation("PayU India plan cached locally as {PlanId} ({Amount} {Currency}/{Interval})",
             reference, plan.Amount, plan.Currency, plan.Interval);
 
         activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
@@ -133,7 +133,7 @@ public sealed class PayUIndiaSubscriptionProvider : ISubscriptionProvider
             var raw = await PostFormAsync("merchant/postservice.php?form=2", form, ct, "CreateSubscription").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<PayUIndiaSubscriptionResponse>(raw, DeserializeOptions);
 
-            _logger.LogInformation("PayU India subscription created: siRef={SiRef} status={Status}",
+            Logger.LogInformation("PayU India subscription created: siRef={SiRef} status={Status}",
                 siRef, response?.Status);
 
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
@@ -229,7 +229,7 @@ public sealed class PayUIndiaSubscriptionProvider : ISubscriptionProvider
 
             await PostFormAsync("merchant/postservice.php?form=2", form, ct, "CancelSubscription").ConfigureAwait(false);
 
-            _logger.LogInformation("PayU India subscription cancelled: siRef={SiRef} immediately={Immediately}",
+            Logger.LogInformation("PayU India subscription cancelled: siRef={SiRef} immediately={Immediately}",
                 subscriptionReference, immediately);
 
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
@@ -318,7 +318,7 @@ public sealed class PayUIndiaSubscriptionProvider : ISubscriptionProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("PayU India {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("PayU India {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

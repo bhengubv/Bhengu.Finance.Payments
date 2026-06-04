@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Core.Observability;
@@ -32,17 +33,16 @@ namespace Bhengu.Finance.Payments.PayUIndia.Providers;
 /// browser. <c>GatewayReference</c> is the merchant-supplied <c>txnid</c>.
 /// Refunds and payouts use the info-service JSON endpoint.
 /// </remarks>
-public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class PayUIndiaPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private static readonly JsonSerializerOptions DeserializeOptions = new() { PropertyNameCaseInsensitive = true };
 
     private readonly HttpClient _httpClient;
     private readonly PayUIndiaOptions _options;
-    private readonly ILogger<PayUIndiaPaymentProvider> _logger;
     private readonly PayUIndiaIdempotencyCache _idempotencyCache;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.PayUIndia;
+    public override string ProviderName => ProviderNames.PayUIndia;
 
     /// <inheritdoc />
     public ProviderCapabilities Capabilities =>
@@ -67,10 +67,10 @@ public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutP
         IOptions<PayUIndiaOptions> options,
         ILogger<PayUIndiaPaymentProvider> logger,
         IBhenguDistributedCache? cache = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotencyCache = new PayUIndiaIdempotencyCache(cache ?? new InMemoryBhenguDistributedCache());
 
         if (string.IsNullOrWhiteSpace(_options.MerchantKey))
@@ -142,7 +142,7 @@ public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutP
                     $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(kv.Value)}"));
                 var redirectUrl = $"{baseUrl.TrimEnd('/')}/_payment?{query}";
 
-                _logger.LogInformation("PayU India payment initiated: txnid={Txnid} (redirect URL built)", txnid);
+                Logger.LogInformation("PayU India payment initiated: txnid={Txnid} (redirect URL built)", txnid);
 
                 activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Pending);
                 BhenguPaymentDiagnostics.ChargesTotal.Add(1,
@@ -199,7 +199,7 @@ public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutP
                 var raw = await PostFormAsync("merchant/postservice.php?form=2", form, ct, "ProcessRefund").ConfigureAwait(false);
                 var refund = TryParseInfoResponse<PayUIndiaInfoResponse>(raw);
 
-                _logger.LogInformation("PayU India refund created for payment {PaymentId} token {TokenId} status={Status}",
+                Logger.LogInformation("PayU India refund created for payment {PaymentId} token {TokenId} status={Status}",
                     paymentId, tokenId, refund?.Status);
 
                 var status = MapStatus(refund?.Status ?? "pending");
@@ -260,7 +260,7 @@ public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutP
                 var raw = await PostFormAsync("merchant/postservice.php?form=2", form, ct, "ProcessPayout").ConfigureAwait(false);
                 var payout = TryParseInfoResponse<PayUIndiaInfoResponse>(raw);
 
-                _logger.LogInformation("PayU India payout initiated to {Destination} status={Status}", var1, payout?.Status);
+                Logger.LogInformation("PayU India payout initiated to {Destination} status={Status}", var1, payout?.Status);
 
                 var status = MapStatus(payout?.Status ?? "pending");
                 activity.SetOutcome(status == PaymentStatus.Completed
@@ -295,7 +295,7 @@ public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutP
 
         if (string.IsNullOrWhiteSpace(_options.Salt))
         {
-            _logger.LogWarning("PayU India Salt not configured — signature verification cannot succeed.");
+            Logger.LogWarning("PayU India Salt not configured — signature verification cannot succeed.");
             BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
                 new KeyValuePair<string, object?>("provider", ProviderName),
                 new KeyValuePair<string, object?>("valid", false));
@@ -321,7 +321,7 @@ public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutP
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "PayU India webhook signature verification raised");
+            Logger.LogError(ex, "PayU India webhook signature verification raised");
             return false;
         }
     }
@@ -360,7 +360,7 @@ public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutP
             if (webhookEvent is null || string.IsNullOrEmpty(webhookEvent.Txnid))
                 return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed PayU India webhook: status={Status} txnid={Txnid}",
+            Logger.LogInformation("Parsed PayU India webhook: status={Status} txnid={Txnid}",
                 webhookEvent.Status, webhookEvent.Txnid);
 
             var status = webhookEvent.Status?.ToLowerInvariant() ?? "unknown";
@@ -425,7 +425,7 @@ public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutP
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse PayU India webhook event");
+            Logger.LogError(ex, "Failed to parse PayU India webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -455,7 +455,7 @@ public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutP
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("PayU India {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("PayU India {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

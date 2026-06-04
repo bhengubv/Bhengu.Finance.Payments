@@ -6,6 +6,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.ThreeDSecure;
 using Bhengu.Finance.Payments.Core.Observability;
@@ -31,24 +32,23 @@ namespace Bhengu.Finance.Payments.Paymob.Providers;
 /// to bypass 3DS where the merchant has a low-risk indicator on file. The provider then returns
 /// <see cref="ThreeDSecureStatus.NotRequired"/>.</para>
 /// </remarks>
-public sealed class PaymobThreeDSecureProvider : IThreeDSecureProvider
+public sealed class PaymobThreeDSecureProvider : BhenguProviderBase, IThreeDSecureProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PaymobOptions _options;
-    private readonly ILogger<PaymobThreeDSecureProvider> _logger;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Paymob;
+    public override string ProviderName => ProviderNames.Paymob;
 
     /// <summary>Construct the provider. Designed to be registered via DI.</summary>
     public PaymobThreeDSecureProvider(
         HttpClient httpClient,
         IOptions<PaymobOptions> options,
         ILogger<PaymobThreeDSecureProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PaymobOptions.ApiKey)} is required");
@@ -87,13 +87,13 @@ public sealed class PaymobThreeDSecureProvider : IThreeDSecureProvider
             throw new PaymentDeclinedException(ProviderName, "missing_integration_id",
                 "Paymob 3DS requires an 'integration_id' on PaymentRequest.Metadata or PaymobOptions.IntegrationId.");
 
-        var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
+        var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
 
         var amountCents = (long)(chargeIntent.Amount * 100);
         var currency = string.IsNullOrWhiteSpace(chargeIntent.Currency) ? _options.Currency : chargeIntent.Currency.ToUpperInvariant();
 
         // Step 1 — create order
-        var orderJson = await PaymobHttpClient.SendAsync(_httpClient, _logger, HttpMethod.Post, "api/ecommerce/orders", new
+        var orderJson = await PaymobHttpClient.SendAsync(_httpClient, Logger, HttpMethod.Post, "api/ecommerce/orders", new
         {
             auth_token = authToken,
             delivery_needed = false,
@@ -108,7 +108,7 @@ public sealed class PaymobThreeDSecureProvider : IThreeDSecureProvider
             throw new ProviderUnavailableException(ProviderName, "Paymob order creation returned no id");
 
         // Step 2 — payment-key with 3DS forced on
-        var keyJson = await PaymobHttpClient.SendAsync(_httpClient, _logger, HttpMethod.Post, "api/acceptance/payment_keys", new
+        var keyJson = await PaymobHttpClient.SendAsync(_httpClient, Logger, HttpMethod.Post, "api/acceptance/payment_keys", new
         {
             auth_token = authToken,
             amount_cents = amountCents,
@@ -130,7 +130,7 @@ public sealed class PaymobThreeDSecureProvider : IThreeDSecureProvider
             ? $"https://accept.paymob.com/api/acceptance/iframes/{iframeId}?payment_token={paymentKey}"
             : null;
 
-        _logger.LogInformation("Paymob 3DS challenge started: order={OrderId} iframe={Iframe}", order.Id, iframeId);
+        Logger.LogInformation("Paymob 3DS challenge started: order={OrderId} iframe={Iframe}", order.Id, iframeId);
 
         return new ThreeDSecureChallenge
         {
@@ -148,14 +148,14 @@ public sealed class PaymobThreeDSecureProvider : IThreeDSecureProvider
         ArgumentException.ThrowIfNullOrEmpty(challengeReference);
 
         using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "3ds.get");
-        var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
+        var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
 
         try
         {
             // Inquire the transaction associated with the order — Paymob exposes it via
             // /api/ecommerce/orders/transaction_inquiry once the order has a settled txn.
             var responseBody = await PaymobHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Post, "api/ecommerce/orders/transaction_inquiry",
+                _httpClient, Logger, HttpMethod.Post, "api/ecommerce/orders/transaction_inquiry",
                 new { auth_token = authToken, order_id = challengeReference },
                 "3ds.Inquire", ct).ConfigureAwait(false);
 
