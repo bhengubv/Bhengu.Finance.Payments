@@ -13,7 +13,6 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
-using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.IPay.Configuration;
 using Bhengu.Finance.Payments.IPay.Internals;
 using Microsoft.Extensions.Logging;
@@ -78,21 +77,14 @@ public sealed class IPayPaymentProvider : BhenguProviderBase, IPaymentGatewayPro
     }
 
     /// <inheritdoc/>
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
-        var started = DateTime.UtcNow;
-        var cached = await TryGetCachedAsync<PaymentResponse>(request.IdempotencyKey, "charge", ct).ConfigureAwait(false);
-        if (cached is not null)
+        return RunChargeAsync(request.Currency, async () =>
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return cached;
-        }
+            var cached = await TryGetCachedAsync<PaymentResponse>(request.IdempotencyKey, "charge", ct).ConfigureAwait(false);
+            if (cached is not null) return cached;
 
-        try
-        {
             var oid = request.PaymentMethodToken;
             var inv = request.Metadata?.GetValueOrDefault("inv") ?? oid;
             var ttl = request.Amount.ToString("0.00", CultureInfo.InvariantCulture);
@@ -136,27 +128,8 @@ public sealed class IPayPaymentProvider : BhenguProviderBase, IPaymentGatewayPro
             };
 
             await TrySetCachedAsync(request.IdempotencyKey, "charge", response, ct).ConfigureAwait(false);
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", BhenguPaymentDiagnostics.Outcomes.Pending));
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Pending);
             return response;
-        }
-        catch (Exception ex)
-        {
-            var outcome = ClassifyOutcome(ex);
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcome));
-            activity.SetOutcome(outcome);
-            throw;
-        }
-        finally
-        {
-            BhenguPaymentDiagnostics.ChargeDurationMs.Record(
-                (DateTime.UtcNow - started).TotalMilliseconds,
-                new KeyValuePair<string, object?>("provider", ProviderName));
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>
@@ -174,20 +147,14 @@ public sealed class IPayPaymentProvider : BhenguProviderBase, IPaymentGatewayPro
     /// <see cref="PayoutRequest.DestinationToken"/> must be a Kenyan M-Pesa MSISDN
     /// (with or without leading <c>+</c>, e.g. <c>254700000000</c>).
     /// </summary>
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, request.Currency);
-        var cached = await TryGetCachedAsync<PayoutResponse>(request.IdempotencyKey, "payout", ct).ConfigureAwait(false);
-        if (cached is not null)
+        return RunPayoutAsync(request.Currency, async () =>
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return cached;
-        }
+            var cached = await TryGetCachedAsync<PayoutResponse>(request.IdempotencyKey, "payout", ct).ConfigureAwait(false);
+            if (cached is not null) return cached;
 
-        try
-        {
             var phone = request.DestinationToken.TrimStart('+');
             var ttl = request.Amount.ToString("0", CultureInfo.InvariantCulture);
             var occasion = request.Description;
@@ -229,23 +196,8 @@ public sealed class IPayPaymentProvider : BhenguProviderBase, IPaymentGatewayPro
             };
 
             await TrySetCachedAsync(request.IdempotencyKey, "payout", response, ct).ConfigureAwait(false);
-            BhenguPaymentDiagnostics.PayoutsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", status == PaymentStatus.Failed
-                    ? BhenguPaymentDiagnostics.Outcomes.Declined
-                    : BhenguPaymentDiagnostics.Outcomes.Success));
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             return response;
-        }
-        catch (Exception ex)
-        {
-            var outcome = ClassifyOutcome(ex);
-            BhenguPaymentDiagnostics.PayoutsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcome));
-            activity.SetOutcome(outcome);
-            throw;
-        }
+        }, ct);
     }
 
     /// <summary>
@@ -267,141 +219,135 @@ public sealed class IPayPaymentProvider : BhenguProviderBase, IPaymentGatewayPro
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        if (string.IsNullOrWhiteSpace(_options.HashKey))
+        return RunWebhookVerify(() =>
         {
-            Logger.LogWarning("iPay HashKey not configured — webhook verification cannot proceed.");
-            BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("valid", false));
-            return false;
-        }
+            if (string.IsNullOrWhiteSpace(_options.HashKey))
+            {
+                Logger.LogWarning("iPay HashKey not configured — webhook verification cannot proceed.");
+                return false;
+            }
 
-        bool valid;
-        try
-        {
-            // iPay's callback re-uses the same HMAC-SHA256-hex scheme over the concatenated
-            // payload string. Caller must concatenate fields in the documented order before
-            // invoking VerifyWebhookSignature.
-            var expected = IPayCrypto.ComputeHmacHex(payload, _options.HashKey);
-            valid = CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(signature),
-                Encoding.UTF8.GetBytes(expected));
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "iPay webhook signature verification raised");
-            valid = false;
-        }
-
-        BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
-            new KeyValuePair<string, object?>("provider", ProviderName),
-            new KeyValuePair<string, object?>("valid", valid));
-        return valid;
+            try
+            {
+                // iPay's callback re-uses the same HMAC-SHA256-hex scheme over the concatenated
+                // payload string. Caller must concatenate fields in the documented order before
+                // invoking VerifyWebhookSignature.
+                var expected = IPayCrypto.ComputeHmacHex(payload, _options.HashKey);
+                return CryptographicOperations.FixedTimeEquals(
+                    Encoding.UTF8.GetBytes(signature),
+                    Encoding.UTF8.GetBytes(expected));
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "iPay webhook signature verification raised");
+                return false;
+            }
+        });
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-
-        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
-
-        try
+        return RunOperationAsync("parse_webhook", () =>
         {
-            // iPay callback can be application/x-www-form-urlencoded (txncd=..&status=..&...)
-            // or JSON. Try JSON first; fall back to form-urlencoded.
-            string? statusRaw, txncd, ipnid, eventType, amountRaw, currencyRaw;
-            if (payload.TrimStart().StartsWith('{'))
+            try
             {
-                var json = JsonSerializer.Deserialize<IPayCallback>(payload);
-                if (json is null) return Task.FromResult<WebhookEvent?>(null);
-                statusRaw = json.Status;
-                txncd = json.Txncd;
-                ipnid = json.Ipnid;
-                eventType = json.EventType;
-                amountRaw = json.Amount;
-                currencyRaw = json.Currency;
-            }
-            else
-            {
-                var bag = ParseQueryString(payload);
-                statusRaw = bag.GetValueOrDefault("status");
-                txncd = bag.GetValueOrDefault("txncd");
-                ipnid = bag.GetValueOrDefault("ipnid");
-                eventType = bag.GetValueOrDefault("event");
-                amountRaw = bag.GetValueOrDefault("amount");
-                currencyRaw = bag.GetValueOrDefault("currency");
-            }
+                // iPay callback can be application/x-www-form-urlencoded (txncd=..&status=..&...)
+                // or JSON. Try JSON first; fall back to form-urlencoded.
+                string? statusRaw, txncd, ipnid, eventType, amountRaw, currencyRaw;
+                if (payload.TrimStart().StartsWith('{'))
+                {
+                    var json = JsonSerializer.Deserialize<IPayCallback>(payload);
+                    if (json is null) return Task.FromResult<WebhookEvent?>(null);
+                    statusRaw = json.Status;
+                    txncd = json.Txncd;
+                    ipnid = json.Ipnid;
+                    eventType = json.EventType;
+                    amountRaw = json.Amount;
+                    currencyRaw = json.Currency;
+                }
+                else
+                {
+                    var bag = ParseQueryString(payload);
+                    statusRaw = bag.GetValueOrDefault("status");
+                    txncd = bag.GetValueOrDefault("txncd");
+                    ipnid = bag.GetValueOrDefault("ipnid");
+                    eventType = bag.GetValueOrDefault("event");
+                    amountRaw = bag.GetValueOrDefault("amount");
+                    currencyRaw = bag.GetValueOrDefault("currency");
+                }
 
-            var reference = txncd ?? ipnid;
-            if (string.IsNullOrEmpty(reference))
+                var reference = txncd ?? ipnid;
+                if (string.IsNullOrEmpty(reference))
+                    return Task.FromResult<WebhookEvent?>(null);
+
+                decimal.TryParse(amountRaw, NumberStyles.Number, CultureInfo.InvariantCulture, out var amount);
+                var currency = currencyRaw ?? _options.Currency;
+                var eventLower = eventType?.ToLowerInvariant();
+                var statusLower = statusRaw?.ToLowerInvariant();
+
+                WebhookEvent? typed = (eventLower, statusLower) switch
+                {
+                    ("payout.completed", _) => new PayoutCompletedEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Completed,
+                        EventType = eventType,
+                        Category = WebhookEventCategory.PayoutCompleted,
+                        PayoutReference = reference,
+                        Amount = amount,
+                        Currency = currency
+                    },
+                    ("payout.failed", _) => new PayoutFailedEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Failed,
+                        EventType = eventType,
+                        Category = WebhookEventCategory.PayoutFailed,
+                        PayoutReference = reference,
+                        Amount = amount,
+                        Currency = currency
+                    },
+                    (_, "aei7p7yrx4ae34") => new ChargeSucceededEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Completed,
+                        EventType = statusRaw,
+                        Category = WebhookEventCategory.ChargeSucceeded,
+                        Amount = amount,
+                        Currency = currency
+                    },
+                    (_, "bdi6p2yy76etrs") or (_, "fe2707etr5s4wq") or (_, "dtfi4p7yty45wq") => new ChargeFailedEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Failed,
+                        EventType = statusRaw,
+                        Category = WebhookEventCategory.ChargeFailed,
+                        Amount = amount,
+                        Currency = currency,
+                        FailureCode = statusRaw
+                    },
+                    (_, "cr5i3pgy9867e1") => new ChargePendingEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Pending,
+                        EventType = statusRaw,
+                        Category = WebhookEventCategory.ChargePending,
+                        Amount = amount,
+                        Currency = currency
+                    },
+                    _ => null
+                };
+
+                return Task.FromResult(typed);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Failed to parse iPay callback");
                 return Task.FromResult<WebhookEvent?>(null);
-
-            decimal.TryParse(amountRaw, NumberStyles.Number, CultureInfo.InvariantCulture, out var amount);
-            var currency = currencyRaw ?? _options.Currency;
-            var eventLower = eventType?.ToLowerInvariant();
-            var statusLower = statusRaw?.ToLowerInvariant();
-
-            WebhookEvent? typed = (eventLower, statusLower) switch
-            {
-                ("payout.completed", _) => new PayoutCompletedEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Completed,
-                    EventType = eventType,
-                    Category = WebhookEventCategory.PayoutCompleted,
-                    PayoutReference = reference,
-                    Amount = amount,
-                    Currency = currency
-                },
-                ("payout.failed", _) => new PayoutFailedEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Failed,
-                    EventType = eventType,
-                    Category = WebhookEventCategory.PayoutFailed,
-                    PayoutReference = reference,
-                    Amount = amount,
-                    Currency = currency
-                },
-                (_, "aei7p7yrx4ae34") => new ChargeSucceededEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Completed,
-                    EventType = statusRaw,
-                    Category = WebhookEventCategory.ChargeSucceeded,
-                    Amount = amount,
-                    Currency = currency
-                },
-                (_, "bdi6p2yy76etrs") or (_, "fe2707etr5s4wq") or (_, "dtfi4p7yty45wq") => new ChargeFailedEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Failed,
-                    EventType = statusRaw,
-                    Category = WebhookEventCategory.ChargeFailed,
-                    Amount = amount,
-                    Currency = currency,
-                    FailureCode = statusRaw
-                },
-                (_, "cr5i3pgy9867e1") => new ChargePendingEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Pending,
-                    EventType = statusRaw,
-                    Category = WebhookEventCategory.ChargePending,
-                    Amount = amount,
-                    Currency = currency
-                },
-                _ => null
-            };
-
-            return Task.FromResult(typed);
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Failed to parse iPay callback");
-            return Task.FromResult<WebhookEvent?>(null);
-        }
+            }
+        }, ct);
     }
 
     private async Task<T?> TryGetCachedAsync<T>(string? idempotencyKey, string operation, CancellationToken ct) where T : class
@@ -419,14 +365,6 @@ public sealed class IPayPaymentProvider : BhenguProviderBase, IPaymentGatewayPro
         var key = $"ipay:{operation}:{idempotencyKey}";
         await _idempotencyCache.SetAsync(key, value, TimeSpan.FromHours(24), ct).ConfigureAwait(false);
     }
-
-    private static string ClassifyOutcome(Exception ex) => ex switch
-    {
-        PaymentDeclinedException => BhenguPaymentDiagnostics.Outcomes.Declined,
-        ProviderRateLimitException => BhenguPaymentDiagnostics.Outcomes.RateLimited,
-        ProviderUnavailableException => BhenguPaymentDiagnostics.Outcomes.Unavailable,
-        _ => BhenguPaymentDiagnostics.Outcomes.Error
-    };
 
     private static Dictionary<string, string> ParseQueryString(string raw)
     {

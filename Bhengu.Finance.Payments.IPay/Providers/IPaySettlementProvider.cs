@@ -90,30 +90,24 @@ public sealed class IPaySettlementProvider : BhenguProviderBase, ISettlementProv
     }
 
     /// <inheritdoc/>
-    public async Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
+    public Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.get");
-        try
+        return RunOperationAsync<Settlement?>("get_settlement", async () =>
         {
-            var hash = IPayCrypto.ComputeHmacHex($"{_options.VendorId}{settlementReference}", _options.HashKey);
-            var path = $"api/v3/settlements/{Uri.EscapeDataString(settlementReference)}?vid={Uri.EscapeDataString(_options.VendorId)}&hash={hash}";
-            var responseBody = await IPayHttpClient.SendGetAsync(_httpClient, Logger, path, ct, "GetSettlement").ConfigureAwait(false);
-            var envelope = JsonSerializer.Deserialize<IPaySettlementSingleResponse>(responseBody);
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return envelope?.Data is null ? null : ToSettlement(envelope.Data);
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return null;
-        }
-        catch (Exception ex)
-        {
-            activity.SetOutcome(ClassifyOutcome(ex));
-            throw;
-        }
+            try
+            {
+                var hash = IPayCrypto.ComputeHmacHex($"{_options.VendorId}{settlementReference}", _options.HashKey);
+                var path = $"api/v3/settlements/{Uri.EscapeDataString(settlementReference)}?vid={Uri.EscapeDataString(_options.VendorId)}&hash={hash}";
+                var responseBody = await IPayHttpClient.SendGetAsync(_httpClient, Logger, path, ct, "GetSettlement").ConfigureAwait(false);
+                var envelope = JsonSerializer.Deserialize<IPaySettlementSingleResponse>(responseBody);
+                return envelope?.Data is null ? null : ToSettlement(envelope.Data);
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return null;
+            }
+        }, ct);
     }
 
     /// <inheritdoc/>
