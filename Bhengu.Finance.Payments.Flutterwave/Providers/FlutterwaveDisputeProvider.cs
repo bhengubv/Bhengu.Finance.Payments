@@ -62,32 +62,26 @@ public sealed class FlutterwaveDisputeProvider : BhenguProviderBase, IDisputePro
     }
 
     /// <inheritdoc />
-    public async Task<Dispute?> GetDisputeAsync(string disputeReference, CancellationToken ct = default)
+    public Task<Dispute?> GetDisputeAsync(string disputeReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(disputeReference);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "dispute.get");
-        try
+        return RunOperationAsync<Dispute?>("get_dispute", async () =>
         {
-            var raw = await SendAsync(HttpMethod.Get, $"v3/chargebacks/{Uri.EscapeDataString(disputeReference)}", body: null, ct, "GetDispute").ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<FlutterwaveDisputeEnvelope<FlutterwaveDisputeBody>>(raw, DeserializeOptions);
+            try
+            {
+                var raw = await SendAsync(HttpMethod.Get, $"v3/chargebacks/{Uri.EscapeDataString(disputeReference)}", body: null, ct, "GetDispute").ConfigureAwait(false);
+                var response = JsonSerializer.Deserialize<FlutterwaveDisputeEnvelope<FlutterwaveDisputeBody>>(raw, DeserializeOptions);
 
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+                if (response?.Data is null)
+                    return null;
 
-            if (response?.Data is null)
+                return MapDispute(response.Data);
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
                 return null;
-
-            return MapDispute(response.Data);
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            return null;
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+            }
+        }, ct);
     }
 
     /// <inheritdoc />
@@ -132,13 +126,11 @@ public sealed class FlutterwaveDisputeProvider : BhenguProviderBase, IDisputePro
     }
 
     /// <inheritdoc />
-    public async Task<Dispute> SubmitEvidenceAsync(string disputeReference, DisputeEvidence evidence, CancellationToken ct = default)
+    public Task<Dispute> SubmitEvidenceAsync(string disputeReference, DisputeEvidence evidence, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(disputeReference);
         ArgumentNullException.ThrowIfNull(evidence);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "dispute.contest");
-        try
+        return RunOperationAsync("submit_dispute_evidence", async () =>
         {
             var body = new
             {
@@ -157,7 +149,6 @@ public sealed class FlutterwaveDisputeProvider : BhenguProviderBase, IDisputePro
             var response = JsonSerializer.Deserialize<FlutterwaveDisputeEnvelope<FlutterwaveDisputeBody>>(raw, DeserializeOptions);
 
             Logger.LogInformation("Flutterwave dispute contested: {DisputeId}", response?.Data?.Id);
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
 
             return response?.Data is null
                 ? new Dispute
@@ -170,27 +161,19 @@ public sealed class FlutterwaveDisputeProvider : BhenguProviderBase, IDisputePro
                     OpenedAt = DateTime.UtcNow
                 }
                 : MapDispute(response.Data);
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+        }, ct);
     }
 
     /// <inheritdoc />
-    public async Task<Dispute> AcceptDisputeAsync(string disputeReference, CancellationToken ct = default)
+    public Task<Dispute> AcceptDisputeAsync(string disputeReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(disputeReference);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "dispute.accept");
-        try
+        return RunOperationAsync("accept_dispute", async () =>
         {
             var raw = await SendAsync(HttpMethod.Post, $"v3/chargebacks/{Uri.EscapeDataString(disputeReference)}/accept", body: new { }, ct, "AcceptDispute").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<FlutterwaveDisputeEnvelope<FlutterwaveDisputeBody>>(raw, DeserializeOptions);
 
             Logger.LogInformation("Flutterwave dispute accepted: {DisputeId}", response?.Data?.Id);
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
 
             return response?.Data is null
                 ? new Dispute
@@ -203,12 +186,7 @@ public sealed class FlutterwaveDisputeProvider : BhenguProviderBase, IDisputePro
                     OpenedAt = DateTime.UtcNow
                 }
                 : MapDispute(response.Data) with { Status = DisputeStatus.Accepted };
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+        }, ct);
     }
 
     private static Dispute MapDispute(FlutterwaveDisputeBody d)
