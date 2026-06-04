@@ -9,6 +9,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Marketplace;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Paystack.Configuration;
 using Bhengu.Finance.Payments.Paystack.Internals;
 using Microsoft.Extensions.Logging;
@@ -27,15 +28,14 @@ namespace Bhengu.Finance.Payments.Paystack.Providers;
 /// active. <see cref="SubAccountRequest.SettlementAccountToken"/> must be a Paystack-resolved
 /// account number (use Paystack's bank resolution endpoint first).
 /// </remarks>
-public sealed class PaystackMarketplaceProvider : IMarketplaceProvider
+public sealed class PaystackMarketplaceProvider : BhenguProviderBase, IMarketplaceProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PaystackOptions _options;
-    private readonly ILogger<PaystackMarketplaceProvider> _logger;
     private readonly PaystackIdempotencyCache _idempotency;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Paystack;
+    public override string ProviderName => ProviderNames.Paystack;
 
     /// <summary>Construct a marketplace provider. Designed to be registered via DI.</summary>
     public PaystackMarketplaceProvider(
@@ -43,10 +43,10 @@ public sealed class PaystackMarketplaceProvider : IMarketplaceProvider
         IOptions<PaystackOptions> options,
         ILogger<PaystackMarketplaceProvider> logger,
         PaystackIdempotencyCache idempotency)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotency = idempotency ?? throw new ArgumentNullException(nameof(idempotency));
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
@@ -59,8 +59,9 @@ public sealed class PaystackMarketplaceProvider : IMarketplaceProvider
     public Task<SubAccount> CreateSubAccountAsync(SubAccountRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return PaystackObservability.ObserveAsync("create_sub_account", () =>
-            _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreateSubAccountCoreAsync(request, ct)));
+        return RunOperationAsync("create_sub_account",
+            () => _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreateSubAccountCoreAsync(request, ct)),
+            ct);
     }
 
     private async Task<SubAccount> CreateSubAccountCoreAsync(SubAccountRequest request, CancellationToken ct)
@@ -90,7 +91,7 @@ public sealed class PaystackMarketplaceProvider : IMarketplaceProvider
         };
 
         var responseBody = await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, "subaccount", body, "CreateSubAccount", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Post, "subaccount", body, "CreateSubAccount", ct).ConfigureAwait(false);
         var response = JsonSerializer.Deserialize<PaystackSubAccountResponse>(responseBody, PaystackHttpClient.Json);
         var data = response?.Data
             ?? throw new BhenguPaymentException(ProviderName, "Paystack subaccount create returned no data", "no_subaccount_data");
@@ -102,7 +103,7 @@ public sealed class PaystackMarketplaceProvider : IMarketplaceProvider
     public Task<SubAccount?> GetSubAccountAsync(string subAccountReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subAccountReference);
-        return PaystackObservability.ObserveAsync("get_sub_account", () => GetSubAccountCoreAsync(subAccountReference, ct));
+        return RunOperationAsync("get_sub_account", () => GetSubAccountCoreAsync(subAccountReference, ct), ct);
     }
 
     private async Task<SubAccount?> GetSubAccountCoreAsync(string subAccountReference, CancellationToken ct)
@@ -110,7 +111,7 @@ public sealed class PaystackMarketplaceProvider : IMarketplaceProvider
         try
         {
             var responseBody = await PaystackHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get, $"subaccount/{Uri.EscapeDataString(subAccountReference)}", null, "GetSubAccount", ct).ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Get, $"subaccount/{Uri.EscapeDataString(subAccountReference)}", null, "GetSubAccount", ct).ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<PaystackSubAccountResponse>(responseBody, PaystackHttpClient.Json);
             return response?.Data is { } data ? MapSubAccount(data, null) : null;
         }
@@ -124,7 +125,7 @@ public sealed class PaystackMarketplaceProvider : IMarketplaceProvider
     public async IAsyncEnumerable<SubAccount> ListSubAccountsAsync([EnumeratorCancellation] CancellationToken ct = default)
     {
         var responseBody = await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Get, "subaccount?perPage=100", null, "ListSubAccounts", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Get, "subaccount?perPage=100", null, "ListSubAccounts", ct).ConfigureAwait(false);
         var response = JsonSerializer.Deserialize<PaystackSubAccountListResponse>(responseBody, PaystackHttpClient.Json);
         if (response?.Data is null) yield break;
 
@@ -139,8 +140,9 @@ public sealed class PaystackMarketplaceProvider : IMarketplaceProvider
     public Task<SplitDefinition> CreateSplitAsync(SplitDefinitionRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return PaystackObservability.ObserveAsync("create_split", () =>
-            _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreateSplitCoreAsync(request, ct)));
+        return RunOperationAsync("create_split",
+            () => _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreateSplitCoreAsync(request, ct)),
+            ct);
     }
 
     private async Task<SplitDefinition> CreateSplitCoreAsync(SplitDefinitionRequest request, CancellationToken ct)
@@ -169,7 +171,7 @@ public sealed class PaystackMarketplaceProvider : IMarketplaceProvider
         };
 
         var responseBody = await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, "split", body, "CreateSplit", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Post, "split", body, "CreateSplit", ct).ConfigureAwait(false);
         var response = JsonSerializer.Deserialize<PaystackSplitResponse>(responseBody, PaystackHttpClient.Json);
         var data = response?.Data
             ?? throw new BhenguPaymentException(ProviderName, "Paystack split create returned no data", "no_split_data");
@@ -181,7 +183,7 @@ public sealed class PaystackMarketplaceProvider : IMarketplaceProvider
     public Task<SplitDefinition?> GetSplitAsync(string splitReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(splitReference);
-        return PaystackObservability.ObserveAsync("get_split", () => GetSplitCoreAsync(splitReference, ct));
+        return RunOperationAsync("get_split", () => GetSplitCoreAsync(splitReference, ct), ct);
     }
 
     private async Task<SplitDefinition?> GetSplitCoreAsync(string splitReference, CancellationToken ct)
@@ -189,7 +191,7 @@ public sealed class PaystackMarketplaceProvider : IMarketplaceProvider
         try
         {
             var responseBody = await PaystackHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get, $"split/{Uri.EscapeDataString(splitReference)}", null, "GetSplit", ct).ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Get, $"split/{Uri.EscapeDataString(splitReference)}", null, "GetSplit", ct).ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<PaystackSplitResponse>(responseBody, PaystackHttpClient.Json);
             return response?.Data is { } data ? MapSplit(data, null) : null;
         }
@@ -203,7 +205,7 @@ public sealed class PaystackMarketplaceProvider : IMarketplaceProvider
     public Task<PaymentResponse> ChargeWithSplitAsync(ChargeWithSplitRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return PaystackObservability.ObserveChargeAsync(request.Payment.Currency, () => ChargeWithSplitCoreAsync(request, ct));
+        return RunChargeAsync(request.Payment.Currency, () => ChargeWithSplitCoreAsync(request, ct), ct);
     }
 
     private async Task<PaymentResponse> ChargeWithSplitCoreAsync(ChargeWithSplitRequest request, CancellationToken ct)
@@ -231,7 +233,7 @@ public sealed class PaystackMarketplaceProvider : IMarketplaceProvider
         };
 
         var responseBody = await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, "transaction/charge_authorization", body, "ChargeWithSplit", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Post, "transaction/charge_authorization", body, "ChargeWithSplit", ct).ConfigureAwait(false);
         var response = JsonSerializer.Deserialize<PaystackChargeResponse>(responseBody, PaystackHttpClient.Json);
 
         return new PaymentResponse

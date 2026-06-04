@@ -6,6 +6,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Subscription;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Paystack.Configuration;
 using Bhengu.Finance.Payments.Paystack.Internals;
 using Microsoft.Extensions.Logging;
@@ -23,15 +24,14 @@ namespace Bhengu.Finance.Payments.Paystack.Providers;
 /// <see cref="Subscription"/> records with <see cref="SubscriptionStatus.Paused"/>/<see cref="SubscriptionStatus.Active"/>
 /// regardless of the wire-level toggle.
 /// </remarks>
-public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
+public sealed class PaystackSubscriptionProvider : BhenguProviderBase, ISubscriptionProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PaystackOptions _options;
-    private readonly ILogger<PaystackSubscriptionProvider> _logger;
     private readonly PaystackIdempotencyCache _idempotency;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Paystack;
+    public override string ProviderName => ProviderNames.Paystack;
 
     /// <summary>Construct a subscription provider. Designed to be registered via DI.</summary>
     public PaystackSubscriptionProvider(
@@ -39,10 +39,10 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
         IOptions<PaystackOptions> options,
         ILogger<PaystackSubscriptionProvider> logger,
         PaystackIdempotencyCache idempotency)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotency = idempotency ?? throw new ArgumentNullException(nameof(idempotency));
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
@@ -55,8 +55,9 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
     public Task<Plan> CreatePlanAsync(PlanRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return PaystackObservability.ObserveAsync("create_plan", () =>
-            _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreatePlanCoreAsync(request, ct)));
+        return RunOperationAsync("create_plan",
+            () => _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreatePlanCoreAsync(request, ct)),
+            ct);
     }
 
     private async Task<Plan> CreatePlanCoreAsync(PlanRequest request, CancellationToken ct)
@@ -72,7 +73,7 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
         };
 
         var responseBody = await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, "plan", body, "CreatePlan", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Post, "plan", body, "CreatePlan", ct).ConfigureAwait(false);
         var response = JsonSerializer.Deserialize<PaystackPlanResponse>(responseBody, PaystackHttpClient.Json);
         var plan = response?.Data
             ?? throw new BhenguPaymentException(ProviderName, "Paystack plan create returned no data", "no_plan_data");
@@ -84,7 +85,7 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
     public Task<Plan?> GetPlanAsync(string planReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(planReference);
-        return PaystackObservability.ObserveAsync("get_plan", () => GetPlanCoreAsync(planReference, ct));
+        return RunOperationAsync("get_plan", () => GetPlanCoreAsync(planReference, ct), ct);
     }
 
     private async Task<Plan?> GetPlanCoreAsync(string planReference, CancellationToken ct)
@@ -92,7 +93,7 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
         try
         {
             var responseBody = await PaystackHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get, $"plan/{Uri.EscapeDataString(planReference)}", null, "GetPlan", ct).ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Get, $"plan/{Uri.EscapeDataString(planReference)}", null, "GetPlan", ct).ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<PaystackPlanResponse>(responseBody, PaystackHttpClient.Json);
             return response?.Data is { } plan ? MapPlan(plan, fallback: null) : null;
         }
@@ -106,8 +107,9 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
     public Task<Subscription> CreateSubscriptionAsync(SubscriptionRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return PaystackObservability.ObserveAsync("create_subscription", () =>
-            _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreateSubscriptionCoreAsync(request, ct)));
+        return RunOperationAsync("create_subscription",
+            () => _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreateSubscriptionCoreAsync(request, ct)),
+            ct);
     }
 
     private async Task<Subscription> CreateSubscriptionCoreAsync(SubscriptionRequest request, CancellationToken ct)
@@ -121,7 +123,7 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
         };
 
         var responseBody = await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, "subscription", body, "CreateSubscription", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Post, "subscription", body, "CreateSubscription", ct).ConfigureAwait(false);
         var response = JsonSerializer.Deserialize<PaystackSubscriptionResponse>(responseBody, PaystackHttpClient.Json);
         var sub = response?.Data
             ?? throw new BhenguPaymentException(ProviderName, "Paystack subscription create returned no data", "no_subscription_data");
@@ -133,7 +135,7 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
     public Task<Subscription?> GetSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
-        return PaystackObservability.ObserveAsync("get_subscription", () => GetSubscriptionCoreAsync(subscriptionReference, ct));
+        return RunOperationAsync("get_subscription", () => GetSubscriptionCoreAsync(subscriptionReference, ct), ct);
     }
 
     private async Task<Subscription?> GetSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
@@ -141,7 +143,7 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
         try
         {
             var responseBody = await PaystackHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get, $"subscription/{Uri.EscapeDataString(subscriptionReference)}", null, "GetSubscription", ct).ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Get, $"subscription/{Uri.EscapeDataString(subscriptionReference)}", null, "GetSubscription", ct).ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<PaystackSubscriptionResponse>(responseBody, PaystackHttpClient.Json);
             return response?.Data is { } sub ? MapSubscription(sub, null) : null;
         }
@@ -155,7 +157,7 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
     public Task<Subscription> CancelSubscriptionAsync(string subscriptionReference, bool immediately = false, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
-        return PaystackObservability.ObserveAsync("cancel_subscription", () => CancelSubscriptionCoreAsync(subscriptionReference, immediately, ct));
+        return RunOperationAsync("cancel_subscription", () => CancelSubscriptionCoreAsync(subscriptionReference, immediately, ct), ct);
     }
 
     private async Task<Subscription> CancelSubscriptionCoreAsync(string subscriptionReference, bool immediately, CancellationToken ct)
@@ -171,7 +173,7 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
 
         // Fetch raw subscription to read the cancellation token.
         var rawBody = await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Get, $"subscription/{Uri.EscapeDataString(subscriptionReference)}", null, "CancelSubscriptionFetch", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Get, $"subscription/{Uri.EscapeDataString(subscriptionReference)}", null, "CancelSubscriptionFetch", ct).ConfigureAwait(false);
         var raw = JsonSerializer.Deserialize<PaystackSubscriptionResponse>(rawBody, PaystackHttpClient.Json);
         var emailToken = raw?.Data?.EmailToken;
 
@@ -184,7 +186,7 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
         try
         {
             await PaystackHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Post, "subscription/disable", body, "CancelSubscription", ct).ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Post, "subscription/disable", body, "CancelSubscription", ct).ConfigureAwait(false);
         }
         catch (PaymentDeclinedException ex) when (ex.ProviderErrorMessage?.Contains("already inactive", StringComparison.OrdinalIgnoreCase) == true)
         {
@@ -198,7 +200,7 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
     public Task<Subscription> PauseSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
-        return PaystackObservability.ObserveAsync("pause_subscription", () => PauseSubscriptionCoreAsync(subscriptionReference, ct));
+        return RunOperationAsync("pause_subscription", () => PauseSubscriptionCoreAsync(subscriptionReference, ct), ct);
     }
 
     private async Task<Subscription> PauseSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
@@ -209,7 +211,7 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
             ?? throw new BhenguPaymentException(ProviderName, $"Subscription {subscriptionReference} not found", "subscription_not_found");
 
         var rawBody = await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Get, $"subscription/{Uri.EscapeDataString(subscriptionReference)}", null, "PauseSubscriptionFetch", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Get, $"subscription/{Uri.EscapeDataString(subscriptionReference)}", null, "PauseSubscriptionFetch", ct).ConfigureAwait(false);
         var raw = JsonSerializer.Deserialize<PaystackSubscriptionResponse>(rawBody, PaystackHttpClient.Json);
 
         var body = new
@@ -219,7 +221,7 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
         };
 
         await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, "subscription/disable", body, "PauseSubscription", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Post, "subscription/disable", body, "PauseSubscription", ct).ConfigureAwait(false);
         return existing with { Status = SubscriptionStatus.Paused };
     }
 
@@ -227,7 +229,7 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
     public Task<Subscription> ResumeSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
-        return PaystackObservability.ObserveAsync("resume_subscription", () => ResumeSubscriptionCoreAsync(subscriptionReference, ct));
+        return RunOperationAsync("resume_subscription", () => ResumeSubscriptionCoreAsync(subscriptionReference, ct), ct);
     }
 
     private async Task<Subscription> ResumeSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
@@ -236,7 +238,7 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
             ?? throw new BhenguPaymentException(ProviderName, $"Subscription {subscriptionReference} not found", "subscription_not_found");
 
         var rawBody = await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Get, $"subscription/{Uri.EscapeDataString(subscriptionReference)}", null, "ResumeSubscriptionFetch", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Get, $"subscription/{Uri.EscapeDataString(subscriptionReference)}", null, "ResumeSubscriptionFetch", ct).ConfigureAwait(false);
         var raw = JsonSerializer.Deserialize<PaystackSubscriptionResponse>(rawBody, PaystackHttpClient.Json);
 
         var body = new
@@ -246,7 +248,7 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
         };
 
         await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, "subscription/enable", body, "ResumeSubscription", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Post, "subscription/enable", body, "ResumeSubscription", ct).ConfigureAwait(false);
         return existing with { Status = SubscriptionStatus.Active };
     }
 

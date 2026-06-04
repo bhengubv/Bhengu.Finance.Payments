@@ -8,6 +8,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Vault;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Paystack.Configuration;
 using Bhengu.Finance.Payments.Paystack.Internals;
 using Microsoft.Extensions.Logging;
@@ -29,24 +30,23 @@ namespace Bhengu.Finance.Payments.Paystack.Providers;
 /// should instead rely on Paystack Inline / Popup on the client and call
 /// <see cref="GetPaymentMethodAsync"/> with the authorization code their backend receives.</para>
 /// </remarks>
-public sealed class PaystackTokenisationProvider : ITokenisationProvider
+public sealed class PaystackTokenisationProvider : BhenguProviderBase, ITokenisationProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PaystackOptions _options;
-    private readonly ILogger<PaystackTokenisationProvider> _logger;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Paystack;
+    public override string ProviderName => ProviderNames.Paystack;
 
     /// <summary>Construct a tokenisation provider. Designed to be registered via DI.</summary>
     public PaystackTokenisationProvider(
         HttpClient httpClient,
         IOptions<PaystackOptions> options,
         ILogger<PaystackTokenisationProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PaystackOptions.SecretKey)} is required");
@@ -58,7 +58,7 @@ public sealed class PaystackTokenisationProvider : ITokenisationProvider
     public Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(token);
-        return PaystackObservability.ObserveAsync("get_payment_method", () => GetPaymentMethodCoreAsync(token, ct));
+        return RunOperationAsync("get_payment_method", () => GetPaymentMethodCoreAsync(token, ct), ct);
     }
 
     private async Task<PaymentMethod?> GetPaymentMethodCoreAsync(string token, CancellationToken ct)
@@ -69,7 +69,7 @@ public sealed class PaystackTokenisationProvider : ITokenisationProvider
         try
         {
             var customerListBody = await PaystackHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get, "customer?perPage=100", null, "GetPaymentMethod", ct).ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Get, "customer?perPage=100", null, "GetPaymentMethod", ct).ConfigureAwait(false);
             var customers = JsonSerializer.Deserialize<PaystackCustomerListResponse>(customerListBody, PaystackHttpClient.Json);
             if (customers?.Data is null) return null;
 
@@ -96,7 +96,7 @@ public sealed class PaystackTokenisationProvider : ITokenisationProvider
         ArgumentException.ThrowIfNullOrEmpty(customerId);
 
         var responseBody = await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Get, $"customer/{Uri.EscapeDataString(customerId)}", null, "ListPaymentMethods", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Get, $"customer/{Uri.EscapeDataString(customerId)}", null, "ListPaymentMethods", ct).ConfigureAwait(false);
         var customer = JsonSerializer.Deserialize<PaystackCustomerResponse>(responseBody, PaystackHttpClient.Json);
 
         if (customer?.Data?.Authorizations is null)
@@ -113,7 +113,7 @@ public sealed class PaystackTokenisationProvider : ITokenisationProvider
     public Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(token);
-        return PaystackObservability.ObserveAsync("delete_payment_method", () => DeletePaymentMethodCoreAsync(token, ct));
+        return RunOperationAsync("delete_payment_method", () => DeletePaymentMethodCoreAsync(token, ct), ct);
     }
 
     private async Task<bool> DeletePaymentMethodCoreAsync(string token, CancellationToken ct)
@@ -122,7 +122,7 @@ public sealed class PaystackTokenisationProvider : ITokenisationProvider
         {
             var body = new { authorization_code = token };
             await PaystackHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Post, "customer/deactivate_authorization", body, "DeletePaymentMethod", ct).ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Post, "customer/deactivate_authorization", body, "DeletePaymentMethod", ct).ConfigureAwait(false);
             return true;
         }
         catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
@@ -199,15 +199,14 @@ public sealed class PaystackTokenisationProvider : ITokenisationProvider
 /// / Popup on the client so the payer's browser sends raw PAN directly to Paystack and your
 /// server only sees the short-lived authorization-code.
 /// </summary>
-public sealed class PaystackRawCardTokenisationProvider : IRawCardTokenisationProvider
+public sealed class PaystackRawCardTokenisationProvider : BhenguProviderBase, IRawCardTokenisationProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PaystackOptions _options;
-    private readonly ILogger<PaystackRawCardTokenisationProvider> _logger;
     private readonly PaystackIdempotencyCache _idempotency;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Paystack;
+    public override string ProviderName => ProviderNames.Paystack;
 
     /// <summary>Construct a raw-card tokenisation provider. Designed to be registered via DI.</summary>
     public PaystackRawCardTokenisationProvider(
@@ -215,10 +214,10 @@ public sealed class PaystackRawCardTokenisationProvider : IRawCardTokenisationPr
         IOptions<PaystackOptions> options,
         ILogger<PaystackRawCardTokenisationProvider> logger,
         PaystackIdempotencyCache idempotency)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotency = idempotency ?? throw new ArgumentNullException(nameof(idempotency));
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
@@ -231,8 +230,9 @@ public sealed class PaystackRawCardTokenisationProvider : IRawCardTokenisationPr
     public Task<PaymentMethod> TokeniseAsync(TokeniseRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return PaystackObservability.ObserveAsync("tokenise", () =>
-            _idempotency.GetOrAddAsync(request.IdempotencyKey, () => TokeniseCoreAsync(request, ct)));
+        return RunOperationAsync("tokenise",
+            () => _idempotency.GetOrAddAsync(request.IdempotencyKey, () => TokeniseCoreAsync(request, ct)),
+            ct);
     }
 
     private async Task<PaymentMethod> TokeniseCoreAsync(TokeniseRequest request, CancellationToken ct)
@@ -253,7 +253,7 @@ public sealed class PaystackRawCardTokenisationProvider : IRawCardTokenisationPr
         };
 
         var customerResponseBody = await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, "customer", customerBody, "TokeniseCustomerCreate", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Post, "customer", customerBody, "TokeniseCustomerCreate", ct).ConfigureAwait(false);
         var customer = JsonSerializer.Deserialize<PaystackTokenisationProvider.PaystackCustomerResponse>(customerResponseBody, PaystackHttpClient.Json);
         var customerCode = customer?.Data?.CustomerCode ?? customerEmail;
 
@@ -277,7 +277,7 @@ public sealed class PaystackRawCardTokenisationProvider : IRawCardTokenisationPr
         };
 
         var chargeResponseBody = await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, "charge", chargeBody, "TokeniseCharge", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Post, "charge", chargeBody, "TokeniseCharge", ct).ConfigureAwait(false);
         var charge = JsonSerializer.Deserialize<PaystackTokenisationProvider.PaystackChargeResponse>(chargeResponseBody, PaystackHttpClient.Json);
 
         var auth = charge?.Data?.Authorization
@@ -287,7 +287,7 @@ public sealed class PaystackRawCardTokenisationProvider : IRawCardTokenisationPr
             throw new PaymentDeclinedException(ProviderName, charge?.Data?.Status ?? "no_authorization_code",
                 charge?.Message ?? "Paystack rejected the card and returned no reusable authorization code.");
 
-        _logger.LogInformation("Paystack tokenised payment method for customer {CustomerCode}: {AuthCode}",
+        Logger.LogInformation("Paystack tokenised payment method for customer {CustomerCode}: {AuthCode}",
             customerCode, auth.AuthorizationCode);
 
         return new PaymentMethod

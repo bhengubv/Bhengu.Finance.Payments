@@ -9,6 +9,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Dispute;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Paystack.Configuration;
 using Bhengu.Finance.Payments.Paystack.Internals;
 using Microsoft.Extensions.Logging;
@@ -25,24 +26,23 @@ namespace Bhengu.Finance.Payments.Paystack.Providers;
 /// <see cref="Dispute.EvidenceDueBy"/>. Evidence submission goes through <c>/dispute/:id/resolve</c>
 /// which accepts a <c>resolution</c>, optional <c>uploaded_filename</c> and refund amount when applicable.
 /// </remarks>
-public sealed class PaystackDisputeProvider : IDisputeProvider
+public sealed class PaystackDisputeProvider : BhenguProviderBase, IDisputeProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PaystackOptions _options;
-    private readonly ILogger<PaystackDisputeProvider> _logger;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Paystack;
+    public override string ProviderName => ProviderNames.Paystack;
 
     /// <summary>Construct a dispute provider. Designed to be registered via DI.</summary>
     public PaystackDisputeProvider(
         HttpClient httpClient,
         IOptions<PaystackOptions> options,
         ILogger<PaystackDisputeProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PaystackOptions.SecretKey)} is required");
@@ -54,7 +54,7 @@ public sealed class PaystackDisputeProvider : IDisputeProvider
     public Task<Dispute?> GetDisputeAsync(string disputeReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(disputeReference);
-        return PaystackObservability.ObserveAsync("get_dispute", () => GetDisputeCoreAsync(disputeReference, ct));
+        return RunOperationAsync("get_dispute", () => GetDisputeCoreAsync(disputeReference, ct), ct);
     }
 
     private async Task<Dispute?> GetDisputeCoreAsync(string disputeReference, CancellationToken ct)
@@ -62,7 +62,7 @@ public sealed class PaystackDisputeProvider : IDisputeProvider
         try
         {
             var responseBody = await PaystackHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get, $"dispute/{Uri.EscapeDataString(disputeReference)}", null, "GetDispute", ct).ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Get, $"dispute/{Uri.EscapeDataString(disputeReference)}", null, "GetDispute", ct).ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<PaystackDisputeResponse>(responseBody, PaystackHttpClient.Json);
             return response?.Data is { } dispute ? MapDispute(dispute) : null;
         }
@@ -82,7 +82,7 @@ public sealed class PaystackDisputeProvider : IDisputeProvider
             qs.Append("&to=").Append(Uri.EscapeDataString(toUtc.Value.ToString("o", CultureInfo.InvariantCulture)));
 
         var responseBody = await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Get, qs.ToString(), null, "ListDisputes", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Get, qs.ToString(), null, "ListDisputes", ct).ConfigureAwait(false);
         var response = JsonSerializer.Deserialize<PaystackDisputeListResponse>(responseBody, PaystackHttpClient.Json);
         if (response?.Data is null)
             yield break;
@@ -99,7 +99,7 @@ public sealed class PaystackDisputeProvider : IDisputeProvider
     {
         ArgumentException.ThrowIfNullOrEmpty(disputeReference);
         ArgumentNullException.ThrowIfNull(evidence);
-        return PaystackObservability.ObserveAsync("submit_evidence", () => SubmitEvidenceCoreAsync(disputeReference, evidence, ct));
+        return RunOperationAsync("submit_evidence", () => SubmitEvidenceCoreAsync(disputeReference, evidence, ct), ct);
     }
 
     private async Task<Dispute> SubmitEvidenceCoreAsync(string disputeReference, DisputeEvidence evidence, CancellationToken ct)
@@ -115,7 +115,7 @@ public sealed class PaystackDisputeProvider : IDisputeProvider
         };
 
         var responseBody = await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Put, $"dispute/{Uri.EscapeDataString(disputeReference)}/evidence", body, "SubmitEvidence", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Put, $"dispute/{Uri.EscapeDataString(disputeReference)}/evidence", body, "SubmitEvidence", ct).ConfigureAwait(false);
         var response = JsonSerializer.Deserialize<PaystackDisputeResponse>(responseBody, PaystackHttpClient.Json);
 
         if (response?.Data is null)
@@ -132,7 +132,7 @@ public sealed class PaystackDisputeProvider : IDisputeProvider
     public Task<Dispute> AcceptDisputeAsync(string disputeReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(disputeReference);
-        return PaystackObservability.ObserveAsync("accept_dispute", () => AcceptDisputeCoreAsync(disputeReference, ct));
+        return RunOperationAsync("accept_dispute", () => AcceptDisputeCoreAsync(disputeReference, ct), ct);
     }
 
     private async Task<Dispute> AcceptDisputeCoreAsync(string disputeReference, CancellationToken ct)
@@ -149,7 +149,7 @@ public sealed class PaystackDisputeProvider : IDisputeProvider
         };
 
         var responseBody = await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Put, $"dispute/{Uri.EscapeDataString(disputeReference)}/resolve", body, "AcceptDispute", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Put, $"dispute/{Uri.EscapeDataString(disputeReference)}/resolve", body, "AcceptDispute", ct).ConfigureAwait(false);
         var response = JsonSerializer.Deserialize<PaystackDisputeResponse>(responseBody, PaystackHttpClient.Json);
         if (response?.Data is null)
             return existing with { Status = DisputeStatus.Accepted };

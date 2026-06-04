@@ -6,6 +6,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Paystack.Configuration;
 using Bhengu.Finance.Payments.Paystack.Internals;
 using Microsoft.Extensions.Logging;
@@ -24,15 +25,14 @@ namespace Bhengu.Finance.Payments.Paystack.Providers;
 /// recipient code directly or prefix with <c>recipient-</c> for parity with the existing
 /// <see cref="PaystackPaymentProvider.ProcessPayoutAsync"/> convention.
 /// </remarks>
-public sealed class PaystackPayoutProvider : IPayoutProvider
+public sealed class PaystackPayoutProvider : BhenguProviderBase, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PaystackOptions _options;
-    private readonly ILogger<PaystackPayoutProvider> _logger;
     private readonly PaystackIdempotencyCache _idempotency;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Paystack;
+    public override string ProviderName => ProviderNames.Paystack;
 
     /// <summary>Construct a payout provider. Designed to be registered via DI.</summary>
     public PaystackPayoutProvider(
@@ -40,10 +40,10 @@ public sealed class PaystackPayoutProvider : IPayoutProvider
         IOptions<PaystackOptions> options,
         ILogger<PaystackPayoutProvider> logger,
         PaystackIdempotencyCache idempotency)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotency = idempotency ?? throw new ArgumentNullException(nameof(idempotency));
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
@@ -56,8 +56,9 @@ public sealed class PaystackPayoutProvider : IPayoutProvider
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return PaystackObservability.ObservePayoutAsync(request.Currency, () =>
-            _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPayoutCoreAsync(request, ct)));
+        return RunPayoutAsync(request.Currency,
+            () => _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPayoutCoreAsync(request, ct)),
+            ct);
     }
 
     private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
@@ -78,10 +79,10 @@ public sealed class PaystackPayoutProvider : IPayoutProvider
         };
 
         var responseBody = await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, "transfer", body, "ProcessPayout", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Post, "transfer", body, "ProcessPayout", ct).ConfigureAwait(false);
         var response = JsonSerializer.Deserialize<PaystackTransferResponse>(responseBody, PaystackHttpClient.Json);
 
-        _logger.LogInformation("Paystack transfer created: {Reference} status={Status}",
+        Logger.LogInformation("Paystack transfer created: {Reference} status={Status}",
             response?.Data?.Reference, response?.Data?.Status);
 
         return new PayoutResponse

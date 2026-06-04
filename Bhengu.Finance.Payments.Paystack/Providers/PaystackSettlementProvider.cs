@@ -9,6 +9,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Settlement;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Paystack.Configuration;
 using Bhengu.Finance.Payments.Paystack.Internals;
 using Microsoft.Extensions.Logging;
@@ -20,24 +21,23 @@ namespace Bhengu.Finance.Payments.Paystack.Providers;
 /// Paystack implementation of <see cref="ISettlementProvider"/> backed by Paystack's
 /// <c>/settlement</c> and <c>/settlement/:id/transactions</c> endpoints.
 /// </summary>
-public sealed class PaystackSettlementProvider : ISettlementProvider
+public sealed class PaystackSettlementProvider : BhenguProviderBase, ISettlementProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PaystackOptions _options;
-    private readonly ILogger<PaystackSettlementProvider> _logger;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Paystack;
+    public override string ProviderName => ProviderNames.Paystack;
 
     /// <summary>Construct a settlement provider. Designed to be registered via DI.</summary>
     public PaystackSettlementProvider(
         HttpClient httpClient,
         IOptions<PaystackOptions> options,
         ILogger<PaystackSettlementProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PaystackOptions.SecretKey)} is required");
@@ -53,7 +53,7 @@ public sealed class PaystackSettlementProvider : ISettlementProvider
             .Append("&to=").Append(Uri.EscapeDataString(toUtc.ToString("o", CultureInfo.InvariantCulture)));
 
         var responseBody = await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Get, qs.ToString(), null, "ListSettlements", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Get, qs.ToString(), null, "ListSettlements", ct).ConfigureAwait(false);
         var response = JsonSerializer.Deserialize<PaystackSettlementListResponse>(responseBody, PaystackHttpClient.Json);
         if (response?.Data is null) yield break;
 
@@ -68,7 +68,7 @@ public sealed class PaystackSettlementProvider : ISettlementProvider
     public Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-        return PaystackObservability.ObserveAsync("get_settlement", () => GetSettlementCoreAsync(settlementReference, ct));
+        return RunOperationAsync("get_settlement", () => GetSettlementCoreAsync(settlementReference, ct), ct);
     }
 
     private async Task<Settlement?> GetSettlementCoreAsync(string settlementReference, CancellationToken ct)
@@ -76,7 +76,7 @@ public sealed class PaystackSettlementProvider : ISettlementProvider
         try
         {
             var responseBody = await PaystackHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get, $"settlement/{Uri.EscapeDataString(settlementReference)}", null, "GetSettlement", ct).ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Get, $"settlement/{Uri.EscapeDataString(settlementReference)}", null, "GetSettlement", ct).ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<PaystackSettlementResponse>(responseBody, PaystackHttpClient.Json);
             return response?.Data is { } s ? MapSettlement(s) : null;
         }
@@ -92,7 +92,7 @@ public sealed class PaystackSettlementProvider : ISettlementProvider
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
 
         var responseBody = await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Get, $"settlement/{Uri.EscapeDataString(settlementReference)}/transactions?perPage=100", null, "ListSettlementTransactions", ct).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Get, $"settlement/{Uri.EscapeDataString(settlementReference)}/transactions?perPage=100", null, "ListSettlementTransactions", ct).ConfigureAwait(false);
         var response = JsonSerializer.Deserialize<PaystackSettlementTransactionListResponse>(responseBody, PaystackHttpClient.Json);
         if (response?.Data is null) yield break;
 

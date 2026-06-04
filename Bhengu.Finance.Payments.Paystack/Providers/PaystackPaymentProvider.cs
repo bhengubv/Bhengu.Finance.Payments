@@ -3,7 +3,6 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -12,6 +11,8 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.Paystack.Configuration;
 using Bhengu.Finance.Payments.Paystack.Internals;
 using Microsoft.Extensions.Logging;
@@ -23,15 +24,16 @@ namespace Bhengu.Finance.Payments.Paystack.Providers;
 /// Paystack (Nigeria / Africa) payment gateway provider. Wraps the Paystack REST API
 /// and supports payments (charge_authorization), transfers (payouts) and refunds.
 /// </summary>
-public sealed class PaystackPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class PaystackPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PaystackOptions _options;
-    private readonly ILogger<PaystackPaymentProvider> _logger;
     private readonly PaystackIdempotencyCache _idempotency;
 
-    public string ProviderName => ProviderNames.Paystack;
+    /// <inheritdoc />
+    public override string ProviderName => ProviderNames.Paystack;
 
+    /// <summary>Provider capability flags advertised by the Paystack payment provider.</summary>
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
         ProviderCapabilities.Refund |
@@ -59,10 +61,10 @@ public sealed class PaystackPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         IOptions<PaystackOptions> options,
         ILogger<PaystackPaymentProvider> logger,
         PaystackIdempotencyCache? idempotency = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotency = idempotency ?? new PaystackIdempotencyCache();
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
@@ -78,8 +80,9 @@ public sealed class PaystackPaymentProvider : IPaymentGatewayProvider, IPayoutPr
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return PaystackObservability.ObserveChargeAsync(request.Currency, () =>
-            _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPaymentCoreAsync(request, ct)));
+        return RunChargeAsync(request.Currency,
+            () => _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPaymentCoreAsync(request, ct)),
+            ct);
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
@@ -103,7 +106,7 @@ public sealed class PaystackPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         var body = await SendAsync(HttpMethod.Post, "transaction/charge_authorization", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
         var paystackResponse = JsonSerializer.Deserialize<PaystackTransactionResponse>(body);
 
-        _logger.LogInformation("Paystack charge created: {Reference} status={Status}",
+        Logger.LogInformation("Paystack charge created: {Reference} status={Status}",
             paystackResponse?.Data?.Reference, paystackResponse?.Data?.Status);
 
         return new PaymentResponse
@@ -121,8 +124,9 @@ public sealed class PaystackPaymentProvider : IPaymentGatewayProvider, IPayoutPr
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return PaystackObservability.ObservePayoutAsync(request.Currency, () =>
-            _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPayoutCoreAsync(request, ct)));
+        return RunPayoutAsync(request.Currency,
+            () => _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPayoutCoreAsync(request, ct)),
+            ct);
     }
 
     private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
@@ -145,7 +149,7 @@ public sealed class PaystackPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         var body = await SendAsync(HttpMethod.Post, "transfer", requestBody, ct, "ProcessPayout").ConfigureAwait(false);
         var paystackResponse = JsonSerializer.Deserialize<PaystackTransferResponse>(body);
 
-        _logger.LogInformation("Paystack transfer created: {Reference} status={Status}",
+        Logger.LogInformation("Paystack transfer created: {Reference} status={Status}",
             paystackResponse?.Data?.Reference, paystackResponse?.Data?.Status);
 
         return new PayoutResponse
@@ -162,8 +166,9 @@ public sealed class PaystackPaymentProvider : IPaymentGatewayProvider, IPayoutPr
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return PaystackObservability.ObserveRefundAsync(request.GatewayReference, () =>
-            _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessRefundCoreAsync(request, ct)));
+        return RunRefundAsync(request.GatewayReference,
+            () => _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessRefundCoreAsync(request, ct)),
+            ct);
     }
 
     private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
@@ -178,7 +183,7 @@ public sealed class PaystackPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         var body = await SendAsync(HttpMethod.Post, "refund", requestBody, ct, "ProcessRefund").ConfigureAwait(false);
         var refundResponse = JsonSerializer.Deserialize<PaystackRefundResponse>(body);
 
-        _logger.LogInformation("Paystack refund created: {RefundId} for transaction {TransactionId}",
+        Logger.LogInformation("Paystack refund created: {RefundId} for transaction {TransactionId}",
             refundResponse?.Data?.RefundReference, request.GatewayReference);
 
         return new RefundResponse
@@ -200,53 +205,35 @@ public sealed class PaystackPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         var secret = string.IsNullOrWhiteSpace(_options.WebhookSecret) ? _options.SecretKey : _options.WebhookSecret;
         if (string.IsNullOrWhiteSpace(secret))
         {
-            _logger.LogWarning("Paystack webhook secret not configured — signature verification cannot succeed.");
-            PaystackObservability.RecordWebhookVerification(false);
-            return false;
+            Logger.LogWarning("Paystack webhook secret not configured — signature verification cannot succeed.");
+            return RunWebhookVerify(() => false);
         }
 
-        bool verified;
-        try
-        {
-            using var hmac = new HMACSHA512(Encoding.UTF8.GetBytes(secret));
-            var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
-            var computedSignature = Convert.ToHexString(computedHash).ToLowerInvariant();
-
-            verified = CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
-                Encoding.UTF8.GetBytes(computedSignature));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Paystack webhook signature verification raised");
-            verified = false;
-        }
-        PaystackObservability.RecordWebhookVerification(verified);
-        return verified;
+        return RunWebhookVerify(() => SignatureHelpers.VerifyHmacSha512(payload, signature, secret));
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        return PaystackObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+        return RunOperationAsync("parse_webhook", () => ParseWebhookCoreAsync(payload), ct);
     }
 
-    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload)
     {
         try
         {
             var webhookEvent = JsonSerializer.Deserialize<PaystackWebhookEvent>(payload);
             if (webhookEvent is null) return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed Paystack webhook event: {EventType}", webhookEvent.Event);
+            Logger.LogInformation("Parsed Paystack webhook event: {EventType}", webhookEvent.Event);
 
             var typed = MapWebhookEvent(webhookEvent);
             return Task.FromResult(typed);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse Paystack webhook event");
+            Logger.LogError(ex, "Failed to parse Paystack webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -450,16 +437,8 @@ public sealed class PaystackPaymentProvider : IPaymentGatewayProvider, IPayoutPr
             Content = new StringContent(json, Encoding.UTF8, "application/json")
         };
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Paystack failed", ex);
-        }
-
+        // HttpRequestException is auto-translated to ProviderUnavailableException by BhenguProviderBase.
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -470,7 +449,7 @@ public sealed class PaystackPaymentProvider : IPaymentGatewayProvider, IPayoutPr
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Paystack {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Paystack {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
