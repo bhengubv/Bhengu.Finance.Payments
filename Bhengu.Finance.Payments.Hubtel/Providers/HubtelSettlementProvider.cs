@@ -1,6 +1,5 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
-using System.Globalization;
 using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -10,7 +9,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Settlement;
-using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Hubtel.Configuration;
 using Bhengu.Finance.Payments.Hubtel.Internals;
 using Microsoft.Extensions.Logging;
@@ -25,24 +24,23 @@ namespace Bhengu.Finance.Payments.Hubtel.Providers;
 /// constituent transactions via <c>/transactions/{posSalesNumber}/history</c> with date filters.
 /// </para>
 /// </summary>
-public sealed class HubtelSettlementProvider : ISettlementProvider
+public sealed class HubtelSettlementProvider : BhenguProviderBase, ISettlementProvider
 {
     private readonly HttpClient _httpClient;
     private readonly HubtelOptions _options;
-    private readonly ILogger<HubtelSettlementProvider> _logger;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Hubtel;
+    public override string ProviderName => ProviderNames.Hubtel;
 
     /// <summary>Construct the Hubtel settlement provider. Designed to be registered via DI.</summary>
     public HubtelSettlementProvider(
         HttpClient httpClient,
         IOptions<HubtelOptions> options,
         ILogger<HubtelSettlementProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ClientId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(HubtelOptions.ClientId)} is required");
@@ -68,25 +66,12 @@ public sealed class HubtelSettlementProvider : ISettlementProvider
     /// <inheritdoc/>
     public async IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        List<HubtelStatementData>? items;
-        using (var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list"))
-        {
-            try
-            {
-                var path = $"merchantaccount/merchants/{Uri.EscapeDataString(_options.MerchantAccountNumber)}/statement?from={fromUtc:yyyy-MM-dd}&to={toUtc:yyyy-MM-dd}";
-                var responseBody = await HubtelHttpClient.SendAsync(_httpClient, _logger, HttpMethod.Get, path, body: null, ct, "ListSettlements").ConfigureAwait(false);
-                var envelope = JsonSerializer.Deserialize<HubtelStatementResponse>(responseBody);
-                items = envelope?.Data;
+        var path = $"merchantaccount/merchants/{Uri.EscapeDataString(_options.MerchantAccountNumber)}/statement?from={fromUtc:yyyy-MM-dd}&to={toUtc:yyyy-MM-dd}";
+        var responseBody = await HubtelHttpClient.SendAsync(_httpClient, Logger, HttpMethod.Get, path, body: null, ct, "ListSettlements").ConfigureAwait(false);
+        var envelope = JsonSerializer.Deserialize<HubtelStatementResponse>(responseBody);
+        var items = envelope?.Data;
 
-                _logger.LogInformation("Hubtel settlements listed: {Count} between {From:O} and {To:O}", items?.Count ?? 0, fromUtc, toUtc);
-                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            }
-            catch (Exception ex)
-            {
-                activity.SetOutcome(ClassifyOutcome(ex));
-                throw;
-            }
-        }
+        Logger.LogInformation("Hubtel settlements listed: {Count} between {From:O} and {To:O}", items?.Count ?? 0, fromUtc, toUtc);
 
         if (items is null) yield break;
         foreach (var d in items)
@@ -97,28 +82,24 @@ public sealed class HubtelSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
+    public Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
+        return RunOperationAsync("get_settlement", () => GetSettlementCoreAsync(settlementReference, ct), ct);
+    }
 
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.get");
+    private async Task<Settlement?> GetSettlementCoreAsync(string settlementReference, CancellationToken ct)
+    {
         try
         {
             var path = $"merchantaccount/merchants/{Uri.EscapeDataString(_options.MerchantAccountNumber)}/statement/{Uri.EscapeDataString(settlementReference)}";
-            var responseBody = await HubtelHttpClient.SendAsync(_httpClient, _logger, HttpMethod.Get, path, body: null, ct, "GetSettlement").ConfigureAwait(false);
+            var responseBody = await HubtelHttpClient.SendAsync(_httpClient, Logger, HttpMethod.Get, path, body: null, ct, "GetSettlement").ConfigureAwait(false);
             var envelope = JsonSerializer.Deserialize<HubtelStatementSingleResponse>(responseBody);
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             return envelope?.Data is null ? null : ToSettlement(envelope.Data);
         }
         catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             return null;
-        }
-        catch (Exception ex)
-        {
-            activity.SetOutcome(ClassifyOutcome(ex));
-            throw;
         }
     }
 
@@ -127,23 +108,10 @@ public sealed class HubtelSettlementProvider : ISettlementProvider
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
 
-        List<HubtelTransactionData>? items;
-        using (var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list_transactions"))
-        {
-            try
-            {
-                var path = $"transactions/{Uri.EscapeDataString(_options.MerchantAccountNumber)}/history?statementId={Uri.EscapeDataString(settlementReference)}";
-                var responseBody = await HubtelHttpClient.SendAsync(_httpClient, _logger, HttpMethod.Get, path, body: null, ct, "ListSettlementTransactions").ConfigureAwait(false);
-                var envelope = JsonSerializer.Deserialize<HubtelTransactionListResponse>(responseBody);
-                items = envelope?.Data;
-                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            }
-            catch (Exception ex)
-            {
-                activity.SetOutcome(ClassifyOutcome(ex));
-                throw;
-            }
-        }
+        var path = $"transactions/{Uri.EscapeDataString(_options.MerchantAccountNumber)}/history?statementId={Uri.EscapeDataString(settlementReference)}";
+        var responseBody = await HubtelHttpClient.SendAsync(_httpClient, Logger, HttpMethod.Get, path, body: null, ct, "ListSettlementTransactions").ConfigureAwait(false);
+        var envelope = JsonSerializer.Deserialize<HubtelTransactionListResponse>(responseBody);
+        var items = envelope?.Data;
 
         if (items is null) yield break;
         foreach (var d in items)
@@ -186,14 +154,6 @@ public sealed class HubtelSettlementProvider : ISettlementProvider
             _ when amount < 0 => SettlementTransactionKind.Refund,
             _ => SettlementTransactionKind.Charge
         };
-
-    private static string ClassifyOutcome(Exception ex) => ex switch
-    {
-        PaymentDeclinedException => BhenguPaymentDiagnostics.Outcomes.Declined,
-        ProviderRateLimitException => BhenguPaymentDiagnostics.Outcomes.RateLimited,
-        ProviderUnavailableException => BhenguPaymentDiagnostics.Outcomes.Unavailable,
-        _ => BhenguPaymentDiagnostics.Outcomes.Error
-    };
 
     // === Hubtel API shapes (internal) ===
 
