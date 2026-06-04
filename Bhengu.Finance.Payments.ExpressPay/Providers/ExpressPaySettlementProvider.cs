@@ -96,35 +96,29 @@ public sealed class ExpressPaySettlementProvider : BhenguProviderBase, ISettleme
     }
 
     /// <inheritdoc/>
-    public async Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
+    public Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.get");
-        try
+        return RunOperationAsync<Settlement?>("get_settlement", async () =>
         {
-            var form = new Dictionary<string, string>
+            try
             {
-                ["merchant-id"] = _options.MerchantId,
-                ["api-key"] = _options.ApiKey,
-                ["settlement-id"] = settlementReference
-            };
+                var form = new Dictionary<string, string>
+                {
+                    ["merchant-id"] = _options.MerchantId,
+                    ["api-key"] = _options.ApiKey,
+                    ["settlement-id"] = settlementReference
+                };
 
-            var responseBody = await ExpressPayHttpClient.SendFormAsync(_httpClient, Logger, HttpMethod.Post, "settlement.php", form, ct, "GetSettlement").ConfigureAwait(false);
-            var envelope = JsonSerializer.Deserialize<ExpressPaySettlementSingleResponse>(responseBody);
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return envelope?.Settlement is null ? null : ToSettlement(envelope.Settlement);
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return null;
-        }
-        catch (Exception ex)
-        {
-            activity.SetOutcome(ClassifyOutcome(ex));
-            throw;
-        }
+                var responseBody = await ExpressPayHttpClient.SendFormAsync(_httpClient, Logger, HttpMethod.Post, "settlement.php", form, ct, "GetSettlement").ConfigureAwait(false);
+                var envelope = JsonSerializer.Deserialize<ExpressPaySettlementSingleResponse>(responseBody);
+                return envelope?.Settlement is null ? null : ToSettlement(envelope.Settlement);
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return null;
+            }
+        }, ct);
     }
 
     /// <inheritdoc/>
