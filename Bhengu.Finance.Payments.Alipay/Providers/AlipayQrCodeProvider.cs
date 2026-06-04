@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Alipay.Configuration;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
@@ -32,7 +33,7 @@ namespace Bhengu.Finance.Payments.Alipay.Providers;
 /// This keeps the SDK dependency-free.
 /// </para>
 /// </summary>
-public sealed class AlipayQrCodeProvider : IQrCodeProvider
+public sealed class AlipayQrCodeProvider : BhenguProviderBase, IQrCodeProvider
 {
     private const string PrecreateMethod = "alipay.trade.precreate";
     private const string QueryMethod = "alipay.trade.query";
@@ -43,21 +44,20 @@ public sealed class AlipayQrCodeProvider : IQrCodeProvider
 
     private readonly HttpClient _httpClient;
     private readonly AlipayOptions _options;
-    private readonly ILogger<AlipayQrCodeProvider> _logger;
     private readonly string _gatewayUrl;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Alipay;
+    public override string ProviderName => ProviderNames.Alipay;
 
     /// <summary>Construct an Alipay QR provider.</summary>
     public AlipayQrCodeProvider(
         HttpClient httpClient,
         IOptions<AlipayOptions> options,
         ILogger<AlipayQrCodeProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ClientId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(AlipayOptions.ClientId)} is required");
@@ -109,7 +109,7 @@ public sealed class AlipayQrCodeProvider : IQrCodeProvider
         var inner = parsed?.Response;
         if (inner is null || !string.Equals(inner.Code, "10000", StringComparison.Ordinal))
         {
-            _logger.LogError(
+            Logger.LogError(
                 "Alipay precreate failed: code={Code} subCode={SubCode} msg={Msg} subMsg={SubMsg}",
                 inner?.Code, inner?.SubCode, inner?.Msg, inner?.SubMsg);
             throw new BhenguPaymentException(
@@ -127,7 +127,7 @@ public sealed class AlipayQrCodeProvider : IQrCodeProvider
         }
 
         var reference = string.IsNullOrEmpty(inner.OutTradeNo) ? request.MerchantReference : inner.OutTradeNo!;
-        _logger.LogInformation("Alipay QR generated: out_trade_no={OutTradeNo}", reference);
+        Logger.LogInformation("Alipay QR generated: out_trade_no={OutTradeNo}", reference);
 
         return new QrCode
         {
@@ -170,7 +170,7 @@ public sealed class AlipayQrCodeProvider : IQrCodeProvider
 
         if (!string.Equals(inner.Code, "10000", StringComparison.Ordinal))
         {
-            _logger.LogWarning(
+            Logger.LogWarning(
                 "Alipay query non-success: code={Code} subCode={SubCode} msg={Msg}",
                 inner.Code, inner.SubCode, inner.Msg);
             return PaymentStatus.Pending;
@@ -210,7 +210,7 @@ public sealed class AlipayQrCodeProvider : IQrCodeProvider
         // out_trade_no submissions as the same logical order. We forward the SDK idempotency key for trace
         // visibility on the merchant side, but Alipay doesn't surface it as a request header.
         if (!string.IsNullOrWhiteSpace(idempotencyKey))
-            _logger.LogDebug("Alipay {Method} IdempotencyKey={Key}", method, idempotencyKey);
+            Logger.LogDebug("Alipay {Method} IdempotencyKey={Key}", method, idempotencyKey);
 
         var canonical = BuildCanonicalString(publicParams);
         var sig = SignRsa2(canonical, _options.MerchantPrivateKey);
@@ -239,7 +239,7 @@ public sealed class AlipayQrCodeProvider : IQrCodeProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Alipay {Method} HTTP failed: {Status} {Body}", method, response.StatusCode, body);
+            Logger.LogError("Alipay {Method} HTTP failed: {Status} {Body}", method, response.StatusCode, body);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), body);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {body}");

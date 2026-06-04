@@ -6,8 +6,9 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.Alipay.Configuration;
-using Bhengu.Finance.Payments.Alipay.Internals;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
@@ -22,7 +23,7 @@ namespace Bhengu.Finance.Payments.Alipay.Providers;
 /// global merchants accepting Chinese consumers (1B+ users). RSA-SHA256 signed requests,
 /// response/webhook signature verification, and IPayoutProvider for disbursements.
 /// </summary>
-public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class AlipayPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private const string PayPath = "/ams/api/v1/payments/pay";
     private const string RefundPath = "/ams/api/v1/payments/refund";
@@ -30,10 +31,9 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
 
     private readonly HttpClient _httpClient;
     private readonly AlipayOptions _options;
-    private readonly ILogger<AlipayPaymentProvider> _logger;
     private readonly string _baseUrl;
 
-    public string ProviderName => ProviderNames.Alipay;
+    public override string ProviderName => ProviderNames.Alipay;
 
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
@@ -48,10 +48,10 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         HttpClient httpClient,
         IOptions<AlipayOptions> options,
         ILogger<AlipayPaymentProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ClientId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(AlipayOptions.ClientId)} is required");
@@ -70,7 +70,7 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return AlipayObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+        return RunChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct), ct);
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
@@ -105,7 +105,7 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         var responseBody = await SendAsync(PayPath, body, ct, "ProcessPayment").ConfigureAwait(false);
         var parsed = JsonSerializer.Deserialize<AlipayPaymentResponse>(responseBody);
 
-        _logger.LogInformation("Alipay pay created: paymentId={PaymentId} resultCode={ResultCode}",
+        Logger.LogInformation("Alipay pay created: paymentId={PaymentId} resultCode={ResultCode}",
             parsed?.PaymentId, parsed?.Result?.ResultCode);
 
         return new PaymentResponse
@@ -124,7 +124,7 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return AlipayObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+        return RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct), ct);
     }
 
     private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
@@ -145,7 +145,7 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         var responseBody = await SendAsync(RefundPath, body, ct, "ProcessRefund").ConfigureAwait(false);
         var parsed = JsonSerializer.Deserialize<AlipayRefundResponse>(responseBody);
 
-        _logger.LogInformation("Alipay refund created: refundId={RefundId} resultCode={ResultCode}",
+        Logger.LogInformation("Alipay refund created: refundId={RefundId} resultCode={ResultCode}",
             parsed?.RefundId, parsed?.Result?.ResultCode);
 
         return new RefundResponse
@@ -162,7 +162,7 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return AlipayObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+        return RunPayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct), ct);
     }
 
     private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
@@ -186,7 +186,7 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         var responseBody = await SendAsync(PayoutPath, body, ct, "ProcessPayout").ConfigureAwait(false);
         var parsed = JsonSerializer.Deserialize<AlipayPayoutResponse>(responseBody);
 
-        _logger.LogInformation("Alipay payout created: payoutId={PayoutId} resultCode={ResultCode}",
+        Logger.LogInformation("Alipay payout created: payoutId={PayoutId} resultCode={ResultCode}",
             parsed?.PayoutId, parsed?.Result?.ResultCode);
 
         return new PayoutResponse
@@ -207,36 +207,30 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
 
         if (string.IsNullOrWhiteSpace(_options.AlipayPublicKey))
         {
-            _logger.LogWarning("Alipay AlipayPublicKey not configured — webhook signature verification cannot succeed.");
-            AlipayObservability.RecordWebhookVerification(false);
-            return false;
+            Logger.LogWarning("Alipay AlipayPublicKey not configured — webhook signature verification cannot succeed.");
+            return RunWebhookVerify(() => false);
         }
 
-        bool verified;
-        try
+        return RunWebhookVerify(() =>
         {
-            var sigBytes = Convert.FromBase64String(signature);
-            using var rsa = LoadPublicKey(_options.AlipayPublicKey);
-            verified = rsa.VerifyData(
-                Encoding.UTF8.GetBytes(payload),
-                sigBytes,
-                HashAlgorithmName.SHA256,
-                RSASignaturePadding.Pkcs1);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Alipay webhook signature verification raised");
-            verified = false;
-        }
-        AlipayObservability.RecordWebhookVerification(verified);
-        return verified;
+            try
+            {
+                using var rsa = LoadPublicKey(_options.AlipayPublicKey);
+                return SignatureHelpers.VerifyRsaSha256(payload, signature, rsa, SignatureHelpers.Encoding.Base64);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Alipay webhook signature verification raised");
+                return false;
+            }
+        });
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        return AlipayObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+        return RunOperationAsync("parse_webhook", () => ParseWebhookCoreAsync(payload, ct), ct);
     }
 
     private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
@@ -247,7 +241,7 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
             if (webhook is null || string.IsNullOrEmpty(webhook.NotifyType))
                 return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed Alipay webhook event: {NotifyType}", webhook.NotifyType);
+            Logger.LogInformation("Parsed Alipay webhook event: {NotifyType}", webhook.NotifyType);
 
             var status = webhook.NotifyType.ToUpperInvariant() switch
             {
@@ -284,7 +278,7 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse Alipay webhook event");
+            Logger.LogError(ex, "Failed to parse Alipay webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -305,16 +299,8 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         req.Headers.Add("request-time", requestTime);
         req.Headers.Add("signature", $"algorithm=RSA256,keyVersion=1,signature={signature}");
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Alipay failed", ex);
-        }
-
+        // HttpRequestException is auto-translated to ProviderUnavailableException by BhenguProviderBase.
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -325,7 +311,7 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Alipay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Alipay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
