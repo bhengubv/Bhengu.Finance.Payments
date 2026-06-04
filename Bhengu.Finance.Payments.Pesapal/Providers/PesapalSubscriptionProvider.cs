@@ -78,12 +78,10 @@ public sealed class PesapalSubscriptionProvider : BhenguProviderBase, ISubscript
     }
 
     /// <inheritdoc/>
-    public async Task<Plan> CreatePlanAsync(PlanRequest request, CancellationToken ct = default)
+    public Task<Plan> CreatePlanAsync(PlanRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "subscription.create_plan");
-        try
+        return RunOperationAsync("create_plan", async () =>
         {
             var reference = $"plan-{Guid.NewGuid():N}";
             var plan = new Plan
@@ -98,42 +96,22 @@ public sealed class PesapalSubscriptionProvider : BhenguProviderBase, ISubscript
             };
             await StorePlanAsync(plan, ct).ConfigureAwait(false);
             Logger.LogInformation("Pesapal plan stored: {Reference} name={Name}", plan.Reference, plan.Name);
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             return plan;
-        }
-        catch (Exception ex)
-        {
-            activity.SetOutcome(ClassifyOutcome(ex));
-            throw;
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>
-    public async Task<Plan?> GetPlanAsync(string planReference, CancellationToken ct = default)
+    public Task<Plan?> GetPlanAsync(string planReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(planReference);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "subscription.get_plan");
-        try
-        {
-            var plan = await ReadPlanAsync(planReference, ct).ConfigureAwait(false);
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return plan;
-        }
-        catch (Exception ex)
-        {
-            activity.SetOutcome(ClassifyOutcome(ex));
-            throw;
-        }
+        return RunOperationAsync("get_plan", () => ReadPlanAsync(planReference, ct), ct);
     }
 
     /// <inheritdoc/>
-    public async Task<Subscription> CreateSubscriptionAsync(SubscriptionRequest request, CancellationToken ct = default)
+    public Task<Subscription> CreateSubscriptionAsync(SubscriptionRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "subscription.create");
-        try
+        return RunOperationAsync("create_subscription", async () =>
         {
             var plan = await ReadPlanAsync(request.PlanReference, ct).ConfigureAwait(false)
                 ?? throw new BhenguPaymentException(ProviderName,
@@ -177,7 +155,7 @@ public sealed class PesapalSubscriptionProvider : BhenguProviderBase, ISubscript
             Logger.LogInformation("Pesapal subscription created: tracking={Tracking} plan={Plan}",
                 submit?.OrderTrackingId, plan.Reference);
 
-            var sub = new Subscription
+            return new Subscription
             {
                 Reference = submit?.OrderTrackingId ?? orderId,
                 PlanReference = plan.Reference,
@@ -187,74 +165,61 @@ public sealed class PesapalSubscriptionProvider : BhenguProviderBase, ISubscript
                 NextBillingAt = MapNextBilling(start, plan.Interval),
                 CyclesCompleted = 0
             };
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return sub;
-        }
-        catch (Exception ex)
-        {
-            activity.SetOutcome(ClassifyOutcome(ex));
-            throw;
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>
-    public async Task<Subscription?> GetSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
+    public Task<Subscription?> GetSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "subscription.get");
-        try
+        return RunOperationAsync<Subscription?>("get_subscription", async () =>
         {
-            var path = $"api/Transactions/GetTransactionStatus?orderTrackingId={Uri.EscapeDataString(subscriptionReference)}";
-            var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, Logger, _options, _tokenCache, ct).ConfigureAwait(false);
-            var responseBody = await PesapalHttpClient.SendAsync(
-                _httpClient, Logger, HttpMethod.Get, path, body: null, token, ct, "GetSubscription").ConfigureAwait(false);
-            var status = JsonSerializer.Deserialize<PesapalTransactionStatus>(responseBody);
-            if (status is null)
+            try
             {
-                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+                var path = $"api/Transactions/GetTransactionStatus?orderTrackingId={Uri.EscapeDataString(subscriptionReference)}";
+                var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, Logger, _options, _tokenCache, ct).ConfigureAwait(false);
+                var responseBody = await PesapalHttpClient.SendAsync(
+                    _httpClient, Logger, HttpMethod.Get, path, body: null, token, ct, "GetSubscription").ConfigureAwait(false);
+                var status = JsonSerializer.Deserialize<PesapalTransactionStatus>(responseBody);
+                if (status is null) return null;
+
+                return new Subscription
+                {
+                    Reference = subscriptionReference,
+                    PlanReference = string.Empty,
+                    CustomerId = status.MerchantReference ?? string.Empty,
+                    Status = MapSubStatus(status.StatusCode, status.PaymentStatusDescription),
+                    StartedAt = status.CreatedDate ?? DateTime.UtcNow,
+                    CyclesCompleted = 0
+                };
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
                 return null;
             }
-
-            var sub = new Subscription
-            {
-                Reference = subscriptionReference,
-                PlanReference = string.Empty,
-                CustomerId = status.MerchantReference ?? string.Empty,
-                Status = MapSubStatus(status.StatusCode, status.PaymentStatusDescription),
-                StartedAt = status.CreatedDate ?? DateTime.UtcNow,
-                CyclesCompleted = 0
-            };
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return sub;
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return null;
-        }
-        catch (Exception ex)
-        {
-            activity.SetOutcome(ClassifyOutcome(ex));
-            throw;
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>
-    public async Task<Subscription> CancelSubscriptionAsync(string subscriptionReference, bool immediately = false, CancellationToken ct = default)
+    public Task<Subscription> CancelSubscriptionAsync(string subscriptionReference, bool immediately = false, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "subscription.cancel");
-        try
+        return RunOperationAsync("cancel_subscription", async () =>
         {
-            var body = new { order_tracking_id = subscriptionReference };
-            var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, Logger, _options, _tokenCache, ct).ConfigureAwait(false);
-            await PesapalHttpClient.SendAsync(
-                _httpClient, Logger, HttpMethod.Post, "api/Transactions/CancelOrder", body, token, ct, "CancelSubscription").ConfigureAwait(false);
+            try
+            {
+                var body = new { order_tracking_id = subscriptionReference };
+                var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, Logger, _options, _tokenCache, ct).ConfigureAwait(false);
+                await PesapalHttpClient.SendAsync(
+                    _httpClient, Logger, HttpMethod.Post, "api/Transactions/CancelOrder", body, token, ct, "CancelSubscription").ConfigureAwait(false);
 
-            Logger.LogInformation("Pesapal subscription {Reference} cancelled (immediately={Immediately})", subscriptionReference, immediately);
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+                Logger.LogInformation("Pesapal subscription {Reference} cancelled (immediately={Immediately})", subscriptionReference, immediately);
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                // Idempotent: cancelling a non-existent subscription returns a cancelled stub.
+            }
+
             return new Subscription
             {
                 Reference = subscriptionReference,
@@ -265,27 +230,7 @@ public sealed class PesapalSubscriptionProvider : BhenguProviderBase, ISubscript
                 CancelledAt = DateTime.UtcNow,
                 CyclesCompleted = 0
             };
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            // Idempotent: cancelling a non-existent subscription returns a cancelled stub.
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return new Subscription
-            {
-                Reference = subscriptionReference,
-                PlanReference = string.Empty,
-                CustomerId = string.Empty,
-                Status = SubscriptionStatus.Cancelled,
-                StartedAt = DateTime.UtcNow,
-                CancelledAt = DateTime.UtcNow,
-                CyclesCompleted = 0
-            };
-        }
-        catch (Exception ex)
-        {
-            activity.SetOutcome(ClassifyOutcome(ex));
-            throw;
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>

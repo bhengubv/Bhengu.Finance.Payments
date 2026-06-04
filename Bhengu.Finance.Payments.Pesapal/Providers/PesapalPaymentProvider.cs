@@ -13,7 +13,6 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
-using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Pesapal.Configuration;
 using Bhengu.Finance.Payments.Pesapal.Internals;
 using Microsoft.Extensions.Logging;
@@ -83,21 +82,14 @@ public sealed class PesapalPaymentProvider : BhenguProviderBase, IPaymentGateway
     }
 
     /// <inheritdoc/>
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
-        var started = DateTime.UtcNow;
-        var cached = await TryGetCachedAsync<PaymentResponse>(request.IdempotencyKey, "charge", ct).ConfigureAwait(false);
-        if (cached is not null)
+        return RunChargeAsync(request.Currency, async () =>
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return cached;
-        }
+            var cached = await TryGetCachedAsync<PaymentResponse>(request.IdempotencyKey, "charge", ct).ConfigureAwait(false);
+            if (cached is not null) return cached;
 
-        try
-        {
             if (string.IsNullOrWhiteSpace(_options.IpnId))
                 throw new ProviderConfigurationException(ProviderName, $"{nameof(PesapalOptions.IpnId)} is required (register an IPN via /api/URLSetup/RegisterIPN first)");
 
@@ -143,44 +135,19 @@ public sealed class PesapalPaymentProvider : BhenguProviderBase, IPaymentGateway
             };
 
             await TrySetCachedAsync(request.IdempotencyKey, "charge", response, ct).ConfigureAwait(false);
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", BhenguPaymentDiagnostics.Outcomes.Pending));
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Pending);
             return response;
-        }
-        catch (Exception ex)
-        {
-            var outcome = ClassifyOutcome(ex);
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcome));
-            activity.SetOutcome(outcome);
-            throw;
-        }
-        finally
-        {
-            BhenguPaymentDiagnostics.ChargeDurationMs.Record(
-                (DateTime.UtcNow - started).TotalMilliseconds,
-                new KeyValuePair<string, object?>("provider", ProviderName));
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
-        var cached = await TryGetCachedAsync<RefundResponse>(request.IdempotencyKey, "refund", ct).ConfigureAwait(false);
-        if (cached is not null)
+        return RunRefundAsync(request.GatewayReference, async () =>
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return cached;
-        }
+            var cached = await TryGetCachedAsync<RefundResponse>(request.IdempotencyKey, "refund", ct).ConfigureAwait(false);
+            if (cached is not null) return cached;
 
-        try
-        {
             var body = new
             {
                 confirmation_code = request.GatewayReference,
@@ -208,25 +175,8 @@ public sealed class PesapalPaymentProvider : BhenguProviderBase, IPaymentGateway
             };
 
             await TrySetCachedAsync(request.IdempotencyKey, "refund", response, ct).ConfigureAwait(false);
-            BhenguPaymentDiagnostics.RefundsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", mapped == PaymentStatus.Refunded
-                    ? BhenguPaymentDiagnostics.Outcomes.Success
-                    : BhenguPaymentDiagnostics.Outcomes.Declined));
-            activity.SetOutcome(mapped == PaymentStatus.Refunded
-                ? BhenguPaymentDiagnostics.Outcomes.Success
-                : BhenguPaymentDiagnostics.Outcomes.Declined);
             return response;
-        }
-        catch (Exception ex)
-        {
-            var outcome = ClassifyOutcome(ex);
-            BhenguPaymentDiagnostics.RefundsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcome));
-            activity.SetOutcome(outcome);
-            throw;
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>
@@ -235,77 +185,73 @@ public sealed class PesapalPaymentProvider : BhenguProviderBase, IPaymentGateway
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        if (string.IsNullOrWhiteSpace(_options.ConsumerSecret))
+        return RunWebhookVerify(() =>
         {
-            Logger.LogWarning("Pesapal ConsumerSecret not configured — IPN verification cannot proceed.");
-            BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("valid", false));
-            return false;
-        }
+            if (string.IsNullOrWhiteSpace(_options.ConsumerSecret))
+            {
+                Logger.LogWarning("Pesapal ConsumerSecret not configured — IPN verification cannot proceed.");
+                return false;
+            }
 
-        // Pesapal does NOT HMAC IPN payloads. We perform a constant-time equality check between
-        // the supplied signature and the configured ConsumerSecret so callers MUST send a known
-        // shared secret in their reverse-proxy header. Production callers should additionally call
-        // GetTransactionStatus(OrderTrackingId) for canonical confirmation.
-        var a = Encoding.UTF8.GetBytes(signature);
-        var b = Encoding.UTF8.GetBytes(_options.ConsumerSecret);
-        var valid = a.Length == b.Length && System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(a, b);
-        BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
-            new KeyValuePair<string, object?>("provider", ProviderName),
-            new KeyValuePair<string, object?>("valid", valid));
-        return valid;
+            // Pesapal does NOT HMAC IPN payloads. We perform a constant-time equality check between
+            // the supplied signature and the configured ConsumerSecret so callers MUST send a known
+            // shared secret in their reverse-proxy header. Production callers should additionally call
+            // GetTransactionStatus(OrderTrackingId) for canonical confirmation.
+            var a = Encoding.UTF8.GetBytes(signature);
+            var b = Encoding.UTF8.GetBytes(_options.ConsumerSecret);
+            return a.Length == b.Length && System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(a, b);
+        });
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-
-        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
-
-        try
+        return RunOperationAsync("parse_webhook", () =>
         {
-            var ipn = JsonSerializer.Deserialize<PesapalIpnEvent>(payload);
-            if (ipn is null || string.IsNullOrEmpty(ipn.OrderTrackingId))
-                return Task.FromResult<WebhookEvent?>(null);
-
-            Logger.LogInformation("Parsed Pesapal IPN: tracking={Tracking} notifType={NotifType}",
-                ipn.OrderTrackingId, ipn.OrderNotificationType);
-
-            var notif = ipn.OrderNotificationType?.ToUpperInvariant();
-            // Pesapal IPNs always carry an OrderNotificationType that we map to a ChargePendingEvent —
-            // the caller must query GetTransactionStatus(OrderTrackingId) to learn the final status.
-            // We surface a ChargePending typed event so consumers can route on category.
-            WebhookEvent typed = notif switch
+            try
             {
-                "IPNCHANGE" or "CHANGE" or "COMPLETED" => new ChargePendingEvent
-                {
-                    GatewayReference = ipn.OrderTrackingId,
-                    Status = PaymentStatus.Pending,
-                    EventType = ipn.OrderNotificationType,
-                    Category = WebhookEventCategory.ChargePending,
-                    Amount = 0m,
-                    Currency = _options.Currency
-                },
-                _ => new ChargePendingEvent
-                {
-                    GatewayReference = ipn.OrderTrackingId,
-                    Status = PaymentStatus.Pending,
-                    EventType = ipn.OrderNotificationType ?? "unknown",
-                    Category = WebhookEventCategory.ChargePending,
-                    Amount = 0m,
-                    Currency = _options.Currency
-                }
-            };
+                var ipn = JsonSerializer.Deserialize<PesapalIpnEvent>(payload);
+                if (ipn is null || string.IsNullOrEmpty(ipn.OrderTrackingId))
+                    return Task.FromResult<WebhookEvent?>(null);
 
-            return Task.FromResult<WebhookEvent?>(typed);
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Failed to parse Pesapal IPN");
-            return Task.FromResult<WebhookEvent?>(null);
-        }
+                Logger.LogInformation("Parsed Pesapal IPN: tracking={Tracking} notifType={NotifType}",
+                    ipn.OrderTrackingId, ipn.OrderNotificationType);
+
+                var notif = ipn.OrderNotificationType?.ToUpperInvariant();
+                // Pesapal IPNs always carry an OrderNotificationType that we map to a ChargePendingEvent —
+                // the caller must query GetTransactionStatus(OrderTrackingId) to learn the final status.
+                // We surface a ChargePending typed event so consumers can route on category.
+                WebhookEvent typed = notif switch
+                {
+                    "IPNCHANGE" or "CHANGE" or "COMPLETED" => new ChargePendingEvent
+                    {
+                        GatewayReference = ipn.OrderTrackingId,
+                        Status = PaymentStatus.Pending,
+                        EventType = ipn.OrderNotificationType,
+                        Category = WebhookEventCategory.ChargePending,
+                        Amount = 0m,
+                        Currency = _options.Currency
+                    },
+                    _ => new ChargePendingEvent
+                    {
+                        GatewayReference = ipn.OrderTrackingId,
+                        Status = PaymentStatus.Pending,
+                        EventType = ipn.OrderNotificationType ?? "unknown",
+                        Category = WebhookEventCategory.ChargePending,
+                        Amount = 0m,
+                        Currency = _options.Currency
+                    }
+                };
+
+                return Task.FromResult<WebhookEvent?>(typed);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Failed to parse Pesapal IPN");
+                return Task.FromResult<WebhookEvent?>(null);
+            }
+        }, ct);
     }
 
     private async Task<T?> TryGetCachedAsync<T>(string? idempotencyKey, string operation, CancellationToken ct) where T : class
@@ -323,14 +269,6 @@ public sealed class PesapalPaymentProvider : BhenguProviderBase, IPaymentGateway
         var key = $"pesapal:{operation}:{idempotencyKey}";
         await _idempotencyCache.SetAsync(key, value, TimeSpan.FromHours(24), ct).ConfigureAwait(false);
     }
-
-    private static string ClassifyOutcome(Exception ex) => ex switch
-    {
-        PaymentDeclinedException => BhenguPaymentDiagnostics.Outcomes.Declined,
-        ProviderRateLimitException => BhenguPaymentDiagnostics.Outcomes.RateLimited,
-        ProviderUnavailableException => BhenguPaymentDiagnostics.Outcomes.Unavailable,
-        _ => BhenguPaymentDiagnostics.Outcomes.Error
-    };
 
     private async Task<string> SendAsync(HttpMethod method, string path, object body, CancellationToken ct, string operation)
     {

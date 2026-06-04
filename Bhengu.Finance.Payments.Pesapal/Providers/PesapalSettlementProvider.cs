@@ -90,31 +90,25 @@ public sealed class PesapalSettlementProvider : BhenguProviderBase, ISettlementP
     }
 
     /// <inheritdoc/>
-    public async Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
+    public Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.get");
-        try
+        return RunOperationAsync<Settlement?>("get_settlement", async () =>
         {
-            var path = $"api/Statements/GetSettlement?settlementId={Uri.EscapeDataString(settlementReference)}";
-            var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, Logger, _options, _tokenCache, ct).ConfigureAwait(false);
-            var responseBody = await PesapalHttpClient.SendAsync(
-                _httpClient, Logger, HttpMethod.Get, path, body: null, token, ct, "GetSettlement").ConfigureAwait(false);
-            var envelope = JsonSerializer.Deserialize<PesapalStatementSingleResponse>(responseBody);
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return envelope?.Data is null ? null : ToSettlement(envelope.Data);
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return null;
-        }
-        catch (Exception ex)
-        {
-            activity.SetOutcome(ClassifyOutcome(ex));
-            throw;
-        }
+            try
+            {
+                var path = $"api/Statements/GetSettlement?settlementId={Uri.EscapeDataString(settlementReference)}";
+                var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, Logger, _options, _tokenCache, ct).ConfigureAwait(false);
+                var responseBody = await PesapalHttpClient.SendAsync(
+                    _httpClient, Logger, HttpMethod.Get, path, body: null, token, ct, "GetSettlement").ConfigureAwait(false);
+                var envelope = JsonSerializer.Deserialize<PesapalStatementSingleResponse>(responseBody);
+                return envelope?.Data is null ? null : ToSettlement(envelope.Data);
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return null;
+            }
+        }, ct);
     }
 
     /// <inheritdoc/>
