@@ -13,7 +13,6 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
-using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.OrangeMoney.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -95,21 +94,14 @@ public sealed class OrangeMoneyPaymentProvider : BhenguProviderBase, IPaymentGat
     }
 
     /// <inheritdoc/>
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
-        var started = DateTime.UtcNow;
-        var cached = await TryGetCachedAsync<PaymentResponse>(request.IdempotencyKey, "charge", ct).ConfigureAwait(false);
-        if (cached is not null)
+        return RunChargeAsync(request.Currency, async () =>
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return cached;
-        }
+            var cached = await TryGetCachedAsync<PaymentResponse>(request.IdempotencyKey, "charge", ct).ConfigureAwait(false);
+            if (cached is not null) return cached;
 
-        try
-        {
             var orderId = request.Metadata?.TryGetValue("order_id", out var oid) == true
                 ? oid
                 : (request.IdempotencyKey is { Length: > 0 } k ? k[..Math.Min(20, k.Length)] : Guid.NewGuid().ToString("N")[..20]);
@@ -150,33 +142,8 @@ public sealed class OrangeMoneyPaymentProvider : BhenguProviderBase, IPaymentGat
             };
 
             await TrySetCachedAsync(request.IdempotencyKey, "charge", response, ct).ConfigureAwait(false);
-            var outcome = response.Status switch
-            {
-                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
-                _ => BhenguPaymentDiagnostics.Outcomes.Declined
-            };
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcome));
-            activity.SetOutcome(outcome);
             return response;
-        }
-        catch (Exception ex)
-        {
-            var outcome = ClassifyOutcome(ex);
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcome));
-            activity.SetOutcome(outcome);
-            throw;
-        }
-        finally
-        {
-            BhenguPaymentDiagnostics.ChargeDurationMs.Record(
-                (DateTime.UtcNow - started).TotalMilliseconds,
-                new KeyValuePair<string, object?>("provider", ProviderName));
-        }
+        }, ct);
     }
 
     /// <summary>
@@ -196,20 +163,14 @@ public sealed class OrangeMoneyPaymentProvider : BhenguProviderBase, IPaymentGat
     /// (<c>/orange-money-b2c/{country}/v1/cashin</c>). The <see cref="PayoutRequest.DestinationToken"/>
     /// must be the recipient's Orange Money MSISDN (with country prefix, e.g. <c>225XXXXXXXX</c>).
     /// </summary>
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, request.Currency);
-        var cached = await TryGetCachedAsync<PayoutResponse>(request.IdempotencyKey, "payout", ct).ConfigureAwait(false);
-        if (cached is not null)
+        return RunPayoutAsync(request.Currency, async () =>
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return cached;
-        }
+            var cached = await TryGetCachedAsync<PayoutResponse>(request.IdempotencyKey, "payout", ct).ConfigureAwait(false);
+            if (cached is not null) return cached;
 
-        try
-        {
             var orderId = request.IdempotencyKey is { Length: > 0 } k
                 ? k[..Math.Min(20, k.Length)]
                 : Guid.NewGuid().ToString("N")[..20];
@@ -245,28 +206,8 @@ public sealed class OrangeMoneyPaymentProvider : BhenguProviderBase, IPaymentGat
             };
 
             await TrySetCachedAsync(request.IdempotencyKey, "payout", response, ct).ConfigureAwait(false);
-            var outcome = status switch
-            {
-                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
-                PaymentStatus.Failed => BhenguPaymentDiagnostics.Outcomes.Declined,
-                _ => BhenguPaymentDiagnostics.Outcomes.Success
-            };
-            BhenguPaymentDiagnostics.PayoutsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcome));
-            activity.SetOutcome(outcome);
             return response;
-        }
-        catch (Exception ex)
-        {
-            var outcome = ClassifyOutcome(ex);
-            BhenguPaymentDiagnostics.PayoutsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcome));
-            activity.SetOutcome(outcome);
-            throw;
-        }
+        }, ct);
     }
 
     /// <summary>
@@ -279,91 +220,85 @@ public sealed class OrangeMoneyPaymentProvider : BhenguProviderBase, IPaymentGat
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        bool valid = false;
-        try
+        return RunWebhookVerify(() =>
         {
-            var evt = JsonSerializer.Deserialize<OrangeNotifPayload>(payload);
-            var notifToken = evt?.NotifToken;
-            if (string.IsNullOrEmpty(notifToken))
+            try
             {
-                Logger.LogWarning("Orange Money notif payload missing notif_token — cannot verify.");
-                valid = false;
-            }
-            else
-            {
-                valid = System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
+                var evt = JsonSerializer.Deserialize<OrangeNotifPayload>(payload);
+                var notifToken = evt?.NotifToken;
+                if (string.IsNullOrEmpty(notifToken))
+                {
+                    Logger.LogWarning("Orange Money notif payload missing notif_token — cannot verify.");
+                    return false;
+                }
+                return System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
                     Encoding.UTF8.GetBytes(notifToken),
                     Encoding.UTF8.GetBytes(signature));
             }
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Orange Money notif token verification raised");
-            valid = false;
-        }
-
-        BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
-            new KeyValuePair<string, object?>("provider", ProviderName),
-            new KeyValuePair<string, object?>("valid", valid));
-        return valid;
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Orange Money notif token verification raised");
+                return false;
+            }
+        });
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-
-        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
-
-        try
+        return RunOperationAsync("parse_webhook", () =>
         {
-            var evt = JsonSerializer.Deserialize<OrangeNotifPayload>(payload);
-            if (evt is null || string.IsNullOrEmpty(evt.PayToken))
-                return Task.FromResult<WebhookEvent?>(null);
-
-            Logger.LogInformation(
-                "Parsed Orange Money notif: PayToken={PayToken} Status={Status}",
-                evt.PayToken, evt.Status);
-
-            var status = MapStatus(evt.Status);
-            decimal.TryParse(evt.Amount, NumberStyles.Number, CultureInfo.InvariantCulture, out var amount);
-            var currency = evt.Currency ?? "XOF";
-            var statusLower = evt.Status?.ToUpperInvariant();
-            var notifType = evt.NotificationType?.ToLowerInvariant();
-
-            WebhookEvent? typed = (notifType, statusLower) switch
+            try
             {
-                ("cashin", "SUCCESS") or ("cashin", "SUCCESSFUL") or ("cashin", "COMPLETED") => new PayoutCompletedEvent
-                {
-                    GatewayReference = evt.PayToken,
-                    Status = PaymentStatus.Completed,
-                    EventType = evt.Status,
-                    Category = WebhookEventCategory.PayoutCompleted,
-                    PayoutReference = evt.PayToken,
-                    Amount = amount,
-                    Currency = currency
-                },
-                ("cashin", _) when status == PaymentStatus.Failed => new PayoutFailedEvent
-                {
-                    GatewayReference = evt.PayToken,
-                    Status = PaymentStatus.Failed,
-                    EventType = evt.Status,
-                    Category = WebhookEventCategory.PayoutFailed,
-                    PayoutReference = evt.PayToken,
-                    Amount = amount,
-                    Currency = currency,
-                    FailureCode = evt.Status
-                },
-                _ => MapChargeStatus(evt, status, amount, currency)
-            };
+                var evt = JsonSerializer.Deserialize<OrangeNotifPayload>(payload);
+                if (evt is null || string.IsNullOrEmpty(evt.PayToken))
+                    return Task.FromResult<WebhookEvent?>(null);
 
-            return Task.FromResult(typed);
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Failed to parse Orange Money notif payload");
-            return Task.FromResult<WebhookEvent?>(null);
-        }
+                Logger.LogInformation(
+                    "Parsed Orange Money notif: PayToken={PayToken} Status={Status}",
+                    evt.PayToken, evt.Status);
+
+                var status = MapStatus(evt.Status);
+                decimal.TryParse(evt.Amount, NumberStyles.Number, CultureInfo.InvariantCulture, out var amount);
+                var currency = evt.Currency ?? "XOF";
+                var statusLower = evt.Status?.ToUpperInvariant();
+                var notifType = evt.NotificationType?.ToLowerInvariant();
+
+                WebhookEvent? typed = (notifType, statusLower) switch
+                {
+                    ("cashin", "SUCCESS") or ("cashin", "SUCCESSFUL") or ("cashin", "COMPLETED") => new PayoutCompletedEvent
+                    {
+                        GatewayReference = evt.PayToken,
+                        Status = PaymentStatus.Completed,
+                        EventType = evt.Status,
+                        Category = WebhookEventCategory.PayoutCompleted,
+                        PayoutReference = evt.PayToken,
+                        Amount = amount,
+                        Currency = currency
+                    },
+                    ("cashin", _) when status == PaymentStatus.Failed => new PayoutFailedEvent
+                    {
+                        GatewayReference = evt.PayToken,
+                        Status = PaymentStatus.Failed,
+                        EventType = evt.Status,
+                        Category = WebhookEventCategory.PayoutFailed,
+                        PayoutReference = evt.PayToken,
+                        Amount = amount,
+                        Currency = currency,
+                        FailureCode = evt.Status
+                    },
+                    _ => MapChargeStatus(evt, status, amount, currency)
+                };
+
+                return Task.FromResult(typed);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Failed to parse Orange Money notif payload");
+                return Task.FromResult<WebhookEvent?>(null);
+            }
+        }, ct);
     }
 
     private static WebhookEvent? MapChargeStatus(OrangeNotifPayload evt, PaymentStatus status, decimal amount, string currency)
@@ -520,14 +455,6 @@ public sealed class OrangeMoneyPaymentProvider : BhenguProviderBase, IPaymentGat
         var key = $"orangemoney:{operation}:{idempotencyKey}";
         await _idempotencyCache.SetAsync(key, value, TimeSpan.FromHours(24), ct).ConfigureAwait(false);
     }
-
-    private static string ClassifyOutcome(Exception ex) => ex switch
-    {
-        PaymentDeclinedException => BhenguPaymentDiagnostics.Outcomes.Declined,
-        ProviderRateLimitException => BhenguPaymentDiagnostics.Outcomes.RateLimited,
-        ProviderUnavailableException => BhenguPaymentDiagnostics.Outcomes.Unavailable,
-        _ => BhenguPaymentDiagnostics.Outcomes.Error
-    };
 
     private static PaymentStatus MapStatus(string? raw) => (raw ?? string.Empty).ToUpperInvariant() switch
     {
