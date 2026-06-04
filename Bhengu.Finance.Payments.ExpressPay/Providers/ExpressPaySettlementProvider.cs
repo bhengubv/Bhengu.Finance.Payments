@@ -7,6 +7,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models.Settlement;
 using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.ExpressPay.Configuration;
@@ -23,24 +24,23 @@ namespace Bhengu.Finance.Payments.ExpressPay.Providers;
 /// settlement-id form post. Both endpoints accept the standard merchant-id / api-key form fields.
 /// </para>
 /// </summary>
-public sealed class ExpressPaySettlementProvider : ISettlementProvider
+public sealed class ExpressPaySettlementProvider : BhenguProviderBase, ISettlementProvider
 {
     private readonly HttpClient _httpClient;
     private readonly ExpressPayOptions _options;
-    private readonly ILogger<ExpressPaySettlementProvider> _logger;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.ExpressPay;
+    public override string ProviderName => ProviderNames.ExpressPay;
 
     /// <summary>Construct the ExpressPay settlement provider. Designed to be registered via DI.</summary>
     public ExpressPaySettlementProvider(
         HttpClient httpClient,
         IOptions<ExpressPayOptions> options,
         ILogger<ExpressPaySettlementProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.MerchantId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(ExpressPayOptions.MerchantId)} is required");
@@ -73,11 +73,11 @@ public sealed class ExpressPaySettlementProvider : ISettlementProvider
                     ["to"] = toUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
                 };
 
-                var responseBody = await ExpressPayHttpClient.SendFormAsync(_httpClient, _logger, HttpMethod.Post, "settlements.php", form, ct, "ListSettlements").ConfigureAwait(false);
+                var responseBody = await ExpressPayHttpClient.SendFormAsync(_httpClient, Logger, HttpMethod.Post, "settlements.php", form, ct, "ListSettlements").ConfigureAwait(false);
                 var envelope = JsonSerializer.Deserialize<ExpressPaySettlementListResponse>(responseBody);
                 items = envelope?.Settlements;
 
-                _logger.LogInformation("ExpressPay settlements listed: {Count} between {From:O} and {To:O}", items?.Count ?? 0, fromUtc, toUtc);
+                Logger.LogInformation("ExpressPay settlements listed: {Count} between {From:O} and {To:O}", items?.Count ?? 0, fromUtc, toUtc);
                 activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             }
             catch (Exception ex)
@@ -110,7 +110,7 @@ public sealed class ExpressPaySettlementProvider : ISettlementProvider
                 ["settlement-id"] = settlementReference
             };
 
-            var responseBody = await ExpressPayHttpClient.SendFormAsync(_httpClient, _logger, HttpMethod.Post, "settlement.php", form, ct, "GetSettlement").ConfigureAwait(false);
+            var responseBody = await ExpressPayHttpClient.SendFormAsync(_httpClient, Logger, HttpMethod.Post, "settlement.php", form, ct, "GetSettlement").ConfigureAwait(false);
             var envelope = JsonSerializer.Deserialize<ExpressPaySettlementSingleResponse>(responseBody);
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             return envelope?.Settlement is null ? null : ToSettlement(envelope.Settlement);
@@ -144,7 +144,7 @@ public sealed class ExpressPaySettlementProvider : ISettlementProvider
                     ["settlement-id"] = settlementReference
                 };
 
-                var responseBody = await ExpressPayHttpClient.SendFormAsync(_httpClient, _logger, HttpMethod.Post, "settlement_transactions.php", form, ct, "ListSettlementTransactions").ConfigureAwait(false);
+                var responseBody = await ExpressPayHttpClient.SendFormAsync(_httpClient, Logger, HttpMethod.Post, "settlement_transactions.php", form, ct, "ListSettlementTransactions").ConfigureAwait(false);
                 var envelope = JsonSerializer.Deserialize<ExpressPayTransactionListResponse>(responseBody);
                 items = envelope?.Transactions;
                 activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);

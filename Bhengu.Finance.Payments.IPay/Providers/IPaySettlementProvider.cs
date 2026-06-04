@@ -7,6 +7,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models.Settlement;
 using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.IPay.Configuration;
@@ -23,24 +24,23 @@ namespace Bhengu.Finance.Payments.IPay.Providers;
 /// transactions are reachable via <c>settlements/{id}/transactions</c>.
 /// </para>
 /// </summary>
-public sealed class IPaySettlementProvider : ISettlementProvider
+public sealed class IPaySettlementProvider : BhenguProviderBase, ISettlementProvider
 {
     private readonly HttpClient _httpClient;
     private readonly IPayOptions _options;
-    private readonly ILogger<IPaySettlementProvider> _logger;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.IPay;
+    public override string ProviderName => ProviderNames.IPay;
 
     /// <summary>Construct the iPay settlement provider. Designed to be registered via DI.</summary>
     public IPaySettlementProvider(
         HttpClient httpClient,
         IOptions<IPayOptions> options,
         ILogger<IPaySettlementProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.VendorId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(IPayOptions.VendorId)} is required");
@@ -67,11 +67,11 @@ public sealed class IPaySettlementProvider : ISettlementProvider
             {
                 var hash = IPayCrypto.ComputeHmacHex($"{_options.VendorId}{fromUtc:yyyy-MM-dd}{toUtc:yyyy-MM-dd}", _options.HashKey);
                 var path = $"api/v3/settlements?vid={Uri.EscapeDataString(_options.VendorId)}&from={fromUtc:yyyy-MM-dd}&to={toUtc:yyyy-MM-dd}&hash={hash}";
-                var responseBody = await IPayHttpClient.SendGetAsync(_httpClient, _logger, path, ct, "ListSettlements").ConfigureAwait(false);
+                var responseBody = await IPayHttpClient.SendGetAsync(_httpClient, Logger, path, ct, "ListSettlements").ConfigureAwait(false);
                 var envelope = JsonSerializer.Deserialize<IPaySettlementListResponse>(responseBody);
                 items = envelope?.Data;
 
-                _logger.LogInformation("iPay settlements listed: {Count} between {From:O} and {To:O}", items?.Count ?? 0, fromUtc, toUtc);
+                Logger.LogInformation("iPay settlements listed: {Count} between {From:O} and {To:O}", items?.Count ?? 0, fromUtc, toUtc);
                 activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             }
             catch (Exception ex)
@@ -99,7 +99,7 @@ public sealed class IPaySettlementProvider : ISettlementProvider
         {
             var hash = IPayCrypto.ComputeHmacHex($"{_options.VendorId}{settlementReference}", _options.HashKey);
             var path = $"api/v3/settlements/{Uri.EscapeDataString(settlementReference)}?vid={Uri.EscapeDataString(_options.VendorId)}&hash={hash}";
-            var responseBody = await IPayHttpClient.SendGetAsync(_httpClient, _logger, path, ct, "GetSettlement").ConfigureAwait(false);
+            var responseBody = await IPayHttpClient.SendGetAsync(_httpClient, Logger, path, ct, "GetSettlement").ConfigureAwait(false);
             var envelope = JsonSerializer.Deserialize<IPaySettlementSingleResponse>(responseBody);
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             return envelope?.Data is null ? null : ToSettlement(envelope.Data);
@@ -128,7 +128,7 @@ public sealed class IPaySettlementProvider : ISettlementProvider
             {
                 var hash = IPayCrypto.ComputeHmacHex($"{_options.VendorId}{settlementReference}", _options.HashKey);
                 var path = $"api/v3/settlements/{Uri.EscapeDataString(settlementReference)}/transactions?vid={Uri.EscapeDataString(_options.VendorId)}&hash={hash}";
-                var responseBody = await IPayHttpClient.SendGetAsync(_httpClient, _logger, path, ct, "ListSettlementTransactions").ConfigureAwait(false);
+                var responseBody = await IPayHttpClient.SendGetAsync(_httpClient, Logger, path, ct, "ListSettlementTransactions").ConfigureAwait(false);
                 var envelope = JsonSerializer.Deserialize<IPayTransactionListResponse>(responseBody);
                 items = envelope?.Data;
                 activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);

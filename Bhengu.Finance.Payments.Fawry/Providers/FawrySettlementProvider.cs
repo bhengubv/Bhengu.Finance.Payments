@@ -8,6 +8,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models.Settlement;
 using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Fawry.Configuration;
@@ -23,31 +24,30 @@ namespace Bhengu.Finance.Payments.Fawry.Providers;
 /// daily batches; this provider exposes those batches plus per-transaction line items for
 /// reconciliation against the merchant's own ledger.
 /// </summary>
-public sealed class FawrySettlementProvider : ISettlementProvider
+public sealed class FawrySettlementProvider : BhenguProviderBase, ISettlementProvider
 {
     private readonly FawryHttpClient _http;
     private readonly FawryOptions _options;
-    private readonly ILogger<FawrySettlementProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Fawry;
+    public override string ProviderName => ProviderNames.Fawry;
 
     /// <summary>Construct a settlement provider. Designed to be registered via DI.</summary>
     public FawrySettlementProvider(
         HttpClient httpClient,
         IOptions<FawryOptions> options,
         ILogger<FawrySettlementProvider> logger)
+        : base(logger)
     {
         ArgumentNullException.ThrowIfNull(httpClient);
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.MerchantCode))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(FawryOptions.MerchantCode)} is required");
         if (string.IsNullOrWhiteSpace(_options.SecurityKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(FawryOptions.SecurityKey)} is required");
 
-        _http = new FawryHttpClient(httpClient, _options, _logger);
+        _http = new FawryHttpClient(httpClient, _options, Logger);
     }
 
     /// <inheritdoc />

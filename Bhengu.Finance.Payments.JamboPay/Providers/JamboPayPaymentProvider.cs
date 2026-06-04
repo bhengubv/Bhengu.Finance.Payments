@@ -11,6 +11,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Core.Observability;
@@ -26,18 +27,17 @@ namespace Bhengu.Finance.Payments.JamboPay.Providers;
 /// /oauth/token (client_credentials). Supports collections, refunds and payouts;
 /// webhook signature is HMAC-SHA256 (hex) over the raw body keyed by WebhookSecret.
 /// </summary>
-public sealed class JamboPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class JamboPayPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly JamboPayOptions _options;
-    private readonly ILogger<JamboPayPaymentProvider> _logger;
     private readonly IBhenguDistributedCache? _idempotencyCache;
     private string? _cachedToken;
     private DateTime _tokenExpiresAtUtc;
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.JamboPay;
+    public override string ProviderName => ProviderNames.JamboPay;
 
     /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
@@ -57,10 +57,10 @@ public sealed class JamboPayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         IOptions<JamboPayOptions> options,
         ILogger<JamboPayPaymentProvider> logger,
         IBhenguDistributedCache? idempotencyCache = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotencyCache = idempotencyCache;
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
@@ -116,7 +116,7 @@ public sealed class JamboPayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
             var responseBody = await SendAsync(HttpMethod.Post, "payments/initiate", body, ct, "ProcessPayment", request.IdempotencyKey).ConfigureAwait(false);
             var payment = JsonSerializer.Deserialize<JamboPayInitiateResponse>(responseBody);
 
-            _logger.LogInformation("JamboPay payment initiated: ref={Ref} status={Status} url={Url}",
+            Logger.LogInformation("JamboPay payment initiated: ref={Ref} status={Status} url={Url}",
                 request.PaymentMethodToken, payment?.Status, payment?.CheckoutUrl);
 
             var response = new PaymentResponse
@@ -186,7 +186,7 @@ public sealed class JamboPayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
             var responseBody = await SendAsync(HttpMethod.Post, "payments/refund", body, ct, "ProcessRefund", request.IdempotencyKey).ConfigureAwait(false);
             var refund = JsonSerializer.Deserialize<JamboPayRefundResponse>(responseBody);
 
-            _logger.LogInformation("JamboPay refund: id={Id} status={Status} for {Ref}",
+            Logger.LogInformation("JamboPay refund: id={Id} status={Status} for {Ref}",
                 refund?.RefundId, refund?.Status, request.GatewayReference);
 
             var response = new RefundResponse
@@ -264,7 +264,7 @@ public sealed class JamboPayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
             var responseBody = await SendAsync(HttpMethod.Post, "payouts/initiate", body, ct, "ProcessPayout", request.IdempotencyKey).ConfigureAwait(false);
             var payout = JsonSerializer.Deserialize<JamboPayPayoutResponse>(responseBody);
 
-            _logger.LogInformation("JamboPay payout initiated: id={Id} status={Status}", payout?.PayoutId, payout?.Status);
+            Logger.LogInformation("JamboPay payout initiated: id={Id} status={Status}", payout?.PayoutId, payout?.Status);
 
             var response = new PayoutResponse
             {
@@ -301,7 +301,7 @@ public sealed class JamboPayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
 
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
-            _logger.LogWarning("JamboPay WebhookSecret not configured — signature verification cannot succeed.");
+            Logger.LogWarning("JamboPay WebhookSecret not configured — signature verification cannot succeed.");
             BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
                 new KeyValuePair<string, object?>("provider", ProviderName),
                 new KeyValuePair<string, object?>("valid", false));
@@ -320,7 +320,7 @@ public sealed class JamboPayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "JamboPay webhook signature verification raised");
+            Logger.LogError(ex, "JamboPay webhook signature verification raised");
             valid = false;
         }
 
@@ -343,7 +343,7 @@ public sealed class JamboPayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
             if (evt is null || string.IsNullOrEmpty(evt.TransactionRef))
                 return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed JamboPay webhook event: {EventType}", evt.EventType);
+            Logger.LogInformation("Parsed JamboPay webhook event: {EventType}", evt.EventType);
 
             var eventLower = evt.EventType?.ToLowerInvariant();
             var currency = evt.Currency ?? _options.Currency;
@@ -436,7 +436,7 @@ public sealed class JamboPayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse JamboPay webhook event");
+            Logger.LogError(ex, "Failed to parse JamboPay webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -537,7 +537,7 @@ public sealed class JamboPayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("JamboPay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("JamboPay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

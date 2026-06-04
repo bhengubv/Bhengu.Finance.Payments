@@ -11,6 +11,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Core.Observability;
@@ -26,16 +27,15 @@ namespace Bhengu.Finance.Payments.EcoCash.Providers;
 /// Webhooks are POSTed to the configured <c>NotifyUrl</c>; the provider supplies no HMAC, so
 /// signature verification relies on the secret-URL convention and clientCorrelator matching.
 /// </summary>
-public sealed class EcoCashPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class EcoCashPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly EcoCashOptions _options;
-    private readonly ILogger<EcoCashPaymentProvider> _logger;
     private readonly IBhenguDistributedCache _cache;
     private static readonly TimeSpan s_idempotencyTtl = TimeSpan.FromHours(24);
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.EcoCash;
+    public override string ProviderName => ProviderNames.EcoCash;
 
     /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
@@ -54,10 +54,10 @@ public sealed class EcoCashPaymentProvider : IPaymentGatewayProvider, IPayoutPro
         IOptions<EcoCashOptions> options,
         ILogger<EcoCashPaymentProvider> logger,
         IBhenguDistributedCache? cache = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _cache = cache ?? new InMemoryBhenguDistributedCache();
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
@@ -107,7 +107,7 @@ public sealed class EcoCashPaymentProvider : IPaymentGatewayProvider, IPayoutPro
             var body = await SendAsync(HttpMethod.Post, "api/v2/payment/instant/c2b/live", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<EcoCashTransactionResponse>(body);
 
-            _logger.LogInformation("EcoCash C2B created: {Correlator} status={Status}",
+            Logger.LogInformation("EcoCash C2B created: {Correlator} status={Status}",
                 response?.ClientCorrelator ?? clientCorrelator, response?.TransactionOperationStatus);
 
             var status = MapStatus(response?.TransactionOperationStatus ?? "pending");
@@ -178,7 +178,7 @@ public sealed class EcoCashPaymentProvider : IPaymentGatewayProvider, IPayoutPro
             var body = await SendAsync(HttpMethod.Post, "api/v2/payment/instant/refund", requestBody, ct, "ProcessRefund").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<EcoCashTransactionResponse>(body);
 
-            _logger.LogInformation("EcoCash refund initiated: {Correlator} for {Original}",
+            Logger.LogInformation("EcoCash refund initiated: {Correlator} for {Original}",
                 clientCorrelator, request.GatewayReference);
 
             var status = MapStatus(response?.TransactionOperationStatus ?? "pending");
@@ -251,7 +251,7 @@ public sealed class EcoCashPaymentProvider : IPaymentGatewayProvider, IPayoutPro
             var body = await SendAsync(HttpMethod.Post, "api/v2/payment/instant/merchanttosubscriber", requestBody, ct, "ProcessPayout").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<EcoCashTransactionResponse>(body);
 
-            _logger.LogInformation("EcoCash B2C disbursement initiated: {Correlator} status={Status}",
+            Logger.LogInformation("EcoCash B2C disbursement initiated: {Correlator} status={Status}",
                 clientCorrelator, response?.TransactionOperationStatus);
 
             var status = MapStatus(response?.TransactionOperationStatus ?? "pending");
@@ -293,7 +293,7 @@ public sealed class EcoCashPaymentProvider : IPaymentGatewayProvider, IPayoutPro
         // secret URL (NotifyUrl) plus matching the clientCorrelator in the body against the value
         // sent on the original charge. Callers should perform that match in their webhook handler.
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        _logger.LogWarning("EcoCash does not sign callbacks — relying on NotifyUrl secrecy and clientCorrelator match instead.");
+        Logger.LogWarning("EcoCash does not sign callbacks — relying on NotifyUrl secrecy and clientCorrelator match instead.");
         return !string.IsNullOrEmpty(signature);
     }
 
@@ -312,14 +312,14 @@ public sealed class EcoCashPaymentProvider : IPaymentGatewayProvider, IPayoutPro
                 return Task.FromResult<WebhookEvent?>(null);
             }
 
-            _logger.LogInformation("Parsed EcoCash webhook: {Status}", response.TransactionOperationStatus);
+            Logger.LogInformation("Parsed EcoCash webhook: {Status}", response.TransactionOperationStatus);
             var typed = MapWebhookEvent(response);
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             return Task.FromResult(typed);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse EcoCash webhook event");
+            Logger.LogError(ex, "Failed to parse EcoCash webhook event");
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
             return Task.FromResult<WebhookEvent?>(null);
         }
@@ -487,7 +487,7 @@ public sealed class EcoCashPaymentProvider : IPaymentGatewayProvider, IPayoutPro
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("EcoCash {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("EcoCash {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

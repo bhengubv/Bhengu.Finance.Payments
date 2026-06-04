@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Core.Observability;
@@ -28,15 +29,14 @@ namespace Bhengu.Finance.Payments.IPay.Providers;
 /// and the merchant order id (oid) in <see cref="PaymentResponse.GatewayReference"/>.
 /// iPay v3 has no refund API — refunds throw a configuration-style exception.
 /// </summary>
-public sealed class IPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class IPayPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly IPayOptions _options;
-    private readonly ILogger<IPayPaymentProvider> _logger;
     private readonly IBhenguDistributedCache? _idempotencyCache;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.IPay;
+    public override string ProviderName => ProviderNames.IPay;
 
     /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
@@ -56,10 +56,10 @@ public sealed class IPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvid
         IOptions<IPayOptions> options,
         ILogger<IPayPaymentProvider> logger,
         IBhenguDistributedCache? idempotencyCache = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotencyCache = idempotencyCache;
 
         if (string.IsNullOrWhiteSpace(_options.VendorId))
@@ -123,7 +123,7 @@ public sealed class IPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvid
                 $"{WebUtility.UrlEncode(p.Key)}={WebUtility.UrlEncode(p.Value)}"));
             var redirectUrl = new Uri(_httpClient.BaseAddress!, "?" + qs).ToString();
 
-            _logger.LogInformation("iPay redirect built for oid={Oid} amount={Amount}", oid, ttl);
+            Logger.LogInformation("iPay redirect built for oid={Oid} amount={Amount}", oid, ttl);
 
             var response = new PaymentResponse
             {
@@ -206,10 +206,10 @@ public sealed class IPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvid
                 hash
             };
 
-            var responseBody = await IPayHttpClient.SendJsonAsync(_httpClient, _logger, HttpMethod.Post, "payments/v3/mpesab2c", body, ct, "ProcessPayout").ConfigureAwait(false);
+            var responseBody = await IPayHttpClient.SendJsonAsync(_httpClient, Logger, HttpMethod.Post, "payments/v3/mpesab2c", body, ct, "ProcessPayout").ConfigureAwait(false);
             var payout = JsonSerializer.Deserialize<IPayPayoutResponse>(responseBody);
 
-            _logger.LogInformation("iPay M-Pesa B2C payout: txn={Txn} status={Status}",
+            Logger.LogInformation("iPay M-Pesa B2C payout: txn={Txn} status={Status}",
                 payout?.TransactionId, payout?.Status);
 
             var status = payout?.Status?.ToLowerInvariant() switch
@@ -258,7 +258,7 @@ public sealed class IPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvid
         var dataToHash = string.Concat(phone, _options.VendorId, ttl, oid);
         var hash = IPayCrypto.ComputeHmacHex(dataToHash, _options.HashKey);
         var body = new { phone, vid = _options.VendorId, amount = ttl, oid, hash };
-        return await IPayHttpClient.SendJsonAsync(_httpClient, _logger, HttpMethod.Post, "api/sdk/v3/mpesa", body, ct, "ChargeMpesa").ConfigureAwait(false);
+        return await IPayHttpClient.SendJsonAsync(_httpClient, Logger, HttpMethod.Post, "api/sdk/v3/mpesa", body, ct, "ChargeMpesa").ConfigureAwait(false);
     }
 
     /// <inheritdoc/>
@@ -269,7 +269,7 @@ public sealed class IPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvid
 
         if (string.IsNullOrWhiteSpace(_options.HashKey))
         {
-            _logger.LogWarning("iPay HashKey not configured — webhook verification cannot proceed.");
+            Logger.LogWarning("iPay HashKey not configured — webhook verification cannot proceed.");
             BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
                 new KeyValuePair<string, object?>("provider", ProviderName),
                 new KeyValuePair<string, object?>("valid", false));
@@ -289,7 +289,7 @@ public sealed class IPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvid
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "iPay webhook signature verification raised");
+            Logger.LogError(ex, "iPay webhook signature verification raised");
             valid = false;
         }
 
@@ -399,7 +399,7 @@ public sealed class IPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvid
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse iPay callback");
+            Logger.LogError(ex, "Failed to parse iPay callback");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }

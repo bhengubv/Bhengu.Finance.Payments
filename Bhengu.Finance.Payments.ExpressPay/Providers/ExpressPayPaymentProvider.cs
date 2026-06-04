@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Core.Observability;
@@ -27,15 +28,14 @@ namespace Bhengu.Finance.Payments.ExpressPay.Providers;
 /// equality check between the supplied signature and the configured ApiKey, requiring
 /// the caller to forward the api-key in a trusted reverse-proxy header.
 /// </summary>
-public sealed class ExpressPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class ExpressPayPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly ExpressPayOptions _options;
-    private readonly ILogger<ExpressPayPaymentProvider> _logger;
     private readonly IBhenguDistributedCache? _idempotencyCache;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.ExpressPay;
+    public override string ProviderName => ProviderNames.ExpressPay;
 
     /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
@@ -55,10 +55,10 @@ public sealed class ExpressPayPaymentProvider : IPaymentGatewayProvider, IPayout
         IOptions<ExpressPayOptions> options,
         ILogger<ExpressPayPaymentProvider> logger,
         IBhenguDistributedCache? idempotencyCache = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotencyCache = idempotencyCache;
 
         if (string.IsNullOrWhiteSpace(_options.MerchantId))
@@ -109,10 +109,10 @@ public sealed class ExpressPayPaymentProvider : IPaymentGatewayProvider, IPayout
                 ["lastname"] = request.Metadata?.GetValueOrDefault("lastname") ?? ""
             };
 
-            var responseBody = await ExpressPayHttpClient.SendFormAsync(_httpClient, _logger, HttpMethod.Post, "submit.php", form, ct, "ProcessPayment").ConfigureAwait(false);
+            var responseBody = await ExpressPayHttpClient.SendFormAsync(_httpClient, Logger, HttpMethod.Post, "submit.php", form, ct, "ProcessPayment").ConfigureAwait(false);
             var submit = JsonSerializer.Deserialize<ExpressPaySubmitResponse>(responseBody);
 
-            _logger.LogInformation("ExpressPay submit: status={Status} token={Token} url={Url}",
+            Logger.LogInformation("ExpressPay submit: status={Status} token={Token} url={Url}",
                 submit?.Status, submit?.Token, submit?.PaymentUrl);
 
             var response = new PaymentResponse
@@ -204,10 +204,10 @@ public sealed class ExpressPayPaymentProvider : IPaymentGatewayProvider, IPayout
                 ["batch-reference"] = batchRef
             };
 
-            var responseBody = await ExpressPayHttpClient.SendFormAsync(_httpClient, _logger, HttpMethod.Post, "payout.php", form, ct, "ProcessPayout").ConfigureAwait(false);
+            var responseBody = await ExpressPayHttpClient.SendFormAsync(_httpClient, Logger, HttpMethod.Post, "payout.php", form, ct, "ProcessPayout").ConfigureAwait(false);
             var payout = JsonSerializer.Deserialize<ExpressPayPayoutResponse>(responseBody);
 
-            _logger.LogInformation("ExpressPay payout: status={Status} txn={Txn} ref={Ref}",
+            Logger.LogInformation("ExpressPay payout: status={Status} txn={Txn} ref={Ref}",
                 payout?.Status, payout?.TransactionId, batchRef);
 
             var status = payout?.Status switch
@@ -259,7 +259,7 @@ public sealed class ExpressPayPaymentProvider : IPaymentGatewayProvider, IPayout
             ["api-key"] = _options.ApiKey,
             ["token"] = token
         };
-        return await ExpressPayHttpClient.SendFormAsync(_httpClient, _logger, HttpMethod.Post, "query.php", form, ct, "QueryStatus").ConfigureAwait(false);
+        return await ExpressPayHttpClient.SendFormAsync(_httpClient, Logger, HttpMethod.Post, "query.php", form, ct, "QueryStatus").ConfigureAwait(false);
     }
 
     /// <inheritdoc/>
@@ -270,7 +270,7 @@ public sealed class ExpressPayPaymentProvider : IPaymentGatewayProvider, IPayout
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
         {
-            _logger.LogWarning("ExpressPay ApiKey not configured — webhook verification cannot succeed.");
+            Logger.LogWarning("ExpressPay ApiKey not configured — webhook verification cannot succeed.");
             BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
                 new KeyValuePair<string, object?>("provider", ProviderName),
                 new KeyValuePair<string, object?>("valid", false));
@@ -387,7 +387,7 @@ public sealed class ExpressPayPaymentProvider : IPaymentGatewayProvider, IPayout
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse ExpressPay callback");
+            Logger.LogError(ex, "Failed to parse ExpressPay callback");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }

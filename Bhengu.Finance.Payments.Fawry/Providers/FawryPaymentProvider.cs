@@ -9,6 +9,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Core.Observability;
@@ -25,18 +26,17 @@ namespace Bhengu.Finance.Payments.Fawry.Providers;
 /// is intentionally not implemented. Merchants requiring disbursements must use
 /// the Fawry Disbursement product (separate contract + API).
 /// </summary>
-public sealed class FawryPaymentProvider : IPaymentGatewayProvider
+public sealed class FawryPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider
 {
     private const string LiveDefaultUrl = "https://atfawry.fawrystaging.com/ECommerceWeb/api/";
     private const string SandboxDefaultUrl = "https://atfawry.fawrystaging.com/ECommerceWeb/api/";
 
     private readonly HttpClient _httpClient;
     private readonly FawryOptions _options;
-    private readonly ILogger<FawryPaymentProvider> _logger;
     private readonly FawryIdempotencyCache? _idempotency;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Fawry;
+    public override string ProviderName => ProviderNames.Fawry;
 
     /// <inheritdoc />
     public ProviderCapabilities Capabilities =>
@@ -57,10 +57,10 @@ public sealed class FawryPaymentProvider : IPaymentGatewayProvider
         IOptions<FawryOptions> options,
         ILogger<FawryPaymentProvider> logger,
         FawryIdempotencyCache? idempotency = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotency = idempotency;
 
         if (string.IsNullOrWhiteSpace(_options.MerchantCode))
@@ -127,7 +127,7 @@ public sealed class FawryPaymentProvider : IPaymentGatewayProvider
             var body = await SendAsync(HttpMethod.Post, "payments/charge", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
             var fawryResponse = JsonSerializer.Deserialize<FawryChargeResponse>(body);
 
-            _logger.LogInformation("Fawry charge created: ref={Ref} status={Status} code={Code}",
+            Logger.LogInformation("Fawry charge created: ref={Ref} status={Status} code={Code}",
                 fawryResponse?.ReferenceNumber, fawryResponse?.OrderStatus, fawryResponse?.StatusCode);
 
             var gatewayRef = fawryResponse?.ReferenceNumber
@@ -196,7 +196,7 @@ public sealed class FawryPaymentProvider : IPaymentGatewayProvider
             var body = await SendAsync(HttpMethod.Post, "payments/refund", requestBody, ct, "ProcessRefund").ConfigureAwait(false);
             var refundResponse = JsonSerializer.Deserialize<FawryRefundResponse>(body);
 
-            _logger.LogInformation("Fawry refund created for ref={Ref} status={Status}",
+            Logger.LogInformation("Fawry refund created for ref={Ref} status={Status}",
                 request.GatewayReference, refundResponse?.StatusCode);
 
             var status = MapRefundStatus(refundResponse?.StatusCode);
@@ -238,7 +238,7 @@ public sealed class FawryPaymentProvider : IPaymentGatewayProvider
         {
             if (string.IsNullOrWhiteSpace(_options.SecurityKey))
             {
-                _logger.LogWarning("Fawry SecurityKey not configured — webhook signature verification cannot succeed.");
+                Logger.LogWarning("Fawry SecurityKey not configured — webhook signature verification cannot succeed.");
                 return false;
             }
 
@@ -257,7 +257,7 @@ public sealed class FawryPaymentProvider : IPaymentGatewayProvider
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Fawry webhook signature verification raised");
+            Logger.LogError(ex, "Fawry webhook signature verification raised");
             return false;
         }
         finally
@@ -279,14 +279,14 @@ public sealed class FawryPaymentProvider : IPaymentGatewayProvider
             var notification = JsonSerializer.Deserialize<FawryNotification>(payload);
             if (notification is null) return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed Fawry notification: status={Status} ref={Ref}",
+            Logger.LogInformation("Parsed Fawry notification: status={Status} ref={Ref}",
                 notification.OrderStatus, notification.FawryRefNumber);
 
             return Task.FromResult(MapWebhookEvent(notification));
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse Fawry notification");
+            Logger.LogError(ex, "Failed to parse Fawry notification");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -415,7 +415,7 @@ public sealed class FawryPaymentProvider : IPaymentGatewayProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Fawry {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Fawry {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
