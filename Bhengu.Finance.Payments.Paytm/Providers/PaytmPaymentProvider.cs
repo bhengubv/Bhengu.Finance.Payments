@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Core.Observability;
@@ -32,18 +33,17 @@ namespace Bhengu.Finance.Payments.Paytm.Providers;
 /// "signature". Production merchants needing strict Paytm-compatible checksum handling should swap in
 /// the official PaytmChecksum helper by wrapping this provider — the rest of the SDK contract is unchanged.
 /// </remarks>
-public sealed class PaytmPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class PaytmPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private static readonly JsonSerializerOptions DeserializeOptions = new() { PropertyNameCaseInsensitive = true };
     private static readonly JsonSerializerOptions SerializeOptions = new() { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
 
     private readonly HttpClient _httpClient;
     private readonly PaytmOptions _options;
-    private readonly ILogger<PaytmPaymentProvider> _logger;
     private readonly PaytmIdempotencyCache _idempotencyCache;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Paytm;
+    public override string ProviderName => ProviderNames.Paytm;
 
     /// <inheritdoc />
     public ProviderCapabilities Capabilities =>
@@ -69,10 +69,10 @@ public sealed class PaytmPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
         IOptions<PaytmOptions> options,
         ILogger<PaytmPaymentProvider> logger,
         IBhenguDistributedCache? cache = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotencyCache = new PaytmIdempotencyCache(cache ?? new InMemoryBhenguDistributedCache());
 
         if (string.IsNullOrWhiteSpace(_options.MerchantId))
@@ -148,7 +148,7 @@ public sealed class PaytmPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
         var txnToken = resp?.Body?.TxnToken;
         var resultStatus = resp?.Body?.ResultInfo?.ResultStatus;
 
-        _logger.LogInformation("Paytm initiateTransaction: orderId={OrderId} status={Status}", orderId, resultStatus);
+        Logger.LogInformation("Paytm initiateTransaction: orderId={OrderId} status={Status}", orderId, resultStatus);
 
         var baseUrl = _options.UseSandbox
             ? (_options.SandboxUrl ?? "https://securegw-stage.paytm.in")
@@ -226,7 +226,7 @@ public sealed class PaytmPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
         var raw = await SendAsync(HttpMethod.Post, "refund/apply", envelope, ct, "ProcessRefund").ConfigureAwait(false);
         var resp = JsonSerializer.Deserialize<PaytmRefundResponse>(raw, DeserializeOptions);
 
-        _logger.LogInformation("Paytm refund: orderId={OrderId} refId={RefId} status={Status}",
+        Logger.LogInformation("Paytm refund: orderId={OrderId} refId={RefId} status={Status}",
             request.GatewayReference, refId, resp?.Body?.ResultInfo?.ResultStatus);
 
         return new RefundResponse
@@ -285,7 +285,7 @@ public sealed class PaytmPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
         var raw = await SendAsync(HttpMethod.Post, "disburse/v1/order/wallet", envelope, ct, "ProcessPayout").ConfigureAwait(false);
         var resp = JsonSerializer.Deserialize<PaytmPayoutResponse>(raw, DeserializeOptions);
 
-        _logger.LogInformation("Paytm payout: orderId={OrderId} status={Status}", orderId, resp?.Body?.ResultInfo?.ResultStatus);
+        Logger.LogInformation("Paytm payout: orderId={OrderId} status={Status}", orderId, resp?.Body?.ResultInfo?.ResultStatus);
 
         return new PayoutResponse
         {
@@ -305,7 +305,7 @@ public sealed class PaytmPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
 
         if (string.IsNullOrWhiteSpace(_options.MerchantKey))
         {
-            _logger.LogWarning("Paytm MerchantKey not configured — signature verification cannot succeed.");
+            Logger.LogWarning("Paytm MerchantKey not configured — signature verification cannot succeed.");
             BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
                 new KeyValuePair<string, object?>("provider", ProviderName),
                 new KeyValuePair<string, object?>("valid", false));
@@ -325,7 +325,7 @@ public sealed class PaytmPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Paytm webhook signature verification raised");
+            Logger.LogError(ex, "Paytm webhook signature verification raised");
             return false;
         }
     }
@@ -360,7 +360,7 @@ public sealed class PaytmPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
             var failureMessage = ReadStringProperty(root, "RESPMSG") ?? ReadStringProperty(root, "respMsg");
             var currency = ReadStringProperty(root, "CURRENCY") ?? ReadStringProperty(root, "currency") ?? _options.Currency;
 
-            _logger.LogInformation("Parsed Paytm webhook: orderId={OrderId} status={Status}", orderId, status);
+            Logger.LogInformation("Parsed Paytm webhook: orderId={OrderId} status={Status}", orderId, status);
 
             if (string.IsNullOrEmpty(orderId))
                 return Task.FromResult<WebhookEvent?>(null);
@@ -425,7 +425,7 @@ public sealed class PaytmPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse Paytm webhook event");
+            Logger.LogError(ex, "Failed to parse Paytm webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -466,7 +466,7 @@ public sealed class PaytmPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Paytm {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Paytm {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

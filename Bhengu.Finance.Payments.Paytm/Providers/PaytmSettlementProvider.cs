@@ -10,6 +10,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models.Settlement;
 using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Paytm.Configuration;
@@ -23,27 +24,26 @@ namespace Bhengu.Finance.Payments.Paytm.Providers;
 /// <c>settlement/getSettlement</c>, and <c>settlement/getSettlementBreakup</c> endpoints
 /// for daily settlement reconciliation.
 /// </summary>
-public sealed class PaytmSettlementProvider : ISettlementProvider
+public sealed class PaytmSettlementProvider : BhenguProviderBase, ISettlementProvider
 {
     private static readonly JsonSerializerOptions DeserializeOptions = new() { PropertyNameCaseInsensitive = true };
     private static readonly JsonSerializerOptions SerializeOptions = new() { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
 
     private readonly HttpClient _httpClient;
     private readonly PaytmOptions _options;
-    private readonly ILogger<PaytmSettlementProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Paytm;
+    public override string ProviderName => ProviderNames.Paytm;
 
     /// <summary>Create a new Paytm settlement provider.</summary>
     public PaytmSettlementProvider(
         HttpClient httpClient,
         IOptions<PaytmOptions> options,
         ILogger<PaytmSettlementProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.MerchantId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PaytmOptions.MerchantId)} is required");
@@ -79,7 +79,7 @@ public sealed class PaytmSettlementProvider : ISettlementProvider
                 var response = JsonSerializer.Deserialize<PaytmSettlementListEnvelope>(raw, DeserializeOptions);
                 items = response?.Body?.Settlements;
 
-                _logger.LogInformation("Paytm listed {Count} settlements between {From:o} and {To:o}", items?.Count ?? 0, fromUtc, toUtc);
+                Logger.LogInformation("Paytm listed {Count} settlements between {From:o} and {To:o}", items?.Count ?? 0, fromUtc, toUtc);
                 activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             }
             catch
@@ -218,7 +218,7 @@ public sealed class PaytmSettlementProvider : ISettlementProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Paytm {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Paytm {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

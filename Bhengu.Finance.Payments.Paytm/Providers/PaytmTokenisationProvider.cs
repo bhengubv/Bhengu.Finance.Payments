@@ -10,6 +10,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models.Vault;
 using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Paytm.Configuration;
@@ -30,7 +31,7 @@ namespace Bhengu.Finance.Payments.Paytm.Providers;
 /// Paytm's vault list endpoint is per-customer; we cache the customer↔tokens mapping locally so
 /// <see cref="ListPaymentMethodsAsync"/> stays consistent across deletions.
 /// </remarks>
-public sealed class PaytmTokenisationProvider : ITokenisationProvider
+public sealed class PaytmTokenisationProvider : BhenguProviderBase, ITokenisationProvider
 {
     internal static readonly JsonSerializerOptions DeserializeOptions = new() { PropertyNameCaseInsensitive = true };
     internal static readonly JsonSerializerOptions SerializeOptions = new() { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
@@ -38,20 +39,19 @@ public sealed class PaytmTokenisationProvider : ITokenisationProvider
 
     private readonly HttpClient _httpClient;
     private readonly PaytmOptions _options;
-    private readonly ILogger<PaytmTokenisationProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Paytm;
+    public override string ProviderName => ProviderNames.Paytm;
 
     /// <summary>Create a new Paytm tokenisation provider.</summary>
     public PaytmTokenisationProvider(
         HttpClient httpClient,
         IOptions<PaytmOptions> options,
         ILogger<PaytmTokenisationProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.MerchantId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PaytmOptions.MerchantId)} is required");
@@ -102,7 +102,7 @@ public sealed class PaytmTokenisationProvider : ITokenisationProvider
 
             try
             {
-                await PaytmHttp.SendAsync(_httpClient, _logger, ProviderName, HttpMethod.Post, "theia/api/v2/vault/deleteCard", envelope, ct, "DeleteCard").ConfigureAwait(false);
+                await PaytmHttp.SendAsync(_httpClient, Logger, ProviderName, HttpMethod.Post, "theia/api/v2/vault/deleteCard", envelope, ct, "DeleteCard").ConfigureAwait(false);
             }
             catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
             {
@@ -191,24 +191,23 @@ internal static class PaytmHttp
 /// PCI-DSS SAQ-D-scope Paytm raw-card tokenisation. Sends raw PAN to Paytm's
 /// <c>theia/api/v2/vault/tokeniseCard</c> endpoint and returns the resulting card token.
 /// </summary>
-public sealed class PaytmRawCardTokenisationProvider : IRawCardTokenisationProvider
+public sealed class PaytmRawCardTokenisationProvider : BhenguProviderBase, IRawCardTokenisationProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PaytmOptions _options;
-    private readonly ILogger<PaytmRawCardTokenisationProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Paytm;
+    public override string ProviderName => ProviderNames.Paytm;
 
     /// <summary>Create a new Paytm raw-card tokenisation provider.</summary>
     public PaytmRawCardTokenisationProvider(
         HttpClient httpClient,
         IOptions<PaytmOptions> options,
         ILogger<PaytmRawCardTokenisationProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.MerchantId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PaytmOptions.MerchantId)} is required");
@@ -248,10 +247,10 @@ public sealed class PaytmRawCardTokenisationProvider : IRawCardTokenisationProvi
 
             var envelope = new { body = bodyPayload, head = new { signature } };
 
-            var raw = await PaytmHttp.SendAsync(_httpClient, _logger, ProviderName, HttpMethod.Post, "theia/api/v2/vault/tokeniseCard", envelope, ct, "TokeniseCard").ConfigureAwait(false);
+            var raw = await PaytmHttp.SendAsync(_httpClient, Logger, ProviderName, HttpMethod.Post, "theia/api/v2/vault/tokeniseCard", envelope, ct, "TokeniseCard").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<PaytmTokenisationProvider.PaytmVaultEnvelope<PaytmTokenisationProvider.PaytmVaultTokenBody>>(raw, PaytmTokenisationProvider.DeserializeOptions);
 
-            _logger.LogInformation("Paytm card vaulted: token={Token} status={Status}",
+            Logger.LogInformation("Paytm card vaulted: token={Token} status={Status}",
                 response?.Body?.CardToken, response?.Body?.ResultInfo?.ResultStatus);
 
             if (response?.Body?.ResultInfo?.ResultStatus is "F" or "FAILURE")

@@ -9,6 +9,7 @@ using System.Text;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.ThreeDSecure;
 using Bhengu.Finance.Payments.Core.Observability;
@@ -29,28 +30,27 @@ namespace Bhengu.Finance.Payments.UnionPay.Providers;
 /// SHA-256(canonical) → RSA-SHA256 → base64. Querying a 3DS authentication state uses
 /// <c>queryTrans.do</c> with the same merId + orderId + txnTime triple.
 /// </remarks>
-public sealed class UnionPayThreeDSecureProvider : IThreeDSecureProvider
+public sealed class UnionPayThreeDSecureProvider : BhenguProviderBase, IThreeDSecureProvider
 {
     private const string FrontTransPath = "/gateway/api/frontTransReq.do";
     private const string QueryPath = "/gateway/api/queryTrans.do";
 
     private readonly HttpClient _httpClient;
     private readonly UnionPayOptions _options;
-    private readonly ILogger<UnionPayThreeDSecureProvider> _logger;
     private readonly string _baseUrl;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.UnionPay;
+    public override string ProviderName => ProviderNames.UnionPay;
 
     /// <summary>Create a new UnionPay 3DS provider.</summary>
     public UnionPayThreeDSecureProvider(
         HttpClient httpClient,
         IOptions<UnionPayOptions> options,
         ILogger<UnionPayThreeDSecureProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.MerId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(UnionPayOptions.MerId)} is required");
@@ -106,7 +106,7 @@ public sealed class UnionPayThreeDSecureProvider : IThreeDSecureProvider
             var actionUrl = _baseUrl + FrontTransPath;
             var body = BuildFormBody(fields);
 
-            _logger.LogInformation("UnionPay UPOP 3DS challenge prepared: orderId={OrderId}", orderId);
+            Logger.LogInformation("UnionPay UPOP 3DS challenge prepared: orderId={OrderId}", orderId);
 
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
 
@@ -159,7 +159,7 @@ public sealed class UnionPayThreeDSecureProvider : IThreeDSecureProvider
             var cavv = responseFields.GetValueOrDefault("cavv") ?? responseFields.GetValueOrDefault("xid");
             var dsTransactionId = responseFields.GetValueOrDefault("dsTransactionId");
 
-            _logger.LogInformation("UnionPay 3DS challenge query: respCode={RespCode} origRespCode={OrigRespCode} eci={Eci}",
+            Logger.LogInformation("UnionPay 3DS challenge query: respCode={RespCode} origRespCode={OrigRespCode} eci={Eci}",
                 respCode, origRespCode, eci);
 
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
@@ -217,7 +217,7 @@ public sealed class UnionPayThreeDSecureProvider : IThreeDSecureProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("UnionPay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("UnionPay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

@@ -9,6 +9,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Core.Observability;
@@ -25,7 +26,7 @@ namespace Bhengu.Finance.Payments.Remita.Providers;
 /// Single Send Money payouts. Authentication uses SHA-512 hex hashes of concatenated
 /// fields with the configured API key — Remita does NOT use bearer tokens for these endpoints.
 /// </summary>
-public sealed class RemitaPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class RemitaPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private const string PaymentInitPath =
         "remita/exapp/api/v1/send/api/echannelsvc/merchant/api/paymentinit";
@@ -37,11 +38,10 @@ public sealed class RemitaPaymentProvider : IPaymentGatewayProvider, IPayoutProv
 
     private readonly HttpClient _httpClient;
     private readonly RemitaOptions _options;
-    private readonly ILogger<RemitaPaymentProvider> _logger;
     private readonly RemitaIdempotencyCache? _idempotency;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Remita;
+    public override string ProviderName => ProviderNames.Remita;
 
     /// <inheritdoc />
     public ProviderCapabilities Capabilities =>
@@ -62,10 +62,10 @@ public sealed class RemitaPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         IOptions<RemitaOptions> options,
         ILogger<RemitaPaymentProvider> logger,
         RemitaIdempotencyCache? idempotency = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotency = idempotency;
 
         if (string.IsNullOrWhiteSpace(_options.MerchantId))
@@ -127,7 +127,7 @@ public sealed class RemitaPaymentProvider : IPaymentGatewayProvider, IPayoutProv
 
             var remitaResponse = JsonSerializer.Deserialize<RemitaPaymentInitResponse>(body);
 
-            _logger.LogInformation("Remita payment init: orderId={OrderId} rrr={Rrr} statusCode={StatusCode}",
+            Logger.LogInformation("Remita payment init: orderId={OrderId} rrr={Rrr} statusCode={StatusCode}",
                 orderId, remitaResponse?.Rrr, remitaResponse?.StatusCode);
 
             var status = MapStatusCode(remitaResponse?.StatusCode);
@@ -195,7 +195,7 @@ public sealed class RemitaPaymentProvider : IPaymentGatewayProvider, IPayoutProv
 
             var refundResponse = JsonSerializer.Deserialize<RemitaRefundResponse>(body);
 
-            _logger.LogInformation("Remita refund initiated: refundRef={RefundRef} rrr={Rrr}",
+            Logger.LogInformation("Remita refund initiated: refundRef={RefundRef} rrr={Rrr}",
                 refundResponse?.RefundReference, request.GatewayReference);
 
             var status = MapStatusCode(refundResponse?.StatusCode);
@@ -279,7 +279,7 @@ public sealed class RemitaPaymentProvider : IPaymentGatewayProvider, IPayoutProv
 
             var payoutResponse = JsonSerializer.Deserialize<RemitaSendMoneyResponse>(body);
 
-            _logger.LogInformation("Remita Single Send Money queued: transRef={TransRef} statusCode={StatusCode}",
+            Logger.LogInformation("Remita Single Send Money queued: transRef={TransRef} statusCode={StatusCode}",
                 transRef, payoutResponse?.StatusCode);
 
             var status = MapStatusCode(payoutResponse?.StatusCode);
@@ -326,7 +326,7 @@ public sealed class RemitaPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         {
             if (string.IsNullOrWhiteSpace(_options.ApiKey))
             {
-                _logger.LogWarning("Remita ApiKey not configured — signature verification cannot succeed.");
+                Logger.LogWarning("Remita ApiKey not configured — signature verification cannot succeed.");
                 return false;
             }
 
@@ -342,7 +342,7 @@ public sealed class RemitaPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Remita webhook signature verification raised");
+            Logger.LogError(ex, "Remita webhook signature verification raised");
             return false;
         }
         finally
@@ -364,14 +364,14 @@ public sealed class RemitaPaymentProvider : IPaymentGatewayProvider, IPayoutProv
             var callback = JsonSerializer.Deserialize<RemitaWebhookEvent>(payload, s_caseInsensitive);
             if (callback is null) return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed Remita webhook: rrr={Rrr} status={Status} type={Type}",
+            Logger.LogInformation("Parsed Remita webhook: rrr={Rrr} status={Status} type={Type}",
                 callback.Rrr, callback.Status, callback.NotificationType);
 
             return Task.FromResult(MapWebhookEvent(callback));
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse Remita webhook event");
+            Logger.LogError(ex, "Failed to parse Remita webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -554,7 +554,7 @@ public sealed class RemitaPaymentProvider : IPaymentGatewayProvider, IPayoutProv
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Remita {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Remita {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

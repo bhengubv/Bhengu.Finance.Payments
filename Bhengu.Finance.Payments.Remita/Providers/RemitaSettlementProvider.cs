@@ -7,6 +7,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models.Settlement;
 using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Remita.Configuration;
@@ -21,7 +22,7 @@ namespace Bhengu.Finance.Payments.Remita.Providers;
 /// settlement reporting endpoint. Returns daily batches the platform credited to the merchant's
 /// nominated collection account, with line-item drill-down.
 /// </summary>
-public sealed class RemitaSettlementProvider : ISettlementProvider
+public sealed class RemitaSettlementProvider : BhenguProviderBase, ISettlementProvider
 {
     private const string SettlementListPath = "remita/exapp/api/v1/send/api/echannelsvc/echannel/settlement/list";
     private const string SettlementDetailPath = "remita/exapp/api/v1/send/api/echannelsvc/echannel/settlement/detail";
@@ -29,27 +30,26 @@ public sealed class RemitaSettlementProvider : ISettlementProvider
 
     private readonly RemitaHttpClient _http;
     private readonly RemitaOptions _options;
-    private readonly ILogger<RemitaSettlementProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Remita;
+    public override string ProviderName => ProviderNames.Remita;
 
     /// <summary>Construct a settlement provider. Designed to be registered via DI.</summary>
     public RemitaSettlementProvider(
         HttpClient httpClient,
         IOptions<RemitaOptions> options,
         ILogger<RemitaSettlementProvider> logger)
+        : base(logger)
     {
         ArgumentNullException.ThrowIfNull(httpClient);
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.MerchantId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(RemitaOptions.MerchantId)} is required");
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(RemitaOptions.ApiKey)} is required");
 
-        _http = new RemitaHttpClient(httpClient, _options, _logger);
+        _http = new RemitaHttpClient(httpClient, _options, Logger);
     }
 
     /// <inheritdoc />

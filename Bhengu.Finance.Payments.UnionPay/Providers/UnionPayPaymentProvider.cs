@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Core.Observability;
@@ -27,7 +28,7 @@ namespace Bhengu.Finance.Payments.UnionPay.Providers;
 /// back-notify verification use the same RSA-SHA256 form-signing scheme.
 /// UnionPay does not expose a standard payout API; <see cref="IPayoutProvider"/> is not implemented.
 /// </summary>
-public sealed class UnionPayPaymentProvider : IPaymentGatewayProvider
+public sealed class UnionPayPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider
 {
     private const string FrontTransPath = "/gateway/api/frontTransReq.do";
     private const string QueryPath = "/gateway/api/queryTrans.do";
@@ -35,12 +36,11 @@ public sealed class UnionPayPaymentProvider : IPaymentGatewayProvider
 
     private readonly HttpClient _httpClient;
     private readonly UnionPayOptions _options;
-    private readonly ILogger<UnionPayPaymentProvider> _logger;
     private readonly UnionPayIdempotencyCache _idempotencyCache;
     private readonly string _baseUrl;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.UnionPay;
+    public override string ProviderName => ProviderNames.UnionPay;
 
     /// <inheritdoc />
     public ProviderCapabilities Capabilities =>
@@ -63,10 +63,10 @@ public sealed class UnionPayPaymentProvider : IPaymentGatewayProvider
         IOptions<UnionPayOptions> options,
         ILogger<UnionPayPaymentProvider> logger,
         IBhenguDistributedCache? cache = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotencyCache = new UnionPayIdempotencyCache(cache ?? new InMemoryBhenguDistributedCache());
 
         if (string.IsNullOrWhiteSpace(_options.MerId))
@@ -123,7 +123,7 @@ public sealed class UnionPayPaymentProvider : IPaymentGatewayProvider
                 var actionUrl = _baseUrl + FrontTransPath;
                 var body = BuildFormBody(fields);
 
-                _logger.LogInformation("UnionPay frontTransReq prepared: orderId={OrderId} txnAmt={TxnAmt}", orderId, txnAmt);
+                Logger.LogInformation("UnionPay frontTransReq prepared: orderId={OrderId} txnAmt={TxnAmt}", orderId, txnAmt);
 
                 activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Pending);
                 BhenguPaymentDiagnostics.ChargesTotal.Add(1,
@@ -187,7 +187,7 @@ public sealed class UnionPayPaymentProvider : IPaymentGatewayProvider
                 var respCode = responseFields.GetValueOrDefault("respCode", "??");
                 var queryId = responseFields.GetValueOrDefault("queryId", orderId);
 
-                _logger.LogInformation("UnionPay refund response: respCode={RespCode} queryId={QueryId}", respCode, queryId);
+                Logger.LogInformation("UnionPay refund response: respCode={RespCode} queryId={QueryId}", respCode, queryId);
 
                 var status = MapRespCode(respCode, refundContext: true);
                 activity.SetOutcome(status == PaymentStatus.Refunded ? BhenguPaymentDiagnostics.Outcomes.Success : BhenguPaymentDiagnostics.Outcomes.Pending);
@@ -220,7 +220,7 @@ public sealed class UnionPayPaymentProvider : IPaymentGatewayProvider
 
         if (string.IsNullOrWhiteSpace(_options.VerifyCertPublicKey))
         {
-            _logger.LogWarning("UnionPay VerifyCertPublicKey not configured — webhook signature verification cannot succeed.");
+            Logger.LogWarning("UnionPay VerifyCertPublicKey not configured — webhook signature verification cannot succeed.");
             BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
                 new KeyValuePair<string, object?>("provider", ProviderName),
                 new KeyValuePair<string, object?>("valid", false));
@@ -248,7 +248,7 @@ public sealed class UnionPayPaymentProvider : IPaymentGatewayProvider
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "UnionPay webhook signature verification raised");
+            Logger.LogError(ex, "UnionPay webhook signature verification raised");
             return false;
         }
     }
@@ -287,7 +287,7 @@ public sealed class UnionPayPaymentProvider : IPaymentGatewayProvider
             if (string.IsNullOrEmpty(reference) || string.IsNullOrEmpty(respCode))
                 return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed UnionPay back-notify: txnType={TxnType} respCode={RespCode}", txnType, respCode);
+            Logger.LogInformation("Parsed UnionPay back-notify: txnType={TxnType} respCode={RespCode}", txnType, respCode);
 
             var amount = long.TryParse(txnAmt, NumberStyles.Integer, CultureInfo.InvariantCulture, out var minor)
                 ? minor / 100m
@@ -365,7 +365,7 @@ public sealed class UnionPayPaymentProvider : IPaymentGatewayProvider
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse UnionPay back-notify");
+            Logger.LogError(ex, "Failed to parse UnionPay back-notify");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -401,7 +401,7 @@ public sealed class UnionPayPaymentProvider : IPaymentGatewayProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("UnionPay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("UnionPay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

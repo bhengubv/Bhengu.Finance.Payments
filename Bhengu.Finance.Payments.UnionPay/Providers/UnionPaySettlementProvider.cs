@@ -9,6 +9,7 @@ using System.Text;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models.Settlement;
 using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.UnionPay.Configuration;
@@ -28,28 +29,27 @@ namespace Bhengu.Finance.Payments.UnionPay.Providers;
 /// <see cref="ISettlementProvider"/> shape — production deployments typically pair this with
 /// scheduled cron jobs that pull the previous day's file and reconcile against their ledger.
 /// </remarks>
-public sealed class UnionPaySettlementProvider : ISettlementProvider
+public sealed class UnionPaySettlementProvider : BhenguProviderBase, ISettlementProvider
 {
     private const string FileTransferPath = "/gateway/api/fileTransfer.do";
     private const string QueryPath = "/gateway/api/queryTrans.do";
 
     private readonly HttpClient _httpClient;
     private readonly UnionPayOptions _options;
-    private readonly ILogger<UnionPaySettlementProvider> _logger;
     private readonly string _baseUrl;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.UnionPay;
+    public override string ProviderName => ProviderNames.UnionPay;
 
     /// <summary>Create a new UnionPay settlement provider.</summary>
     public UnionPaySettlementProvider(
         HttpClient httpClient,
         IOptions<UnionPayOptions> options,
         ILogger<UnionPaySettlementProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.MerId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(UnionPayOptions.MerId)} is required");
@@ -138,7 +138,7 @@ public sealed class UnionPaySettlementProvider : ISettlementProvider
             }
         }
 
-        _logger.LogInformation("UnionPay listed {Count} settlements between {From:o} and {To:o}", yielded, fromUtc, toUtc);
+        Logger.LogInformation("UnionPay listed {Count} settlements between {From:o} and {To:o}", yielded, fromUtc, toUtc);
         activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
     }
 
@@ -284,7 +284,7 @@ public sealed class UnionPaySettlementProvider : ISettlementProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("UnionPay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("UnionPay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

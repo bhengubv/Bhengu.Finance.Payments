@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Core.Observability;
@@ -28,16 +29,15 @@ namespace Bhengu.Finance.Payments.Pesapal.Providers;
 /// provided signature; production callers should ALSO call /api/Transactions/GetTransactionStatus
 /// using the OrderTrackingId to confirm settlement (the canonical Pesapal hardening).
 /// </summary>
-public sealed class PesapalPaymentProvider : IPaymentGatewayProvider
+public sealed class PesapalPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PesapalOptions _options;
-    private readonly ILogger<PesapalPaymentProvider> _logger;
     private readonly IBhenguDistributedCache? _idempotencyCache;
     private readonly PesapalTokenCache _tokenCache;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Pesapal;
+    public override string ProviderName => ProviderNames.Pesapal;
 
     /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
@@ -59,10 +59,10 @@ public sealed class PesapalPaymentProvider : IPaymentGatewayProvider
         ILogger<PesapalPaymentProvider> logger,
         IBhenguDistributedCache? idempotencyCache = null,
         PesapalTokenCache? tokenCache = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotencyCache = idempotencyCache;
         _tokenCache = tokenCache ?? new PesapalTokenCache();
 
@@ -128,7 +128,7 @@ public sealed class PesapalPaymentProvider : IPaymentGatewayProvider
             var responseBody = await SendAsync(HttpMethod.Post, "api/Transactions/SubmitOrderRequest", body, ct, "ProcessPayment").ConfigureAwait(false);
             var submit = JsonSerializer.Deserialize<PesapalSubmitOrderResponse>(responseBody);
 
-            _logger.LogInformation("Pesapal order submitted: tracking={Tracking} merchantRef={MerchantRef}",
+            Logger.LogInformation("Pesapal order submitted: tracking={Tracking} merchantRef={MerchantRef}",
                 submit?.OrderTrackingId, submit?.MerchantReference);
 
             var response = new PaymentResponse
@@ -192,7 +192,7 @@ public sealed class PesapalPaymentProvider : IPaymentGatewayProvider
             var responseBody = await SendAsync(HttpMethod.Post, "api/Transactions/RefundRequest", body, ct, "ProcessRefund").ConfigureAwait(false);
             var refund = JsonSerializer.Deserialize<PesapalRefundResponse>(responseBody);
 
-            _logger.LogInformation("Pesapal refund: status={Status} message={Message}", refund?.Status, refund?.Message);
+            Logger.LogInformation("Pesapal refund: status={Status} message={Message}", refund?.Status, refund?.Message);
 
             var mapped = string.Equals(refund?.Status, "200", StringComparison.Ordinal)
                 ? PaymentStatus.Refunded
@@ -237,7 +237,7 @@ public sealed class PesapalPaymentProvider : IPaymentGatewayProvider
 
         if (string.IsNullOrWhiteSpace(_options.ConsumerSecret))
         {
-            _logger.LogWarning("Pesapal ConsumerSecret not configured — IPN verification cannot proceed.");
+            Logger.LogWarning("Pesapal ConsumerSecret not configured — IPN verification cannot proceed.");
             BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
                 new KeyValuePair<string, object?>("provider", ProviderName),
                 new KeyValuePair<string, object?>("valid", false));
@@ -270,7 +270,7 @@ public sealed class PesapalPaymentProvider : IPaymentGatewayProvider
             if (ipn is null || string.IsNullOrEmpty(ipn.OrderTrackingId))
                 return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed Pesapal IPN: tracking={Tracking} notifType={NotifType}",
+            Logger.LogInformation("Parsed Pesapal IPN: tracking={Tracking} notifType={NotifType}",
                 ipn.OrderTrackingId, ipn.OrderNotificationType);
 
             var notif = ipn.OrderNotificationType?.ToUpperInvariant();
@@ -303,7 +303,7 @@ public sealed class PesapalPaymentProvider : IPaymentGatewayProvider
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse Pesapal IPN");
+            Logger.LogError(ex, "Failed to parse Pesapal IPN");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -334,8 +334,8 @@ public sealed class PesapalPaymentProvider : IPaymentGatewayProvider
 
     private async Task<string> SendAsync(HttpMethod method, string path, object body, CancellationToken ct, string operation)
     {
-        var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, _logger, _options, _tokenCache, ct).ConfigureAwait(false);
-        return await PesapalHttpClient.SendAsync(_httpClient, _logger, method, path, body, token, ct, operation).ConfigureAwait(false);
+        var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, Logger, _options, _tokenCache, ct).ConfigureAwait(false);
+        return await PesapalHttpClient.SendAsync(_httpClient, Logger, method, path, body, token, ct, operation).ConfigureAwait(false);
     }
 
     // === Pesapal API response shapes (internal) ===

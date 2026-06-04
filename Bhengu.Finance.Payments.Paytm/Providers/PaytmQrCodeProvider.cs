@@ -9,6 +9,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.QrCode;
 using Bhengu.Finance.Payments.Core.Observability;
@@ -28,27 +29,26 @@ namespace Bhengu.Finance.Payments.Paytm.Providers;
 /// is HMAC-SHA256(body, MerchantKey) per Paytm's S2S checksum scheme. Status is polled via
 /// <c>POST /paymentservices/qr/getStatus</c>.
 /// </remarks>
-public sealed class PaytmQrCodeProvider : IQrCodeProvider
+public sealed class PaytmQrCodeProvider : BhenguProviderBase, IQrCodeProvider
 {
     private static readonly JsonSerializerOptions DeserializeOptions = new() { PropertyNameCaseInsensitive = true };
     private static readonly JsonSerializerOptions SerializeOptions = new() { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
 
     private readonly HttpClient _httpClient;
     private readonly PaytmOptions _options;
-    private readonly ILogger<PaytmQrCodeProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Paytm;
+    public override string ProviderName => ProviderNames.Paytm;
 
     /// <summary>Create a new Paytm Smart QR provider.</summary>
     public PaytmQrCodeProvider(
         HttpClient httpClient,
         IOptions<PaytmOptions> options,
         ILogger<PaytmQrCodeProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.MerchantId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PaytmOptions.MerchantId)} is required");
@@ -88,7 +88,7 @@ public sealed class PaytmQrCodeProvider : IQrCodeProvider
             var raw = await SendAsync(HttpMethod.Post, "paymentservices/qr/create", envelope, ct, "GenerateQr").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<PaytmQrEnvelope<PaytmQrCreateBody>>(raw, DeserializeOptions);
 
-            _logger.LogInformation("Paytm QR created: orderId={OrderId} qrId={QrId} status={Status}",
+            Logger.LogInformation("Paytm QR created: orderId={OrderId} qrId={QrId} status={Status}",
                 request.MerchantReference, response?.Body?.QrCodeId, response?.Body?.ResultInfo?.ResultStatus);
 
             if (response?.Body?.ResultInfo?.ResultStatus is "F" or "FAILURE")
@@ -179,7 +179,7 @@ public sealed class PaytmQrCodeProvider : IQrCodeProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Paytm {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Paytm {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

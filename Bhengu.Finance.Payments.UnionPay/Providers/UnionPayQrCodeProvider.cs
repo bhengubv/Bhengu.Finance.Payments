@@ -8,6 +8,7 @@ using System.Text;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.QrCode;
 using Bhengu.Finance.Payments.Core.Observability;
@@ -27,28 +28,27 @@ namespace Bhengu.Finance.Payments.UnionPay.Providers;
 /// is responsible for rendering it as a QR image. Format is the QuickPass URL scheme
 /// (<c>https://qr.95516.com/00010000/01...</c>) which any QR encoder converts to a scannable image.
 /// </remarks>
-public sealed class UnionPayQrCodeProvider : IQrCodeProvider
+public sealed class UnionPayQrCodeProvider : BhenguProviderBase, IQrCodeProvider
 {
     private const string BackTransPath = "/gateway/api/backTransReq.do";
     private const string QueryPath = "/gateway/api/queryTrans.do";
 
     private readonly HttpClient _httpClient;
     private readonly UnionPayOptions _options;
-    private readonly ILogger<UnionPayQrCodeProvider> _logger;
     private readonly string _baseUrl;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.UnionPay;
+    public override string ProviderName => ProviderNames.UnionPay;
 
     /// <summary>Create a new UnionPay QuickPass QR provider.</summary>
     public UnionPayQrCodeProvider(
         HttpClient httpClient,
         IOptions<UnionPayOptions> options,
         ILogger<UnionPayQrCodeProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.MerId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(UnionPayOptions.MerId)} is required");
@@ -100,7 +100,7 @@ public sealed class UnionPayQrCodeProvider : IQrCodeProvider
             var respCode = responseFields.GetValueOrDefault("respCode", "??");
             var qrCode = responseFields.GetValueOrDefault("qrCode");
 
-            _logger.LogInformation("UnionPay QR backTransReq: respCode={RespCode} qrCode={HasQr}",
+            Logger.LogInformation("UnionPay QR backTransReq: respCode={RespCode} qrCode={HasQr}",
                 respCode, !string.IsNullOrEmpty(qrCode));
 
             if (respCode != "00" || string.IsNullOrEmpty(qrCode))
@@ -208,7 +208,7 @@ public sealed class UnionPayQrCodeProvider : IQrCodeProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("UnionPay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("UnionPay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

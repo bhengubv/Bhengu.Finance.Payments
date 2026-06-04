@@ -8,6 +8,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models.Subscription;
 using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Pesapal.Configuration;
@@ -34,19 +35,18 @@ namespace Bhengu.Finance.Payments.Pesapal.Providers;
 /// <b>Pause / resume:</b> not natively supported by Pesapal — both throw.
 /// </para>
 /// </summary>
-public sealed class PesapalSubscriptionProvider : ISubscriptionProvider
+public sealed class PesapalSubscriptionProvider : BhenguProviderBase, ISubscriptionProvider
 {
     private static readonly TimeSpan PlanCacheTtl = TimeSpan.FromDays(90);
     private static readonly ConcurrentDictionary<string, Plan> s_planFallback = new(StringComparer.Ordinal);
 
     private readonly HttpClient _httpClient;
     private readonly PesapalOptions _options;
-    private readonly ILogger<PesapalSubscriptionProvider> _logger;
     private readonly IBhenguDistributedCache? _cache;
     private readonly PesapalTokenCache _tokenCache;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Pesapal;
+    public override string ProviderName => ProviderNames.Pesapal;
 
     /// <summary>Construct the Pesapal subscription provider. Designed to be registered via DI.</summary>
     public PesapalSubscriptionProvider(
@@ -55,10 +55,10 @@ public sealed class PesapalSubscriptionProvider : ISubscriptionProvider
         ILogger<PesapalSubscriptionProvider> logger,
         IBhenguDistributedCache? cache = null,
         PesapalTokenCache? tokenCache = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _cache = cache;
         _tokenCache = tokenCache ?? new PesapalTokenCache();
 
@@ -97,7 +97,7 @@ public sealed class PesapalSubscriptionProvider : ISubscriptionProvider
                 Description = request.Description
             };
             await StorePlanAsync(plan, ct).ConfigureAwait(false);
-            _logger.LogInformation("Pesapal plan stored: {Reference} name={Name}", plan.Reference, plan.Name);
+            Logger.LogInformation("Pesapal plan stored: {Reference} name={Name}", plan.Reference, plan.Name);
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             return plan;
         }
@@ -169,12 +169,12 @@ public sealed class PesapalSubscriptionProvider : ISubscriptionProvider
                 }
             };
 
-            var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, _logger, _options, _tokenCache, ct).ConfigureAwait(false);
+            var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, Logger, _options, _tokenCache, ct).ConfigureAwait(false);
             var responseBody = await PesapalHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Post, "api/Transactions/SubmitOrderRequest", body, token, ct, "CreateSubscription").ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Post, "api/Transactions/SubmitOrderRequest", body, token, ct, "CreateSubscription").ConfigureAwait(false);
             var submit = JsonSerializer.Deserialize<PesapalSubmitResponse>(responseBody);
 
-            _logger.LogInformation("Pesapal subscription created: tracking={Tracking} plan={Plan}",
+            Logger.LogInformation("Pesapal subscription created: tracking={Tracking} plan={Plan}",
                 submit?.OrderTrackingId, plan.Reference);
 
             var sub = new Subscription
@@ -206,9 +206,9 @@ public sealed class PesapalSubscriptionProvider : ISubscriptionProvider
         try
         {
             var path = $"api/Transactions/GetTransactionStatus?orderTrackingId={Uri.EscapeDataString(subscriptionReference)}";
-            var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, _logger, _options, _tokenCache, ct).ConfigureAwait(false);
+            var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, Logger, _options, _tokenCache, ct).ConfigureAwait(false);
             var responseBody = await PesapalHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get, path, body: null, token, ct, "GetSubscription").ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Get, path, body: null, token, ct, "GetSubscription").ConfigureAwait(false);
             var status = JsonSerializer.Deserialize<PesapalTransactionStatus>(responseBody);
             if (status is null)
             {
@@ -249,11 +249,11 @@ public sealed class PesapalSubscriptionProvider : ISubscriptionProvider
         try
         {
             var body = new { order_tracking_id = subscriptionReference };
-            var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, _logger, _options, _tokenCache, ct).ConfigureAwait(false);
+            var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, Logger, _options, _tokenCache, ct).ConfigureAwait(false);
             await PesapalHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Post, "api/Transactions/CancelOrder", body, token, ct, "CancelSubscription").ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Post, "api/Transactions/CancelOrder", body, token, ct, "CancelSubscription").ConfigureAwait(false);
 
-            _logger.LogInformation("Pesapal subscription {Reference} cancelled (immediately={Immediately})", subscriptionReference, immediately);
+            Logger.LogInformation("Pesapal subscription {Reference} cancelled (immediately={Immediately})", subscriptionReference, immediately);
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             return new Subscription
             {

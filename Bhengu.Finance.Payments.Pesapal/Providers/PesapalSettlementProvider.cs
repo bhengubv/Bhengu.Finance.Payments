@@ -7,6 +7,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models.Settlement;
 using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Pesapal.Configuration;
@@ -19,15 +20,14 @@ namespace Bhengu.Finance.Payments.Pesapal.Providers;
 /// <summary>
 /// Pesapal settlement provider — wraps the <c>/api/Statements/</c> reconciliation endpoints.
 /// </summary>
-public sealed class PesapalSettlementProvider : ISettlementProvider
+public sealed class PesapalSettlementProvider : BhenguProviderBase, ISettlementProvider
 {
     private readonly HttpClient _httpClient;
     private readonly PesapalOptions _options;
-    private readonly ILogger<PesapalSettlementProvider> _logger;
     private readonly PesapalTokenCache _tokenCache;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Pesapal;
+    public override string ProviderName => ProviderNames.Pesapal;
 
     /// <summary>Construct the Pesapal settlement provider. Designed to be registered via DI.</summary>
     public PesapalSettlementProvider(
@@ -35,10 +35,10 @@ public sealed class PesapalSettlementProvider : ISettlementProvider
         IOptions<PesapalOptions> options,
         ILogger<PesapalSettlementProvider> logger,
         PesapalTokenCache? tokenCache = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _tokenCache = tokenCache ?? new PesapalTokenCache();
 
         if (string.IsNullOrWhiteSpace(_options.ConsumerKey))
@@ -65,13 +65,13 @@ public sealed class PesapalSettlementProvider : ISettlementProvider
             try
             {
                 var path = $"api/Statements/GetStatement?startDate={fromUtc:yyyy-MM-dd}&endDate={toUtc:yyyy-MM-dd}";
-                var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, _logger, _options, _tokenCache, ct).ConfigureAwait(false);
+                var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, Logger, _options, _tokenCache, ct).ConfigureAwait(false);
                 var responseBody = await PesapalHttpClient.SendAsync(
-                    _httpClient, _logger, HttpMethod.Get, path, body: null, token, ct, "ListSettlements").ConfigureAwait(false);
+                    _httpClient, Logger, HttpMethod.Get, path, body: null, token, ct, "ListSettlements").ConfigureAwait(false);
                 var envelope = JsonSerializer.Deserialize<PesapalStatementListResponse>(responseBody);
                 items = envelope?.Data;
 
-                _logger.LogInformation("Pesapal statements listed: {Count} between {From:O} and {To:O}", items?.Count ?? 0, fromUtc, toUtc);
+                Logger.LogInformation("Pesapal statements listed: {Count} between {From:O} and {To:O}", items?.Count ?? 0, fromUtc, toUtc);
                 activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             }
             catch (Exception ex)
@@ -98,9 +98,9 @@ public sealed class PesapalSettlementProvider : ISettlementProvider
         try
         {
             var path = $"api/Statements/GetSettlement?settlementId={Uri.EscapeDataString(settlementReference)}";
-            var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, _logger, _options, _tokenCache, ct).ConfigureAwait(false);
+            var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, Logger, _options, _tokenCache, ct).ConfigureAwait(false);
             var responseBody = await PesapalHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get, path, body: null, token, ct, "GetSettlement").ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Get, path, body: null, token, ct, "GetSettlement").ConfigureAwait(false);
             var envelope = JsonSerializer.Deserialize<PesapalStatementSingleResponse>(responseBody);
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             return envelope?.Data is null ? null : ToSettlement(envelope.Data);
@@ -128,9 +128,9 @@ public sealed class PesapalSettlementProvider : ISettlementProvider
             try
             {
                 var path = $"api/Statements/GetSettlementTransactions?settlementId={Uri.EscapeDataString(settlementReference)}";
-                var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, _logger, _options, _tokenCache, ct).ConfigureAwait(false);
+                var token = await PesapalHttpClient.EnsureTokenAsync(_httpClient, Logger, _options, _tokenCache, ct).ConfigureAwait(false);
                 var responseBody = await PesapalHttpClient.SendAsync(
-                    _httpClient, _logger, HttpMethod.Get, path, body: null, token, ct, "ListSettlementTransactions").ConfigureAwait(false);
+                    _httpClient, Logger, HttpMethod.Get, path, body: null, token, ct, "ListSettlementTransactions").ConfigureAwait(false);
                 var envelope = JsonSerializer.Deserialize<PesapalTransactionListResponse>(responseBody);
                 items = envelope?.Data;
                 activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);

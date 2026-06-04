@@ -10,6 +10,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models.Subscription;
 using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Paytm.Configuration;
@@ -28,7 +29,7 @@ namespace Bhengu.Finance.Payments.Paytm.Providers;
 /// To preserve the SDK's <see cref="ISubscriptionProvider"/> shape we cache plans locally and
 /// inline them at subscription-creation time.
 /// </remarks>
-public sealed class PaytmSubscriptionProvider : ISubscriptionProvider
+public sealed class PaytmSubscriptionProvider : BhenguProviderBase, ISubscriptionProvider
 {
     private static readonly JsonSerializerOptions DeserializeOptions = new() { PropertyNameCaseInsensitive = true };
     private static readonly JsonSerializerOptions SerializeOptions = new() { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
@@ -36,20 +37,19 @@ public sealed class PaytmSubscriptionProvider : ISubscriptionProvider
 
     private readonly HttpClient _httpClient;
     private readonly PaytmOptions _options;
-    private readonly ILogger<PaytmSubscriptionProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Paytm;
+    public override string ProviderName => ProviderNames.Paytm;
 
     /// <summary>Create a new Paytm subscription provider.</summary>
     public PaytmSubscriptionProvider(
         HttpClient httpClient,
         IOptions<PaytmOptions> options,
         ILogger<PaytmSubscriptionProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.MerchantId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PaytmOptions.MerchantId)} is required");
@@ -83,7 +83,7 @@ public sealed class PaytmSubscriptionProvider : ISubscriptionProvider
         };
 
         PlanCache[reference] = plan;
-        _logger.LogInformation("Paytm plan cached as {Ref} ({Amount} {Currency}/{Interval})",
+        Logger.LogInformation("Paytm plan cached as {Ref} ({Amount} {Currency}/{Interval})",
             reference, plan.Amount, plan.Currency, plan.Interval);
         activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
 
@@ -138,7 +138,7 @@ public sealed class PaytmSubscriptionProvider : ISubscriptionProvider
             var raw = await SendAsync(HttpMethod.Post, $"subscription/create?mid={Uri.EscapeDataString(_options.MerchantId)}&orderId={Uri.EscapeDataString(subscriptionId)}", envelope, ct, "CreateSubscription").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<PaytmSubscriptionEnvelope<PaytmSubscriptionBody>>(raw, DeserializeOptions);
 
-            _logger.LogInformation("Paytm subscription created: {Id} status={Status}",
+            Logger.LogInformation("Paytm subscription created: {Id} status={Status}",
                 subscriptionId, response?.Body?.ResultInfo?.ResultStatus);
 
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
@@ -222,7 +222,7 @@ public sealed class PaytmSubscriptionProvider : ISubscriptionProvider
 
             await SendAsync(HttpMethod.Post, "subscription/cancelSubscription", envelope, ct, "CancelSubscription").ConfigureAwait(false);
 
-            _logger.LogInformation("Paytm subscription cancelled: {Id} immediately={Immediately}", subscriptionReference, immediately);
+            Logger.LogInformation("Paytm subscription cancelled: {Id} immediately={Immediately}", subscriptionReference, immediately);
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
 
             return new Subscription
@@ -321,7 +321,7 @@ public sealed class PaytmSubscriptionProvider : ISubscriptionProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Paytm {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Paytm {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
