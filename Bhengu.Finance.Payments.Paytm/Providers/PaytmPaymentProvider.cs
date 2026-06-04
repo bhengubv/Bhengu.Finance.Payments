@@ -415,7 +415,8 @@ public sealed class PaytmPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
                 {
                     GatewayReference = orderId,
                     Status = MapStatus(status ?? "pending"),
-                    EventType = $"paytm.{normalised}"
+                    EventType = $"paytm.{normalised}",
+                    Category = WebhookEventCategory.Unknown
                 }
             };
 

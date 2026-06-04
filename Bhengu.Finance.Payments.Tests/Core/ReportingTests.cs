@@ -28,18 +28,25 @@ public class ReportingTests
             _throws = throws;
         }
 
-        public Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+#pragma warning disable CS1998 // intentionally async with no awaits — synchronous stub for tests.
+        public async IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
         {
             if (_throws is not null)
                 throw _throws;
-            return Task.FromResult(_settlements);
+            foreach (var s in _settlements)
+                yield return s;
         }
+#pragma warning restore CS1998
 
         public Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default) =>
             Task.FromResult<Settlement?>(null);
 
-        public Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default) =>
-            Task.FromResult<IReadOnlyList<SettlementTransaction>>(Array.Empty<SettlementTransaction>());
+#pragma warning disable CS1998 // intentionally async with no awaits — synchronous stub for tests.
+        public async IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(string settlementReference, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        {
+            yield break;
+        }
+#pragma warning restore CS1998
     }
 
     private static Settlement S(string reference, string currency, decimal net, decimal? gross = null, decimal? fees = null, int txCount = 1) => new()
@@ -197,16 +204,22 @@ public class ReportingTests
             _onList = onList;
         }
 
-        public Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+#pragma warning disable CS1998 // intentionally async with no awaits — synchronous spy for tests.
+        public async IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
         {
             _onList(fromUtc, toUtc);
-            return Task.FromResult<IReadOnlyList<Settlement>>(Array.Empty<Settlement>());
+            yield break;
         }
+#pragma warning restore CS1998
 
         public Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default) =>
             Task.FromResult<Settlement?>(null);
 
-        public Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default) =>
-            Task.FromResult<IReadOnlyList<SettlementTransaction>>(Array.Empty<SettlementTransaction>());
+#pragma warning disable CS1998 // intentionally async with no awaits — synchronous spy for tests.
+        public async IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(string settlementReference, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        {
+            yield break;
+        }
+#pragma warning restore CS1998
     }
 }

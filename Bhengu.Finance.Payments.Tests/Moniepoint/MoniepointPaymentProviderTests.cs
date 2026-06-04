@@ -156,7 +156,7 @@ public class MoniepointPaymentProviderTests
     {
         const string apiKey = "mpt-fallback-api-key";
         const string payload = """{"event":"transaction.successful","data":{"reference":"MPT-1"}}""";
-        using var hmac = new HMACSHA512(Encoding.UTF8.GetBytes(apiKey));
+        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(apiKey));
         var validSig = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant();
 
         var provider = Create(
@@ -171,7 +171,7 @@ public class MoniepointPaymentProviderTests
     {
         const string secret = "webhook-test-secret";
         const string payload = """{"event":"transaction.successful","data":{"reference":"MPT-1"}}""";
-        using var hmac = new HMACSHA512(Encoding.UTF8.GetBytes(secret));
+        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
         var validSig = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant();
 
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));

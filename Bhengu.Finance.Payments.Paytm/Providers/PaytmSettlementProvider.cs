@@ -2,6 +2,7 @@
 
 using System.Globalization;
 using System.Net;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -58,38 +59,41 @@ public sealed class PaytmSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+    public async IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list");
-        try
+        List<PaytmSettlementBody>? items;
+        using (var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list"))
         {
-            var body = new
+            try
             {
-                mid = _options.MerchantId,
-                fromDate = fromUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
-                toDate = toUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
-            };
-            var signature = ComputeChecksum(JsonSerializer.Serialize(body, SerializeOptions));
-            var envelope = new { body, head = new { signature } };
+                var body = new
+                {
+                    mid = _options.MerchantId,
+                    fromDate = fromUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+                    toDate = toUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
+                };
+                var signature = ComputeChecksum(JsonSerializer.Serialize(body, SerializeOptions));
+                var envelope = new { body, head = new { signature } };
 
-            var raw = await SendAsync(HttpMethod.Post, "settlement/info", envelope, ct, "ListSettlements").ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<PaytmSettlementListEnvelope>(raw, DeserializeOptions);
+                var raw = await SendAsync(HttpMethod.Post, "settlement/info", envelope, ct, "ListSettlements").ConfigureAwait(false);
+                var response = JsonSerializer.Deserialize<PaytmSettlementListEnvelope>(raw, DeserializeOptions);
+                items = response?.Body?.Settlements;
 
-            _logger.LogInformation("Paytm listed {Count} settlements between {From:o} and {To:o}",
-                response?.Body?.Settlements?.Count ?? 0, fromUtc, toUtc);
-
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-
-            var list = new List<Settlement>();
-            if (response?.Body?.Settlements is null) return list;
-            foreach (var s in response.Body.Settlements)
-                list.Add(MapSettlement(s));
-            return list;
+                _logger.LogInformation("Paytm listed {Count} settlements between {From:o} and {To:o}", items?.Count ?? 0, fromUtc, toUtc);
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+            }
+            catch
+            {
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
+                throw;
+            }
         }
-        catch
+
+        if (items is null) yield break;
+        foreach (var s in items)
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
+            ct.ThrowIfCancellationRequested();
+            yield return MapSettlement(s);
         }
     }
 
@@ -123,42 +127,44 @@ public sealed class PaytmSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
+    public async IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(string settlementReference, [EnumeratorCancellation] CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(settlementReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.transactions");
-        try
+        List<PaytmSettlementBreakupItem>? items;
+        using (var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.transactions"))
         {
-            var body = new { mid = _options.MerchantId, settlementId = settlementReference };
-            var signature = ComputeChecksum(JsonSerializer.Serialize(body, SerializeOptions));
-            var envelope = new { body, head = new { signature } };
-
-            var raw = await SendAsync(HttpMethod.Post, "settlement/getSettlementBreakup", envelope, ct, "ListTransactions").ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<PaytmSettlementBreakupEnvelope>(raw, DeserializeOptions);
-
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-
-            var list = new List<SettlementTransaction>();
-            if (response?.Body?.Transactions is null) return list;
-            foreach (var t in response.Body.Transactions)
+            try
             {
-                list.Add(new SettlementTransaction
-                {
-                    GatewayReference = t.OrderId ?? t.TxnId ?? string.Empty,
-                    Kind = MapKind(t.Type),
-                    NetAmount = t.NetAmount ?? 0m,
-                    GrossAmount = t.GrossAmount,
-                    Fee = t.Fee,
-                    Currency = t.Currency ?? "INR",
-                    CreatedAt = t.CreatedAt ?? DateTime.UtcNow
-                });
+                var body = new { mid = _options.MerchantId, settlementId = settlementReference };
+                var signature = ComputeChecksum(JsonSerializer.Serialize(body, SerializeOptions));
+                var envelope = new { body, head = new { signature } };
+
+                var raw = await SendAsync(HttpMethod.Post, "settlement/getSettlementBreakup", envelope, ct, "ListTransactions").ConfigureAwait(false);
+                var response = JsonSerializer.Deserialize<PaytmSettlementBreakupEnvelope>(raw, DeserializeOptions);
+                items = response?.Body?.Transactions;
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             }
-            return list;
+            catch
+            {
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
+                throw;
+            }
         }
-        catch
+
+        if (items is null) yield break;
+        foreach (var t in items)
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
+            ct.ThrowIfCancellationRequested();
+            yield return new SettlementTransaction
+            {
+                GatewayReference = t.OrderId ?? t.TxnId ?? string.Empty,
+                Kind = MapKind(t.Type),
+                NetAmount = t.NetAmount ?? 0m,
+                GrossAmount = t.GrossAmount,
+                Fee = t.Fee,
+                Currency = t.Currency ?? "INR",
+                CreatedAt = t.CreatedAt ?? DateTime.UtcNow
+            };
         }
     }
 

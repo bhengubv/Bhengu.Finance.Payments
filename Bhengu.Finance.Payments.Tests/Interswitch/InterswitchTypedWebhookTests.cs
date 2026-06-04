@@ -75,11 +75,12 @@ public class InterswitchTypedWebhookTests
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsNull_ForUnknownEvent()
+    public async Task ParseWebhookAsync_ReturnsUnknownCategory_ForUnknownEvent()
     {
         var evt = await Create().ParseWebhookAsync("""
             {"eventType":"some.random.event","data":{"transactionRef":"X"}}
             """);
-        Assert.Null(evt);
+        Assert.NotNull(evt);
+        Assert.Equal(WebhookEventCategory.Unknown, evt!.Category);
     }
 }

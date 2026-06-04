@@ -162,13 +162,15 @@ public class YocoPaymentProviderTests
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsNull_ForUnknownEventType()
+    public async Task ParseWebhookAsync_ReturnsUnknownCategory_ForUnknownEventType()
     {
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
         var evt = await provider.ParseWebhookAsync("""
             {"type":"some.unknown.event","payload":{"id":"x"}}
             """);
-        Assert.Null(evt);
+        Assert.NotNull(evt);
+        Assert.Equal(Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.Unknown, evt!.Category);
+        Assert.Equal("some.unknown.event", evt.EventType);
     }
 
     [Fact]

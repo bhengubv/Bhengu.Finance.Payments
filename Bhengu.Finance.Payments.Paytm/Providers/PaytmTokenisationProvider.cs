@@ -2,6 +2,7 @@
 
 using System.Collections.Concurrent;
 using System.Net;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -31,9 +32,9 @@ namespace Bhengu.Finance.Payments.Paytm.Providers;
 /// </remarks>
 public sealed class PaytmTokenisationProvider : ITokenisationProvider
 {
-    private static readonly JsonSerializerOptions DeserializeOptions = new() { PropertyNameCaseInsensitive = true };
-    private static readonly JsonSerializerOptions SerializeOptions = new() { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
-    private static readonly ConcurrentDictionary<string, PaymentMethod> TokenCache = new(StringComparer.Ordinal);
+    internal static readonly JsonSerializerOptions DeserializeOptions = new() { PropertyNameCaseInsensitive = true };
+    internal static readonly JsonSerializerOptions SerializeOptions = new() { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
+    internal static readonly ConcurrentDictionary<string, PaymentMethod> TokenCache = new(StringComparer.Ordinal);
 
     private readonly HttpClient _httpClient;
     private readonly PaytmOptions _options;
@@ -47,6 +48,163 @@ public sealed class PaytmTokenisationProvider : ITokenisationProvider
         HttpClient httpClient,
         IOptions<PaytmOptions> options,
         ILogger<PaytmTokenisationProvider> logger)
+    {
+        _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
+        _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
+        if (string.IsNullOrWhiteSpace(_options.MerchantId))
+            throw new ProviderConfigurationException(ProviderName, $"{nameof(PaytmOptions.MerchantId)} is required");
+        if (string.IsNullOrWhiteSpace(_options.MerchantKey))
+            throw new ProviderConfigurationException(ProviderName, $"{nameof(PaytmOptions.MerchantKey)} is required");
+
+        if (_httpClient.BaseAddress is null)
+        {
+            _httpClient.BaseAddress = new Uri(_options.UseSandbox
+                ? (_options.SandboxUrl ?? "https://securegw-stage.paytm.in/")
+                : (_options.BaseUrl ?? "https://securegw.paytm.in/"));
+        }
+    }
+
+    /// <inheritdoc />
+    public Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(token);
+        return Task.FromResult(TokenCache.TryGetValue(token, out var m) ? m : null);
+    }
+
+    /// <inheritdoc />
+#pragma warning disable CS1998 // intentionally async with no awaits — Paytm uses an in-memory cache for vault listing.
+    public async IAsyncEnumerable<PaymentMethod> ListPaymentMethodsAsync(string customerId, [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(customerId);
+        foreach (var m in TokenCache.Values)
+        {
+            if (m.CustomerId != customerId) continue;
+            ct.ThrowIfCancellationRequested();
+            yield return m;
+        }
+    }
+#pragma warning restore CS1998
+
+    /// <inheritdoc />
+    public async Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(token);
+
+        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise.delete");
+        try
+        {
+            var bodyPayload = new { mid = _options.MerchantId, cardToken = token };
+            var serializedBody = JsonSerializer.Serialize(bodyPayload, SerializeOptions);
+            var signature = ComputeChecksum(serializedBody);
+            var envelope = new { body = bodyPayload, head = new { signature } };
+
+            try
+            {
+                await PaytmHttp.SendAsync(_httpClient, _logger, ProviderName, HttpMethod.Post, "theia/api/v2/vault/deleteCard", envelope, ct, "DeleteCard").ConfigureAwait(false);
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return false;
+            }
+
+            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+            return TokenCache.TryRemove(token, out _);
+        }
+        catch
+        {
+            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
+            throw;
+        }
+    }
+
+    internal string ComputeChecksum(string payload)
+    {
+        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.MerchantKey));
+        var hash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
+        return Convert.ToBase64String(hash);
+    }
+
+    internal sealed class PaytmVaultEnvelope<TBody>
+    {
+        [JsonPropertyName("body")] public TBody? Body { get; set; }
+    }
+
+    internal sealed class PaytmVaultTokenBody
+    {
+        [JsonPropertyName("resultInfo")] public PaytmResultInfo? ResultInfo { get; set; }
+        [JsonPropertyName("cardToken")] public string? CardToken { get; set; }
+        [JsonPropertyName("cardScheme")] public string? CardScheme { get; set; }
+    }
+
+    internal sealed class PaytmResultInfo
+    {
+        [JsonPropertyName("resultStatus")] public string? ResultStatus { get; set; }
+        [JsonPropertyName("resultCode")] public string? ResultCode { get; set; }
+        [JsonPropertyName("resultMsg")] public string? ResultMsg { get; set; }
+    }
+}
+
+/// <summary>Shared HTTP helper for Paytm vault providers.</summary>
+internal static class PaytmHttp
+{
+    public static async Task<string> SendAsync(HttpClient httpClient, ILogger logger, string providerName, HttpMethod method, string path, object body, CancellationToken ct, string operation)
+    {
+        var json = JsonSerializer.Serialize(body, PaytmTokenisationProvider.SerializeOptions);
+        using var req = new HttpRequestMessage(method, path)
+        {
+            Content = new StringContent(json, Encoding.UTF8, "application/json")
+        };
+
+        HttpResponseMessage response;
+        try
+        {
+            response = await httpClient.SendAsync(req, ct).ConfigureAwait(false);
+        }
+        catch (HttpRequestException ex)
+        {
+            throw new ProviderUnavailableException(providerName, "HTTP request to Paytm failed", ex);
+        }
+
+        var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+
+        if (response.StatusCode == HttpStatusCode.TooManyRequests)
+        {
+            var retryAfter = response.Headers.RetryAfter?.Delta?.TotalSeconds is double d ? (int)d : (int?)null;
+            throw new ProviderRateLimitException(providerName, retryAfter, responseBody);
+        }
+
+        if (!response.IsSuccessStatusCode)
+        {
+            logger.LogError("Paytm {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            if ((int)response.StatusCode is >= 400 and < 500)
+                throw new PaymentDeclinedException(providerName, ((int)response.StatusCode).ToString(), responseBody);
+            throw new ProviderUnavailableException(providerName, $"HTTP {(int)response.StatusCode}: {responseBody}");
+        }
+
+        return responseBody;
+    }
+}
+
+/// <summary>
+/// PCI-DSS SAQ-D-scope Paytm raw-card tokenisation. Sends raw PAN to Paytm's
+/// <c>theia/api/v2/vault/tokeniseCard</c> endpoint and returns the resulting card token.
+/// </summary>
+public sealed class PaytmRawCardTokenisationProvider : IRawCardTokenisationProvider
+{
+    private readonly HttpClient _httpClient;
+    private readonly PaytmOptions _options;
+    private readonly ILogger<PaytmRawCardTokenisationProvider> _logger;
+
+    /// <inheritdoc />
+    public string ProviderName => ProviderNames.Paytm;
+
+    /// <summary>Create a new Paytm raw-card tokenisation provider.</summary>
+    public PaytmRawCardTokenisationProvider(
+        HttpClient httpClient,
+        IOptions<PaytmOptions> options,
+        ILogger<PaytmRawCardTokenisationProvider> logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
@@ -85,13 +243,13 @@ public sealed class PaytmTokenisationProvider : ITokenisationProvider
                 cvv = request.Card.Cvv
             };
 
-            var serializedBody = JsonSerializer.Serialize(bodyPayload, SerializeOptions);
+            var serializedBody = JsonSerializer.Serialize(bodyPayload, PaytmTokenisationProvider.SerializeOptions);
             var signature = ComputeChecksum(serializedBody);
 
             var envelope = new { body = bodyPayload, head = new { signature } };
 
-            var raw = await SendAsync(HttpMethod.Post, "theia/api/v2/vault/tokeniseCard", envelope, ct, "TokeniseCard").ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<PaytmVaultEnvelope<PaytmVaultTokenBody>>(raw, DeserializeOptions);
+            var raw = await PaytmHttp.SendAsync(_httpClient, _logger, ProviderName, HttpMethod.Post, "theia/api/v2/vault/tokeniseCard", envelope, ct, "TokeniseCard").ConfigureAwait(false);
+            var response = JsonSerializer.Deserialize<PaytmTokenisationProvider.PaytmVaultEnvelope<PaytmTokenisationProvider.PaytmVaultTokenBody>>(raw, PaytmTokenisationProvider.DeserializeOptions);
 
             _logger.LogInformation("Paytm card vaulted: token={Token} status={Status}",
                 response?.Body?.CardToken, response?.Body?.ResultInfo?.ResultStatus);
@@ -114,7 +272,7 @@ public sealed class PaytmTokenisationProvider : ITokenisationProvider
                 CreatedAt = DateTime.UtcNow
             };
 
-            TokenCache[method.Token] = method;
+            PaytmTokenisationProvider.TokenCache[method.Token] = method;
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             return method;
         }
@@ -125,113 +283,10 @@ public sealed class PaytmTokenisationProvider : ITokenisationProvider
         }
     }
 
-    /// <inheritdoc />
-    public Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(token);
-        return Task.FromResult(TokenCache.TryGetValue(token, out var m) ? m : null);
-    }
-
-    /// <inheritdoc />
-    public Task<IReadOnlyList<PaymentMethod>> ListPaymentMethodsAsync(string customerId, CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(customerId);
-        var list = TokenCache.Values.Where(m => m.CustomerId == customerId).ToList();
-        return Task.FromResult<IReadOnlyList<PaymentMethod>>(list);
-    }
-
-    /// <inheritdoc />
-    public async Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(token);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise.delete");
-        try
-        {
-            var bodyPayload = new { mid = _options.MerchantId, cardToken = token };
-            var serializedBody = JsonSerializer.Serialize(bodyPayload, SerializeOptions);
-            var signature = ComputeChecksum(serializedBody);
-            var envelope = new { body = bodyPayload, head = new { signature } };
-
-            try
-            {
-                await SendAsync(HttpMethod.Post, "theia/api/v2/vault/deleteCard", envelope, ct, "DeleteCard").ConfigureAwait(false);
-            }
-            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-            {
-                return false;
-            }
-
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return TokenCache.TryRemove(token, out _);
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
-    }
-
-    private async Task<string> SendAsync(HttpMethod method, string path, object body, CancellationToken ct, string operation)
-    {
-        var json = JsonSerializer.Serialize(body, SerializeOptions);
-        using var req = new HttpRequestMessage(method, path)
-        {
-            Content = new StringContent(json, Encoding.UTF8, "application/json")
-        };
-
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Paytm failed", ex);
-        }
-
-        var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-
-        if (response.StatusCode == HttpStatusCode.TooManyRequests)
-        {
-            var retryAfter = response.Headers.RetryAfter?.Delta?.TotalSeconds is double d ? (int)d : (int?)null;
-            throw new ProviderRateLimitException(ProviderName, retryAfter, responseBody);
-        }
-
-        if (!response.IsSuccessStatusCode)
-        {
-            _logger.LogError("Paytm {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
-            if ((int)response.StatusCode is >= 400 and < 500)
-                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
-            throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
-        }
-
-        return responseBody;
-    }
-
     private string ComputeChecksum(string payload)
     {
         using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.MerchantKey));
         var hash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
         return Convert.ToBase64String(hash);
-    }
-
-    private sealed class PaytmVaultEnvelope<TBody>
-    {
-        [JsonPropertyName("body")] public TBody? Body { get; set; }
-    }
-
-    private sealed class PaytmVaultTokenBody
-    {
-        [JsonPropertyName("resultInfo")] public PaytmResultInfo? ResultInfo { get; set; }
-        [JsonPropertyName("cardToken")] public string? CardToken { get; set; }
-        [JsonPropertyName("cardScheme")] public string? CardScheme { get; set; }
-    }
-
-    private sealed class PaytmResultInfo
-    {
-        [JsonPropertyName("resultStatus")] public string? ResultStatus { get; set; }
-        [JsonPropertyName("resultCode")] public string? ResultCode { get; set; }
-        [JsonPropertyName("resultMsg")] public string? ResultMsg { get; set; }
     }
 }

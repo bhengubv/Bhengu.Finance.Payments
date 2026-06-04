@@ -52,16 +52,19 @@ public static class ServiceCollectionExtensions
         // Optional contracts.
         services.AddHttpClient<PayUIndiaThreeDSecureProvider>();
         services.AddHttpClient<PayUIndiaTokenisationProvider>();
+        services.AddHttpClient<PayUIndiaRawCardTokenisationProvider>();
         services.AddHttpClient<PayUIndiaSubscriptionProvider>();
         services.AddHttpClient<PayUIndiaSettlementProvider>();
 
         services.AddTransient<IThreeDSecureProvider>(sp => sp.GetRequiredService<PayUIndiaThreeDSecureProvider>());
         services.AddTransient<ITokenisationProvider>(sp => sp.GetRequiredService<PayUIndiaTokenisationProvider>());
+        services.AddTransient<IRawCardTokenisationProvider>(sp => sp.GetRequiredService<PayUIndiaRawCardTokenisationProvider>());
         services.AddTransient<ISubscriptionProvider>(sp => sp.GetRequiredService<PayUIndiaSubscriptionProvider>());
         services.AddTransient<ISettlementProvider>(sp => sp.GetRequiredService<PayUIndiaSettlementProvider>());
 
         services.AddKeyedTransient<IThreeDSecureProvider>(ProviderNames.PayUIndia, (sp, _) => sp.GetRequiredService<PayUIndiaThreeDSecureProvider>());
         services.AddKeyedTransient<ITokenisationProvider>(ProviderNames.PayUIndia, (sp, _) => sp.GetRequiredService<PayUIndiaTokenisationProvider>());
+        services.AddKeyedTransient<IRawCardTokenisationProvider>(ProviderNames.PayUIndia, (sp, _) => sp.GetRequiredService<PayUIndiaRawCardTokenisationProvider>());
         services.AddKeyedTransient<ISubscriptionProvider>(ProviderNames.PayUIndia, (sp, _) => sp.GetRequiredService<PayUIndiaSubscriptionProvider>());
         services.AddKeyedTransient<ISettlementProvider>(ProviderNames.PayUIndia, (sp, _) => sp.GetRequiredService<PayUIndiaSettlementProvider>());
 

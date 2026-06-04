@@ -75,11 +75,12 @@ public class OPayTypedWebhookTests
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsNull_ForUnknownEvent()
+    public async Task ParseWebhookAsync_ReturnsUnknownCategory_ForUnknownEvent()
     {
         var evt = await Create().ParseWebhookAsync("""
             {"type":"some.random","payload":{"reference":"X"}}
             """);
-        Assert.Null(evt);
+        Assert.NotNull(evt);
+        Assert.Equal(WebhookEventCategory.Unknown, evt!.Category);
     }
 }

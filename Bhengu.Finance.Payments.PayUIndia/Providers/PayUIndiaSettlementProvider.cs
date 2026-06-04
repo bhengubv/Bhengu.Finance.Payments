@@ -2,6 +2,7 @@
 
 using System.Globalization;
 using System.Net;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -57,46 +58,48 @@ public sealed class PayUIndiaSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+    public async IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list");
-        try
+        List<PayUIndiaSettlementResponse>? items;
+        using (var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list"))
         {
-            const string command = "get_settlement_details";
-            var fromStr = fromUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-            var toStr = toUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-
-            var hashInput = string.Join("|", _options.MerchantKey, command, fromStr, _options.Salt);
-            var hash = Sha512Hex(hashInput);
-
-            var form = new Dictionary<string, string>
+            try
             {
-                ["key"] = _options.MerchantKey,
-                ["command"] = command,
-                ["var1"] = fromStr,
-                ["var2"] = toStr,
-                ["hash"] = hash
-            };
+                const string command = "get_settlement_details";
+                var fromStr = fromUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+                var toStr = toUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
 
-            var raw = await PostFormAsync("merchant/postservice.php?form=2", form, ct, "ListSettlements").ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<PayUIndiaSettlementListResponse>(raw, DeserializeOptions);
+                var hashInput = string.Join("|", _options.MerchantKey, command, fromStr, _options.Salt);
+                var hash = Sha512Hex(hashInput);
 
-            _logger.LogInformation("PayU India listed {Count} settlements between {From:o} and {To:o}",
-                response?.Settlements?.Count ?? 0, fromUtc, toUtc);
+                var form = new Dictionary<string, string>
+                {
+                    ["key"] = _options.MerchantKey,
+                    ["command"] = command,
+                    ["var1"] = fromStr,
+                    ["var2"] = toStr,
+                    ["hash"] = hash
+                };
 
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+                var raw = await PostFormAsync("merchant/postservice.php?form=2", form, ct, "ListSettlements").ConfigureAwait(false);
+                var response = JsonSerializer.Deserialize<PayUIndiaSettlementListResponse>(raw, DeserializeOptions);
+                items = response?.Settlements;
 
-            var list = new List<Settlement>();
-            if (response?.Settlements is null) return list;
-
-            foreach (var s in response.Settlements)
-                list.Add(MapSettlement(s));
-            return list;
+                _logger.LogInformation("PayU India listed {Count} settlements between {From:o} and {To:o}", items?.Count ?? 0, fromUtc, toUtc);
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+            }
+            catch
+            {
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
+                throw;
+            }
         }
-        catch
+
+        if (items is null) yield break;
+        foreach (var s in items)
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
+            ct.ThrowIfCancellationRequested();
+            yield return MapSettlement(s);
         }
     }
 
@@ -142,52 +145,53 @@ public sealed class PayUIndiaSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
+    public async IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(string settlementReference, [EnumeratorCancellation] CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(settlementReference);
 
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.transactions");
-        try
+        List<PayUIndiaSettlementTransactionItem>? items;
+        using (var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.transactions"))
         {
-            const string command = "get_settlement_breakup";
-            var hashInput = string.Join("|", _options.MerchantKey, command, settlementReference, _options.Salt);
-            var hash = Sha512Hex(hashInput);
-
-            var form = new Dictionary<string, string>
+            try
             {
-                ["key"] = _options.MerchantKey,
-                ["command"] = command,
-                ["var1"] = settlementReference,
-                ["hash"] = hash
-            };
+                const string command = "get_settlement_breakup";
+                var hashInput = string.Join("|", _options.MerchantKey, command, settlementReference, _options.Salt);
+                var hash = Sha512Hex(hashInput);
 
-            var raw = await PostFormAsync("merchant/postservice.php?form=2", form, ct, "ListTransactions").ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<PayUIndiaSettlementTransactionListResponse>(raw, DeserializeOptions);
-
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-
-            var list = new List<SettlementTransaction>();
-            if (response?.Transactions is null) return list;
-
-            foreach (var t in response.Transactions)
-            {
-                list.Add(new SettlementTransaction
+                var form = new Dictionary<string, string>
                 {
-                    GatewayReference = t.MihPayId ?? t.TxnId ?? string.Empty,
-                    Kind = MapKind(t.Type),
-                    NetAmount = t.NetAmount ?? 0m,
-                    GrossAmount = t.GrossAmount,
-                    Fee = t.Fee,
-                    Currency = t.Currency ?? "INR",
-                    CreatedAt = t.CreatedAt ?? DateTime.UtcNow
-                });
+                    ["key"] = _options.MerchantKey,
+                    ["command"] = command,
+                    ["var1"] = settlementReference,
+                    ["hash"] = hash
+                };
+
+                var raw = await PostFormAsync("merchant/postservice.php?form=2", form, ct, "ListTransactions").ConfigureAwait(false);
+                var response = JsonSerializer.Deserialize<PayUIndiaSettlementTransactionListResponse>(raw, DeserializeOptions);
+                items = response?.Transactions;
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             }
-            return list;
+            catch
+            {
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
+                throw;
+            }
         }
-        catch
+
+        if (items is null) yield break;
+        foreach (var t in items)
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
+            ct.ThrowIfCancellationRequested();
+            yield return new SettlementTransaction
+            {
+                GatewayReference = t.MihPayId ?? t.TxnId ?? string.Empty,
+                Kind = MapKind(t.Type),
+                NetAmount = t.NetAmount ?? 0m,
+                GrossAmount = t.GrossAmount,
+                Fee = t.Fee,
+                Currency = t.Currency ?? "INR",
+                CreatedAt = t.CreatedAt ?? DateTime.UtcNow
+            };
         }
     }
 

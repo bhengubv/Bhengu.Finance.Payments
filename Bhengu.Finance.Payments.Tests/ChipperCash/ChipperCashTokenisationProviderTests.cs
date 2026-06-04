@@ -15,18 +15,27 @@ namespace Bhengu.Finance.Payments.Tests.ChipperCash;
 
 public class ChipperCashTokenisationProviderTests
 {
-    private static ChipperCashTokenisationProvider Create(StubHttpMessageHandler handler, IBhenguDistributedCache? cache = null, ChipperCashOptions? opts = null)
+    private static ChipperCashOptions DefaultOptions() => new()
     {
-        opts ??= new ChipperCashOptions
-        {
-            ApiKey = "chp-api-key",
-            ApiSecret = "chp-api-secret",
-            MerchantId = "MERCH-CHP",
-            Country = "NG",
-            Currency = "NGN"
-        };
+        ApiKey = "chp-api-key",
+        ApiSecret = "chp-api-secret",
+        MerchantId = "MERCH-CHP",
+        Country = "NG",
+        Currency = "NGN"
+    };
+
+    private static ChipperCashTokenisationProvider CreateRead(StubHttpMessageHandler handler, ChipperCashOptions? opts = null)
+    {
+        opts ??= DefaultOptions();
         var http = new HttpClient(handler);
-        return new ChipperCashTokenisationProvider(http, Options.Create(opts), NullLogger<ChipperCashTokenisationProvider>.Instance, cache);
+        return new ChipperCashTokenisationProvider(http, Options.Create(opts), NullLogger<ChipperCashTokenisationProvider>.Instance);
+    }
+
+    private static ChipperCashRawCardTokenisationProvider CreateRaw(StubHttpMessageHandler handler, IBhenguDistributedCache? cache = null, ChipperCashOptions? opts = null)
+    {
+        opts ??= DefaultOptions();
+        var http = new HttpClient(handler);
+        return new ChipperCashRawCardTokenisationProvider(http, Options.Create(opts), NullLogger<ChipperCashRawCardTokenisationProvider>.Instance, cache);
     }
 
     private static TokeniseRequest SampleRequest(string? key = null) => new()
@@ -64,7 +73,7 @@ public class ChipperCashTokenisationProviderTests
                 {"id":"REC-1","customerId":"CUST-1","name":"My MTN line","msisdn":"+2348012345678","network":"MTN","isDefault":false}
                 """);
         });
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         var method = await provider.TokeniseAsync(SampleRequest());
 
         Assert.Equal("REC-1", method.Token);
@@ -85,7 +94,7 @@ public class ChipperCashTokenisationProviderTests
                 """);
         });
         var cache = new InMemoryBhenguDistributedCache();
-        var provider = Create(handler, cache);
+        var provider = CreateRaw(handler, cache);
         var first = await provider.TokeniseAsync(SampleRequest("idem-1"));
         var second = await provider.TokeniseAsync(SampleRequest("idem-1"));
 
@@ -98,7 +107,7 @@ public class ChipperCashTokenisationProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) =>
             StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "rate limited"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderRateLimitException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -107,7 +116,7 @@ public class ChipperCashTokenisationProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) =>
             StubHttpMessageHandler.Text(HttpStatusCode.BadRequest, "bad"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -115,7 +124,7 @@ public class ChipperCashTokenisationProviderTests
     public async Task TokeniseAsync_WrapsHttpRequestExceptionAsProviderUnavailableException()
     {
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("DNS fail"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -124,7 +133,7 @@ public class ChipperCashTokenisationProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) =>
             StubHttpMessageHandler.Text(HttpStatusCode.NotFound, "missing"));
-        var provider = Create(handler);
+        var provider = CreateRead(handler);
         Assert.Null(await provider.GetPaymentMethodAsync("missing"));
     }
 
@@ -136,7 +145,7 @@ public class ChipperCashTokenisationProviderTests
             Assert.Equal(HttpMethod.Delete, req.Method);
             return StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}");
         });
-        var provider = Create(handler);
+        var provider = CreateRead(handler);
         Assert.True(await provider.DeletePaymentMethodAsync("REC-1"));
     }
 }

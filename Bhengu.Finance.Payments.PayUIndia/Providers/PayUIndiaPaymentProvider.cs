@@ -415,7 +415,8 @@ public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutP
                 {
                     GatewayReference = webhookEvent.Txnid,
                     Status = mappedStatus,
-                    EventType = $"payuindia.{status}"
+                    EventType = $"payuindia.{status}",
+                    Category = WebhookEventCategory.Unknown
                 }
             };
 

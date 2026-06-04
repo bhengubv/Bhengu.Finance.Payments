@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
@@ -45,24 +46,29 @@ public sealed class PaymobSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+    public async IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list");
-        var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
-        var from = fromUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-        var to = toUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-        var responseBody = await PaymobHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Get,
-            $"api/acceptance/settlements?from={from}&to={to}&auth_token={Uri.EscapeDataString(authToken)}",
-            null, "ListSettlements", ct).ConfigureAwait(false);
+        List<PaymobSettlement>? items;
+        using (BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list"))
+        {
+            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
+            var from = fromUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+            var to = toUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+            var responseBody = await PaymobHttpClient.SendAsync(
+                _httpClient, _logger, HttpMethod.Get,
+                $"api/acceptance/settlements?from={from}&to={to}&auth_token={Uri.EscapeDataString(authToken)}",
+                null, "ListSettlements", ct).ConfigureAwait(false);
 
-        var response = JsonSerializer.Deserialize<PaymobSettlementListResponse>(responseBody, PaymobHttpClient.Json);
-        if (response?.Results is null) return Array.Empty<Settlement>();
+            var response = JsonSerializer.Deserialize<PaymobSettlementListResponse>(responseBody, PaymobHttpClient.Json);
+            items = response?.Results;
+        }
 
-        var list = new List<Settlement>(response.Results.Count);
-        foreach (var s in response.Results)
-            list.Add(MapSettlement(s));
-        return list;
+        if (items is null) yield break;
+        foreach (var s in items)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return MapSettlement(s);
+        }
     }
 
     /// <inheritdoc/>
@@ -88,23 +94,28 @@ public sealed class PaymobSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
+    public async IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(string settlementReference, [EnumeratorCancellation] CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.transactions");
-        var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
-        var responseBody = await PaymobHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Get,
-            $"api/acceptance/settlements/{Uri.EscapeDataString(settlementReference)}/transactions?auth_token={Uri.EscapeDataString(authToken)}",
-            null, "SettlementTransactions", ct).ConfigureAwait(false);
+        List<PaymobSettlementTxn>? items;
+        using (BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.transactions"))
+        {
+            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, _logger, _options, ct).ConfigureAwait(false);
+            var responseBody = await PaymobHttpClient.SendAsync(
+                _httpClient, _logger, HttpMethod.Get,
+                $"api/acceptance/settlements/{Uri.EscapeDataString(settlementReference)}/transactions?auth_token={Uri.EscapeDataString(authToken)}",
+                null, "SettlementTransactions", ct).ConfigureAwait(false);
 
-        var response = JsonSerializer.Deserialize<PaymobSettlementTxnListResponse>(responseBody, PaymobHttpClient.Json);
-        if (response?.Results is null) return Array.Empty<SettlementTransaction>();
+            var response = JsonSerializer.Deserialize<PaymobSettlementTxnListResponse>(responseBody, PaymobHttpClient.Json);
+            items = response?.Results;
+        }
 
-        var list = new List<SettlementTransaction>(response.Results.Count);
-        foreach (var t in response.Results)
-            list.Add(MapTransaction(t));
-        return list;
+        if (items is null) yield break;
+        foreach (var t in items)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return MapTransaction(t);
+        }
     }
 
     private static Settlement MapSettlement(PaymobSettlement s) => new()

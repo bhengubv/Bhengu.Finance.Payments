@@ -26,6 +26,20 @@ public class BricsPaySettlementProviderTests
         return new BricsPaySettlementProvider(http, Options.Create(opts), NullLogger<BricsPaySettlementProvider>.Instance);
     }
 
+    private static async Task<List<Settlement>> ToListAsync(IAsyncEnumerable<Settlement> source)
+    {
+        var list = new List<Settlement>();
+        await foreach (var s in source) list.Add(s);
+        return list;
+    }
+
+    private static async Task<List<SettlementTransaction>> ToListAsync(IAsyncEnumerable<SettlementTransaction> source)
+    {
+        var list = new List<SettlementTransaction>();
+        await foreach (var t in source) list.Add(t);
+        return list;
+    }
+
     [Fact]
     public async Task ListSettlementsAsync_ReturnsBatches()
     {
@@ -37,7 +51,7 @@ public class BricsPaySettlementProviderTests
                 """);
         });
         var provider = Create(handler);
-        var list = await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-7), DateTime.UtcNow);
+        var list = await ToListAsync(provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-7), DateTime.UtcNow));
         Assert.Single(list);
         Assert.Equal("S-1", list[0].Reference);
         Assert.Equal(985m, list[0].NetAmount);
@@ -70,7 +84,7 @@ public class BricsPaySettlementProviderTests
             {"transactions":[{"transaction_reference":"TX-1","kind":"charge","gross_amount":100,"net_amount":97,"fee":3,"currency":"ZAR","created_at":"2026-06-04T07:00:00Z"}]}
             """));
         var provider = Create(handler);
-        var list = await provider.ListTransactionsAsync("S-1");
+        var list = await ToListAsync(provider.ListTransactionsAsync("S-1"));
         Assert.Single(list);
         Assert.Equal(SettlementTransactionKind.Charge, list[0].Kind);
     }
@@ -81,7 +95,7 @@ public class BricsPaySettlementProviderTests
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "rate"));
         var provider = Create(handler);
         await Assert.ThrowsAsync<ProviderRateLimitException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+            ToListAsync(provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow)));
     }
 
     [Fact]
@@ -90,6 +104,6 @@ public class BricsPaySettlementProviderTests
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("net"));
         var provider = Create(handler);
         await Assert.ThrowsAsync<ProviderUnavailableException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+            ToListAsync(provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow)));
     }
 }

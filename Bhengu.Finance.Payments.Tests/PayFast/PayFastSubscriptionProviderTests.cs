@@ -86,7 +86,7 @@ public class PayFastSubscriptionProviderTests
         Assert.Equal("cust-1", sub.CustomerId);
         Assert.Equal(SubscriptionStatus.Active, sub.Status);
 
-        var url = provider.TryGetAuthorisationUrl(sub.Reference);
+        var url = sub.AuthorisationUrl;
         Assert.NotNull(url);
         Assert.StartsWith("https://sandbox.payfast.co.za/eng/process?", url);
         Assert.Contains("subscription_type=1", url);

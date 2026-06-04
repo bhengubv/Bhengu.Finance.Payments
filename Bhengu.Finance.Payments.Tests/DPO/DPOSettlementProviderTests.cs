@@ -21,6 +21,20 @@ public class DPOSettlementProviderTests
         return new DPOSettlementProvider(http, Options.Create(opts), NullLogger<DPOSettlementProvider>.Instance);
     }
 
+    private static async Task<List<Settlement>> ToListAsync(IAsyncEnumerable<Settlement> source)
+    {
+        var list = new List<Settlement>();
+        await foreach (var s in source) list.Add(s);
+        return list;
+    }
+
+    private static async Task<List<SettlementTransaction>> ToListAsync(IAsyncEnumerable<SettlementTransaction> source)
+    {
+        var list = new List<SettlementTransaction>();
+        await foreach (var t in source) list.Add(t);
+        return list;
+    }
+
     [Fact]
     public async Task ListSettlementsAsync_ReturnsBatches()
     {
@@ -28,7 +42,7 @@ public class DPOSettlementProviderTests
             {"Result":"000","Settlements":[{"SettlementReference":"S-1","GrossAmount":"1000.00","NetAmount":"970.00","Fees":"30.00","Currency":"USD","SettlementDate":"2026-06-04","TransactionCount":4}]}
             """));
         var provider = Create(handler);
-        var list = await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-7), DateTime.UtcNow);
+        var list = await ToListAsync(provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-7), DateTime.UtcNow));
         Assert.Single(list);
         Assert.Equal("S-1", list[0].Reference);
         Assert.Equal(970m, list[0].NetAmount);
@@ -54,7 +68,7 @@ public class DPOSettlementProviderTests
             {"Result":"000","Transactions":[{"TransactionToken":"TT-1","Kind":"charge","GrossAmount":"100","NetAmount":"97","Fee":"3","Currency":"USD","TransactionDate":"2026-06-04"}]}
             """));
         var provider = Create(handler);
-        var list = await provider.ListTransactionsAsync("S-1");
+        var list = await ToListAsync(provider.ListTransactionsAsync("S-1"));
         Assert.Single(list);
         Assert.Equal(SettlementTransactionKind.Charge, list[0].Kind);
     }
@@ -65,7 +79,7 @@ public class DPOSettlementProviderTests
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "rate"));
         var provider = Create(handler);
         await Assert.ThrowsAsync<ProviderRateLimitException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+            ToListAsync(provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow)));
     }
 
     [Fact]
@@ -74,7 +88,7 @@ public class DPOSettlementProviderTests
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("net"));
         var provider = Create(handler);
         await Assert.ThrowsAsync<ProviderUnavailableException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+            ToListAsync(provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow)));
     }
 
     [Fact]
@@ -84,6 +98,6 @@ public class DPOSettlementProviderTests
             {"Result":"000"}
             """));
         var provider = Create(handler);
-        Assert.Empty(await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+        Assert.Empty(await ToListAsync(provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow)));
     }
 }

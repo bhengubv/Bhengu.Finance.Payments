@@ -27,6 +27,20 @@ public class OPaySettlementProviderTests
         return new OPaySettlementProvider(http, Options.Create(opts), NullLogger<OPaySettlementProvider>.Instance);
     }
 
+    private static async Task<List<Settlement>> Drain(IAsyncEnumerable<Settlement> source)
+    {
+        var list = new List<Settlement>();
+        await foreach (var s in source) list.Add(s);
+        return list;
+    }
+
+    private static async Task<List<SettlementTransaction>> Drain(IAsyncEnumerable<SettlementTransaction> source)
+    {
+        var list = new List<SettlementTransaction>();
+        await foreach (var s in source) list.Add(s);
+        return list;
+    }
+
     [Fact]
     public async Task ListSettlementsAsync_MapsResults()
     {
@@ -40,7 +54,7 @@ public class OPaySettlementProviderTests
                 """);
         });
         var provider = Create(handler);
-        var list = await provider.ListSettlementsAsync(new DateTime(2026, 6, 1), new DateTime(2026, 6, 30));
+        var list = await Drain(provider.ListSettlementsAsync(new DateTime(2026, 6, 1), new DateTime(2026, 6, 30)));
         Assert.Single(list);
         Assert.Equal("SET-1", list[0].Reference);
         Assert.Equal(4950m, list[0].NetAmount);
@@ -67,7 +81,7 @@ public class OPaySettlementProviderTests
                 ]}}
                 """));
         var provider = Create(handler);
-        var txns = await provider.ListTransactionsAsync("SET-1");
+        var txns = await Drain(provider.ListTransactionsAsync("SET-1"));
         Assert.Equal(2, txns.Count);
         Assert.Equal(SettlementTransactionKind.Charge, txns[0].Kind);
         Assert.Equal(SettlementTransactionKind.Refund, txns[1].Kind);
@@ -81,7 +95,7 @@ public class OPaySettlementProviderTests
             StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "rate"));
         var provider = Create(handler);
         await Assert.ThrowsAsync<ProviderRateLimitException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+            Drain(provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow)));
     }
 
     [Fact]
@@ -91,7 +105,7 @@ public class OPaySettlementProviderTests
             StubHttpMessageHandler.Text(HttpStatusCode.BadRequest, "bad"));
         var provider = Create(handler);
         await Assert.ThrowsAsync<PaymentDeclinedException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+            Drain(provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow)));
     }
 
     [Fact]
@@ -100,6 +114,6 @@ public class OPaySettlementProviderTests
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("dns"));
         var provider = Create(handler);
         await Assert.ThrowsAsync<ProviderUnavailableException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+            Drain(provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow)));
     }
 }

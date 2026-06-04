@@ -16,21 +16,26 @@ namespace Bhengu.Finance.Payments.Tests.OPay;
 
 public class OPayTokenisationProviderTests
 {
-    private static OPayTokenisationProvider Create(StubHttpMessageHandler handler, OPayOptions? opts = null)
+    private static OPayOptions DefaultOptions() => new()
     {
-        opts ??= new OPayOptions
-        {
-            PublicKey = "pub",
-            SecretKey = "sec",
-            MerchantId = "MERCH",
-            Country = "NG",
-            CallbackUrl = "https://example.com/cb",
-            ReturnUrl = "https://example.com/ret"
-        };
+        PublicKey = "pub",
+        SecretKey = "sec",
+        MerchantId = "MERCH",
+        Country = "NG",
+        CallbackUrl = "https://example.com/cb",
+        ReturnUrl = "https://example.com/ret"
+    };
+
+    private static OPayTokenisationProvider CreateRead(StubHttpMessageHandler handler) =>
+        new(new HttpClient(handler), Options.Create(DefaultOptions()),
+            NullLogger<OPayTokenisationProvider>.Instance);
+
+    private static OPayRawCardTokenisationProvider CreateRaw(StubHttpMessageHandler handler)
+    {
         var http = new HttpClient(handler);
         var cache = new OPayIdempotencyCache(new InMemoryBhenguDistributedCache());
-        return new OPayTokenisationProvider(http, Options.Create(opts),
-            NullLogger<OPayTokenisationProvider>.Instance, cache);
+        return new OPayRawCardTokenisationProvider(http, Options.Create(DefaultOptions()),
+            NullLogger<OPayRawCardTokenisationProvider>.Instance, cache);
     }
 
     private static TokeniseRequest SampleRequest(string? idempotencyKey = null) => new()
@@ -59,7 +64,7 @@ public class OPayTokenisationProviderTests
                 {"code":"00000","message":"OK","data":{"token":"opay-bank-tok","userId":"USR-001","bankAccountNumber":"0123456789","bankCode":"058","bankName":"GTBank","alias":"Default Bank","isDefault":true}}
                 """);
         });
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         var pm = await provider.TokeniseAsync(SampleRequest());
 
         Assert.Equal("opay-bank-tok", pm.Token);
@@ -76,7 +81,7 @@ public class OPayTokenisationProviderTests
         var handler = new StubHttpMessageHandler((_, _) =>
             StubHttpMessageHandler.Json(HttpStatusCode.OK,
                 """{"code":"40001","message":"bank not supported"}"""));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -84,7 +89,7 @@ public class OPayTokenisationProviderTests
     public async Task TokeniseAsync_Throws429AsProviderRateLimit()
     {
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "rate"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderRateLimitException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -92,7 +97,7 @@ public class OPayTokenisationProviderTests
     public async Task TokeniseAsync_WrapsNetworkFailureAsProviderUnavailable()
     {
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("dns"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -107,7 +112,7 @@ public class OPayTokenisationProviderTests
                 {"code":"00000","message":"OK","data":{"token":"opay-bank-dup","userId":"USR-001","bankAccountNumber":"0123456789","bankCode":"058","bankName":"GT","isDefault":false}}
                 """);
         });
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         var key = $"idemp-{Guid.NewGuid():N}";
         var first = await provider.TokeniseAsync(SampleRequest(key));
         var second = await provider.TokeniseAsync(SampleRequest(key));
@@ -125,8 +130,10 @@ public class OPayTokenisationProviderTests
                     {"token":"t2","bankAccountNumber":"0002222222","bankCode":"044","bankName":"Access"}
                 ]}}
                 """));
-        var provider = Create(handler);
-        var list = await provider.ListPaymentMethodsAsync("USR-001");
+        var provider = CreateRead(handler);
+        var list = new List<PaymentMethod>();
+        await foreach (var pm in provider.ListPaymentMethodsAsync("USR-001"))
+            list.Add(pm);
         Assert.Equal(2, list.Count);
         Assert.Equal("1111", list[0].Last4);
         Assert.True(list[0].IsDefault);
@@ -138,7 +145,7 @@ public class OPayTokenisationProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) =>
             StubHttpMessageHandler.Json(HttpStatusCode.OK, """{"code":"00000","message":"OK"}"""));
-        var provider = Create(handler);
+        var provider = CreateRead(handler);
         Assert.True(await provider.DeletePaymentMethodAsync("t1"));
     }
 }

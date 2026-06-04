@@ -18,20 +18,25 @@ public class InterswitchTokenisationProviderTests
 {
     private const string TokenJson = """{"access_token":"isw-tok","token_type":"bearer","expires_in":3600}""";
 
-    private static InterswitchTokenisationProvider Create(StubHttpMessageHandler handler, InterswitchOptions? opts = null)
+    private static InterswitchOptions DefaultOptions() => new()
     {
-        opts ??= new InterswitchOptions
-        {
-            ClientId = "isw-id",
-            ClientSecret = "isw-secret",
-            MerchantCode = "MX1",
-            ProductId = "1",
-            WebhookSecret = "wh"
-        };
+        ClientId = "isw-id",
+        ClientSecret = "isw-secret",
+        MerchantCode = "MX1",
+        ProductId = "1",
+        WebhookSecret = "wh"
+    };
+
+    private static InterswitchTokenisationProvider CreateRead(StubHttpMessageHandler handler) =>
+        new(new HttpClient(handler), Options.Create(DefaultOptions()),
+            NullLogger<InterswitchTokenisationProvider>.Instance);
+
+    private static InterswitchRawCardTokenisationProvider CreateRaw(StubHttpMessageHandler handler)
+    {
         var http = new HttpClient(handler);
         var cache = new InterswitchIdempotencyCache(new InMemoryBhenguDistributedCache());
-        return new InterswitchTokenisationProvider(http, Options.Create(opts),
-            NullLogger<InterswitchTokenisationProvider>.Instance, cache);
+        return new InterswitchRawCardTokenisationProvider(http, Options.Create(DefaultOptions()),
+            NullLogger<InterswitchRawCardTokenisationProvider>.Instance, cache);
     }
 
     private static StubHttpMessageHandler TokenThen(Func<HttpRequestMessage, HttpResponseMessage> apiHandler) =>
@@ -69,7 +74,7 @@ public class InterswitchTokenisationProviderTests
                  "expiryDate":"0630","cardScheme":"verve","alias":"Default","defaultCard":true}
                 """);
         });
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         var pm = await provider.TokeniseAsync(SampleRequest());
 
         Assert.Equal("isw-card-xyz", pm.Token);
@@ -87,7 +92,7 @@ public class InterswitchTokenisationProviderTests
     {
         var handler = TokenThen(_ => StubHttpMessageHandler.Json(HttpStatusCode.OK,
             """{"responseCode":"05","responseDescription":"do not honor"}"""));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -95,7 +100,7 @@ public class InterswitchTokenisationProviderTests
     public async Task TokeniseAsync_Throws429AsProviderRateLimit()
     {
         var handler = TokenThen(_ => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "rate"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderRateLimitException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -110,7 +115,7 @@ public class InterswitchTokenisationProviderTests
                 {"cardToken":"isw-card-dup","customerId":"CUS-001","maskedPan":"507850******0000","expiryDate":"0630","cardScheme":"verve"}
                 """);
         });
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         var key = $"idemp-{Guid.NewGuid():N}";
         var first = await provider.TokeniseAsync(SampleRequest(key));
         var second = await provider.TokeniseAsync(SampleRequest(key));
@@ -125,7 +130,7 @@ public class InterswitchTokenisationProviderTests
             req.RequestUri!.AbsolutePath.Contains("oauth/token", StringComparison.OrdinalIgnoreCase)
                 ? StubHttpMessageHandler.Json(HttpStatusCode.OK, TokenJson)
                 : throw new HttpRequestException("DNS fail"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -133,7 +138,7 @@ public class InterswitchTokenisationProviderTests
     public async Task GetPaymentMethodAsync_ReturnsNull_On404()
     {
         var handler = TokenThen(_ => StubHttpMessageHandler.Text(HttpStatusCode.NotFound, "no"));
-        var provider = Create(handler);
+        var provider = CreateRead(handler);
         Assert.Null(await provider.GetPaymentMethodAsync("missing"));
     }
 
@@ -150,8 +155,10 @@ public class InterswitchTokenisationProviderTests
                 ]}
                 """);
         });
-        var provider = Create(handler);
-        var list = await provider.ListPaymentMethodsAsync("CUS-001");
+        var provider = CreateRead(handler);
+        var list = new List<PaymentMethod>();
+        await foreach (var pm in provider.ListPaymentMethodsAsync("CUS-001"))
+            list.Add(pm);
         Assert.Equal(2, list.Count);
         Assert.Equal("1111", list[0].Last4);
         Assert.True(list[0].IsDefault);
@@ -162,7 +169,7 @@ public class InterswitchTokenisationProviderTests
     public async Task DeletePaymentMethodAsync_ReturnsFalse_On404()
     {
         var handler = TokenThen(_ => StubHttpMessageHandler.Text(HttpStatusCode.NotFound, "no"));
-        var provider = Create(handler);
+        var provider = CreateRead(handler);
         Assert.False(await provider.DeletePaymentMethodAsync("missing"));
     }
 }

@@ -51,7 +51,9 @@ public class CellulantSettlementProviderTests
                 """);
         });
         var provider = Create(handler);
-        var list = await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-7), DateTime.UtcNow);
+        var list = new List<Settlement>();
+        await foreach (var s in provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-7), DateTime.UtcNow))
+            list.Add(s);
         Assert.Single(list);
         Assert.Equal("SET-1", list[0].Reference);
         Assert.Equal(985m, list[0].NetAmount);
@@ -86,7 +88,9 @@ public class CellulantSettlementProviderTests
             {"data":[{"transactionReference":"TX-1","kind":"charge","grossAmount":100,"netAmount":97,"fee":3,"currency":"KES","createdAt":"2026-06-04T07:30:00Z"}]}
             """));
         var provider = Create(handler);
-        var list = await provider.ListTransactionsAsync("SET-1");
+        var list = new List<SettlementTransaction>();
+        await foreach (var t in provider.ListTransactionsAsync("SET-1"))
+            list.Add(t);
         Assert.Single(list);
         Assert.Equal(SettlementTransactionKind.Charge, list[0].Kind);
         Assert.Equal(97m, list[0].NetAmount);
@@ -97,8 +101,10 @@ public class CellulantSettlementProviderTests
     {
         var handler = ComposeWithToken((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "rate"));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<ProviderRateLimitException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+        await Assert.ThrowsAsync<ProviderRateLimitException>(async () =>
+        {
+            await foreach (var _ in provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow)) { }
+        });
     }
 
     [Fact]
@@ -106,7 +112,9 @@ public class CellulantSettlementProviderTests
     {
         var handler = ComposeWithToken((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.InternalServerError, "down"));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<ProviderUnavailableException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+        await Assert.ThrowsAsync<ProviderUnavailableException>(async () =>
+        {
+            await foreach (var _ in provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow)) { }
+        });
     }
 }

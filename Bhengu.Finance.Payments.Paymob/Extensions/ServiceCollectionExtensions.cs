@@ -41,6 +41,7 @@ public static class ServiceCollectionExtensions
 
         services.AddHttpClient<PaymobPaymentProvider>();
         services.AddHttpClient<PaymobTokenisationProvider>();
+        services.AddHttpClient<PaymobRawCardTokenisationProvider>();
         services.AddHttpClient<PaymobSubscriptionProvider>();
         services.AddHttpClient<PaymobThreeDSecureProvider>();
         services.AddHttpClient<PaymobSettlementProvider>();
@@ -51,6 +52,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<PaymobPaymentProvider>());
         services.AddTransient<ITokenisationProvider, PaymobTokenisationProvider>(sp =>
             sp.GetRequiredService<PaymobTokenisationProvider>());
+        services.AddTransient<IRawCardTokenisationProvider, PaymobRawCardTokenisationProvider>(sp =>
+            sp.GetRequiredService<PaymobRawCardTokenisationProvider>());
         services.AddTransient<ISubscriptionProvider, PaymobSubscriptionProvider>(sp =>
             sp.GetRequiredService<PaymobSubscriptionProvider>());
         services.AddTransient<IThreeDSecureProvider, PaymobThreeDSecureProvider>(sp =>
@@ -64,6 +67,8 @@ public static class ServiceCollectionExtensions
             (sp, _) => sp.GetRequiredService<PaymobPaymentProvider>());
         services.AddKeyedTransient<ITokenisationProvider>(ProviderNames.Paymob,
             (sp, _) => sp.GetRequiredService<PaymobTokenisationProvider>());
+        services.AddKeyedTransient<IRawCardTokenisationProvider>(ProviderNames.Paymob,
+            (sp, _) => sp.GetRequiredService<PaymobRawCardTokenisationProvider>());
         services.AddKeyedTransient<ISubscriptionProvider>(ProviderNames.Paymob,
             (sp, _) => sp.GetRequiredService<PaymobSubscriptionProvider>());
         services.AddKeyedTransient<IThreeDSecureProvider>(ProviderNames.Paymob,

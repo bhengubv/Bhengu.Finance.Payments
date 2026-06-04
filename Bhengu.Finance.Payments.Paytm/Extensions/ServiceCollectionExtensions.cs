@@ -49,16 +49,19 @@ public static class ServiceCollectionExtensions
 
         // Optional contracts.
         services.AddHttpClient<PaytmTokenisationProvider>();
+        services.AddHttpClient<PaytmRawCardTokenisationProvider>();
         services.AddHttpClient<PaytmSubscriptionProvider>();
         services.AddHttpClient<PaytmQrCodeProvider>();
         services.AddHttpClient<PaytmSettlementProvider>();
 
         services.AddTransient<ITokenisationProvider>(sp => sp.GetRequiredService<PaytmTokenisationProvider>());
+        services.AddTransient<IRawCardTokenisationProvider>(sp => sp.GetRequiredService<PaytmRawCardTokenisationProvider>());
         services.AddTransient<ISubscriptionProvider>(sp => sp.GetRequiredService<PaytmSubscriptionProvider>());
         services.AddTransient<IQrCodeProvider>(sp => sp.GetRequiredService<PaytmQrCodeProvider>());
         services.AddTransient<ISettlementProvider>(sp => sp.GetRequiredService<PaytmSettlementProvider>());
 
         services.AddKeyedTransient<ITokenisationProvider>(ProviderNames.Paytm, (sp, _) => sp.GetRequiredService<PaytmTokenisationProvider>());
+        services.AddKeyedTransient<IRawCardTokenisationProvider>(ProviderNames.Paytm, (sp, _) => sp.GetRequiredService<PaytmRawCardTokenisationProvider>());
         services.AddKeyedTransient<ISubscriptionProvider>(ProviderNames.Paytm, (sp, _) => sp.GetRequiredService<PaytmSubscriptionProvider>());
         services.AddKeyedTransient<IQrCodeProvider>(ProviderNames.Paytm, (sp, _) => sp.GetRequiredService<PaytmQrCodeProvider>());
         services.AddKeyedTransient<ISettlementProvider>(ProviderNames.Paytm, (sp, _) => sp.GetRequiredService<PaytmSettlementProvider>());
