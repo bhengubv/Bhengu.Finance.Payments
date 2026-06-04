@@ -143,7 +143,7 @@ public class StripeIdempotencyTests
                 {"id":"cus_test","object":"customer","email":"a@b.com"}
                 """);
         });
-        var provider = new StripeTokenisationProvider(new HttpClient(handler), Options.Create(Opts()), NullLogger<StripeTokenisationProvider>.Instance);
+        var provider = new StripeRawCardTokenisationProvider(new HttpClient(handler), Options.Create(Opts()), NullLogger<StripeRawCardTokenisationProvider>.Instance);
 
         await provider.TokeniseAsync(new Core.Models.Vault.TokeniseRequest
         {

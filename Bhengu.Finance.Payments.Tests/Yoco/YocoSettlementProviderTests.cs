@@ -37,7 +37,7 @@ public class YocoSettlementProviderTests
         });
         var provider = Create(handler);
 
-        var list = await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-7), DateTime.UtcNow);
+        var list = await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-7), DateTime.UtcNow).ToListAsync();
         Assert.Equal(2, list.Count);
         Assert.Equal("po_1", list[0].Reference);
         Assert.Equal(1450m, list[0].NetAmount);
@@ -86,7 +86,7 @@ public class YocoSettlementProviderTests
             """));
         var provider = Create(handler);
 
-        var txs = await provider.ListTransactionsAsync("po_1");
+        var txs = await provider.ListTransactionsAsync("po_1").ToListAsync();
         Assert.Equal(3, txs.Count);
         Assert.Equal(SettlementTransactionKind.Charge, txs[0].Kind);
         Assert.Equal(SettlementTransactionKind.Refund, txs[1].Kind);
@@ -98,15 +98,15 @@ public class YocoSettlementProviderTests
     public async Task ListSettlementsAsync_Throws5xxAsProviderUnavailable()
     {
         var provider = Create(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.BadGateway, "down")));
-        await Assert.ThrowsAsync<ProviderUnavailableException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+        await Assert.ThrowsAsync<ProviderUnavailableException>(async () =>
+            await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow).ToListAsync());
     }
 
     [Fact]
     public async Task ListSettlementsAsync_Throws429AsRateLimit()
     {
         var provider = Create(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "slow")));
-        await Assert.ThrowsAsync<ProviderRateLimitException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+        await Assert.ThrowsAsync<ProviderRateLimitException>(async () =>
+            await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow).ToListAsync());
     }
 }

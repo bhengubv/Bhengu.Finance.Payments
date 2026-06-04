@@ -164,7 +164,7 @@ public class MercadoPagoMarketplaceProviderTests
     public async Task ListSubAccountsAsync_ReturnsEmpty()
     {
         var provider = Create(new StubHttpMessageHandler((_, _) => throw new InvalidOperationException("Should not POST")));
-        var list = await provider.ListSubAccountsAsync();
+        var list = await provider.ListSubAccountsAsync().ToListAsync();
         Assert.Empty(list);
     }
 }

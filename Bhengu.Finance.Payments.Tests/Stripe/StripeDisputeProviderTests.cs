@@ -63,7 +63,7 @@ public class StripeDisputeProviderTests
             ],"has_more":false}
             """));
         var provider = Create(handler);
-        var disputes = await provider.ListDisputesAsync();
+        var disputes = await provider.ListDisputesAsync().ToListAsync();
         Assert.Equal(2, disputes.Count);
         Assert.Equal(DisputeStatus.Won, disputes[0].Status);
         Assert.Equal(DisputeStatus.Lost, disputes[1].Status);
@@ -134,7 +134,7 @@ public class StripeDisputeProviderTests
             {"error":{"type":"invalid_request_error","message":"Too many requests"}}
             """));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<ProviderRateLimitException>(() => provider.ListDisputesAsync());
+        await Assert.ThrowsAsync<ProviderRateLimitException>(async () => await provider.ListDisputesAsync().ToListAsync());
     }
 
     [Fact]
@@ -144,6 +144,6 @@ public class StripeDisputeProviderTests
             {"error":{"type":"api_error","message":"Stripe is down"}}
             """));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.ListDisputesAsync());
+        await Assert.ThrowsAsync<ProviderUnavailableException>(async () => await provider.ListDisputesAsync().ToListAsync());
     }
 }

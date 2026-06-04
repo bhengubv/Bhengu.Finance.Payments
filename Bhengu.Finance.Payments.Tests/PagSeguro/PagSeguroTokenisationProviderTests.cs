@@ -19,6 +19,11 @@ public class PagSeguroTokenisationProviderTests
             Options.Create(new PagSeguroOptions { ApiToken = "pagbank-test-token" }),
             NullLogger<PagSeguroTokenisationProvider>.Instance);
 
+    private static PagSeguroRawCardTokenisationProvider CreateRaw(StubHttpMessageHandler handler) =>
+        new(new HttpClient(handler),
+            Options.Create(new PagSeguroOptions { ApiToken = "pagbank-test-token" }),
+            NullLogger<PagSeguroRawCardTokenisationProvider>.Instance);
+
     private static TokeniseRequest SampleRequest() => new()
     {
         Card = new CardDetails
@@ -44,7 +49,7 @@ public class PagSeguroTokenisationProviderTests
                 {"id":"TOK_abc","type":"card","created_at":"2026-06-03T10:00:00-03:00","card":{"brand":"visa","last4":"1111","exp_month":12,"exp_year":2030}}
                 """);
         });
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
 
         var pm = await provider.TokeniseAsync(SampleRequest());
 
@@ -63,7 +68,7 @@ public class PagSeguroTokenisationProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) =>
             StubHttpMessageHandler.Text(HttpStatusCode.BadRequest, "card declined"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -103,7 +108,7 @@ public class PagSeguroTokenisationProviderTests
             return StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}");
         });
         var provider = Create(handler);
-        var list = await provider.ListPaymentMethodsAsync("CUST_1");
+        var list = await provider.ListPaymentMethodsAsync("CUST_1").ToListAsync();
         Assert.Empty(list);
         Assert.Equal(0, calls);
     }

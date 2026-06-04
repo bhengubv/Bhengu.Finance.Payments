@@ -34,7 +34,7 @@ public class StripeSettlementProviderTests
                 """);
         });
         var provider = Create(handler);
-        var settlements = await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-30), DateTime.UtcNow);
+        var settlements = await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-30), DateTime.UtcNow).ToListAsync();
 
         Assert.Equal(2, settlements.Count);
         Assert.Equal("po_1", settlements[0].Reference);
@@ -78,7 +78,7 @@ public class StripeSettlementProviderTests
                 """);
         });
         var provider = Create(handler);
-        var transactions = await provider.ListTransactionsAsync("po_1");
+        var transactions = await provider.ListTransactionsAsync("po_1").ToListAsync();
 
         Assert.Equal(2, transactions.Count);
         Assert.Equal(SettlementTransactionKind.Charge, transactions[0].Kind);
@@ -93,8 +93,8 @@ public class StripeSettlementProviderTests
             {"error":{"type":"invalid_request_error","message":"Too many requests"}}
             """));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<ProviderRateLimitException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-30), DateTime.UtcNow));
+        await Assert.ThrowsAsync<ProviderRateLimitException>(async () =>
+            await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-30), DateTime.UtcNow).ToListAsync());
     }
 
     [Fact]
@@ -104,7 +104,7 @@ public class StripeSettlementProviderTests
             {"error":{"type":"api_error","message":"Stripe is down"}}
             """));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<ProviderUnavailableException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-30), DateTime.UtcNow));
+        await Assert.ThrowsAsync<ProviderUnavailableException>(async () =>
+            await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-30), DateTime.UtcNow).ToListAsync());
     }
 }

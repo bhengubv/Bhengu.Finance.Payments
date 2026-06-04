@@ -27,7 +27,7 @@ public class CMISettlementProviderTests
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.OK,
             "<CC5Response><Settlement><Id>S1</Id><NetAmount>1000.00</NetAmount><GrossAmount>1100.00</GrossAmount><Fees>100.00</Fees><Currency>MAD</Currency><SettledAt>2026-06-01T00:00:00Z</SettledAt><Count>5</Count></Settlement></CC5Response>"));
         var provider = Create(handler);
-        var list = await provider.ListSettlementsAsync(new DateTime(2026, 6, 1), new DateTime(2026, 6, 30));
+        var list = await provider.ListSettlementsAsync(new DateTime(2026, 6, 1), new DateTime(2026, 6, 30)).ToListAsync();
         Assert.Single(list);
         Assert.Equal("S1", list[0].Reference);
         Assert.Equal(1000m, list[0].NetAmount);
@@ -52,7 +52,7 @@ public class CMISettlementProviderTests
             "<Transaction><OrderId>O2</OrderId><Type>Credit</Type><NetAmount>-100.00</NetAmount><Currency>MAD</Currency><Date>2026-06-04T00:00:00Z</Date></Transaction>" +
             "</CC5Response>"));
         var provider = Create(handler);
-        var txns = await provider.ListTransactionsAsync("S1");
+        var txns = await provider.ListTransactionsAsync("S1").ToListAsync();
         Assert.Equal(2, txns.Count);
         Assert.Equal(SettlementTransactionKind.Charge, txns[0].Kind);
         Assert.Equal(SettlementTransactionKind.Refund, txns[1].Kind);
@@ -64,7 +64,7 @@ public class CMISettlementProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "rate"));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<ProviderRateLimitException>(() => provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+        await Assert.ThrowsAsync<ProviderRateLimitException>(async () => await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow).ToListAsync());
     }
 
     [Fact]
@@ -72,6 +72,6 @@ public class CMISettlementProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("DNS"));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+        await Assert.ThrowsAsync<ProviderUnavailableException>(async () => await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow).ToListAsync());
     }
 }

@@ -48,7 +48,7 @@ public class PesapalSettlementProviderTests
                 ]}
                 """);
         }));
-        var settlements = await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-30), DateTime.UtcNow);
+        var settlements = await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-30), DateTime.UtcNow).ToListAsync();
         Assert.Single(settlements);
         Assert.Equal("st-1", settlements[0].Reference);
         Assert.Equal(990.5m, settlements[0].NetAmount);
@@ -71,7 +71,7 @@ public class PesapalSettlementProviderTests
                     {"confirmation_code":"cc-b","amount":50,"net_amount":50,"fees":0,"currency":"KES","transaction_type":"refund"}
                 ]}
                 """)));
-        var txns = await provider.ListTransactionsAsync("st-1");
+        var txns = await provider.ListTransactionsAsync("st-1").ToListAsync();
         Assert.Equal(2, txns.Count);
         Assert.Equal(SettlementTransactionKind.Charge, txns[0].Kind);
         Assert.Equal(SettlementTransactionKind.Refund, txns[1].Kind);
@@ -81,6 +81,6 @@ public class PesapalSettlementProviderTests
     public async Task ListSettlementsAsync_Throws429AsRateLimit()
     {
         var provider = Create(StubWithToken(_ => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "slow")));
-        await Assert.ThrowsAsync<ProviderRateLimitException>(() => provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+        await Assert.ThrowsAsync<ProviderRateLimitException>(async () => await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow).ToListAsync());
     }
 }

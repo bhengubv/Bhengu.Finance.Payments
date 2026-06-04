@@ -23,6 +23,15 @@ public class PayUIndiaTokenisationProviderTests
             }),
             NullLogger<PayUIndiaTokenisationProvider>.Instance);
 
+    private static PayUIndiaRawCardTokenisationProvider CreateRaw(StubHttpMessageHandler handler) =>
+        new(new HttpClient(handler),
+            Options.Create(new PayUIndiaOptions
+            {
+                MerchantKey = "gtKFFx",
+                Salt = "eCwWELxi"
+            }),
+            NullLogger<PayUIndiaRawCardTokenisationProvider>.Instance);
+
     private static TokeniseRequest SampleRequest() => new()
     {
         Card = new CardDetails
@@ -47,7 +56,7 @@ public class PayUIndiaTokenisationProviderTests
                 {"status":"1","card_token":"vaulted_token_1","card_mode":"VISA","user_credentials":"merchant:cust1"}
                 """);
         });
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
 
         var pm = await provider.TokeniseAsync(SampleRequest());
 
@@ -92,7 +101,7 @@ public class PayUIndiaTokenisationProviderTests
                 """));
         var provider = Create(handler);
 
-        var list = await provider.ListPaymentMethodsAsync("cust1");
+        var list = await provider.ListPaymentMethodsAsync("cust1").ToListAsync();
 
         Assert.Equal(2, list.Count);
         Assert.Equal("t1", list[0].Token);
@@ -123,7 +132,7 @@ public class PayUIndiaTokenisationProviderTests
     public async Task TokeniseAsync_OnNetworkFailure_Throws()
     {
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("dns"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 }

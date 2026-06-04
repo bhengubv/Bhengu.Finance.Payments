@@ -25,6 +25,17 @@ public class YocoTokenisationProviderTests
             cache ?? new YocoTokenCache());
     }
 
+    private static YocoRawCardTokenisationProvider CreateRaw(StubHttpMessageHandler handler, YocoTokenCache? cache = null)
+    {
+        var opts = new YocoOptions { SecretKey = "sk_test_xx", WebhookSecret = "ws" };
+        var http = new HttpClient(handler);
+        return new YocoRawCardTokenisationProvider(
+            http,
+            Options.Create(opts),
+            NullLogger<YocoRawCardTokenisationProvider>.Instance,
+            cache ?? new YocoTokenCache());
+    }
+
     private static TokeniseRequest SampleRequest() => new()
     {
         Card = new CardDetails
@@ -52,7 +63,7 @@ public class YocoTokenisationProviderTests
                 """);
         });
         var cache = new YocoTokenCache();
-        var provider = Create(handler, cache);
+        var provider = CreateRaw(handler, cache);
 
         var method = await provider.TokeniseAsync(SampleRequest());
 
@@ -71,21 +82,21 @@ public class YocoTokenisationProviderTests
     [Fact]
     public async Task TokeniseAsync_Throws4xxAsPaymentDeclined()
     {
-        var provider = Create(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.BadRequest, "invalid")));
+        var provider = CreateRaw(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.BadRequest, "invalid")));
         await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
     [Fact]
     public async Task TokeniseAsync_Throws5xxAsProviderUnavailable()
     {
-        var provider = Create(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.BadGateway, "down")));
+        var provider = CreateRaw(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.BadGateway, "down")));
         await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
     [Fact]
     public async Task TokeniseAsync_Throws429AsRateLimit()
     {
-        var provider = Create(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "slow")));
+        var provider = CreateRaw(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "slow")));
         await Assert.ThrowsAsync<ProviderRateLimitException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -113,7 +124,7 @@ public class YocoTokenisationProviderTests
     public async Task ListPaymentMethodsAsync_ReturnsEmptyList()
     {
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
-        var list = await provider.ListPaymentMethodsAsync("cust-1");
+        var list = await provider.ListPaymentMethodsAsync("cust-1").ToListAsync();
         Assert.Empty(list);
     }
 

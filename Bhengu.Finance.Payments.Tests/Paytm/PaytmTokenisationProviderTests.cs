@@ -19,6 +19,11 @@ public class PaytmTokenisationProviderTests
             Options.Create(new PaytmOptions { MerchantId = "MID1", MerchantKey = "secret_key" }),
             NullLogger<PaytmTokenisationProvider>.Instance);
 
+    private static PaytmRawCardTokenisationProvider CreateRaw(StubHttpMessageHandler handler) =>
+        new(new HttpClient(handler),
+            Options.Create(new PaytmOptions { MerchantId = "MID1", MerchantKey = "secret_key" }),
+            NullLogger<PaytmRawCardTokenisationProvider>.Instance);
+
     private static TokeniseRequest SampleRequest() => new()
     {
         Card = new CardDetails
@@ -43,7 +48,7 @@ public class PaytmTokenisationProviderTests
                 {"body":{"resultInfo":{"resultStatus":"S","resultCode":"01"},"cardToken":"tkn-1","cardScheme":"VISA"}}
                 """);
         });
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
 
         var pm = await provider.TokeniseAsync(SampleRequest());
         Assert.Equal("tkn-1", pm.Token);
@@ -60,7 +65,7 @@ public class PaytmTokenisationProviderTests
             StubHttpMessageHandler.Json(HttpStatusCode.OK, """
                 {"body":{"resultInfo":{"resultStatus":"F","resultCode":"401","resultMsg":"Card declined"}}}
                 """));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -71,8 +76,9 @@ public class PaytmTokenisationProviderTests
             StubHttpMessageHandler.Json(HttpStatusCode.OK, """
                 {"body":{"resultInfo":{"resultStatus":"S"},"cardToken":"tkn-2","cardScheme":"MASTERCARD"}}
                 """));
+        var rawProvider = CreateRaw(handler);
         var provider = Create(handler);
-        var pm = await provider.TokeniseAsync(SampleRequest());
+        var pm = await rawProvider.TokeniseAsync(SampleRequest());
 
         var fetched = await provider.GetPaymentMethodAsync(pm.Token);
         Assert.NotNull(fetched);
@@ -94,16 +100,17 @@ public class PaytmTokenisationProviderTests
             StubHttpMessageHandler.Json(HttpStatusCode.OK, """
                 {"body":{"resultInfo":{"resultStatus":"S"},"cardToken":"tkn-3","cardScheme":"VISA"}}
                 """));
+        var rawProvider = CreateRaw(handler);
         var provider = Create(handler);
-        await provider.TokeniseAsync(SampleRequest() with { CustomerId = "shared_cust" });
-        await provider.TokeniseAsync(new TokeniseRequest
+        await rawProvider.TokeniseAsync(SampleRequest() with { CustomerId = "shared_cust" });
+        await rawProvider.TokeniseAsync(new TokeniseRequest
         {
             Card = SampleRequest().Card,
             CustomerId = "shared_cust",
             DisplayName = "second card"
         });
 
-        var list = await provider.ListPaymentMethodsAsync("shared_cust");
+        var list = await provider.ListPaymentMethodsAsync("shared_cust").ToListAsync();
         Assert.NotEmpty(list);
         Assert.All(list, m => Assert.Equal("shared_cust", m.CustomerId));
     }
@@ -115,8 +122,9 @@ public class PaytmTokenisationProviderTests
             StubHttpMessageHandler.Json(HttpStatusCode.OK, """
                 {"body":{"resultInfo":{"resultStatus":"S"},"cardToken":"tkn-4","cardScheme":"VISA"}}
                 """));
+        var rawProvider = CreateRaw(handler);
         var provider = Create(handler);
-        var pm = await provider.TokeniseAsync(SampleRequest());
+        var pm = await rawProvider.TokeniseAsync(SampleRequest());
 
         Assert.True(await provider.DeletePaymentMethodAsync(pm.Token));
         Assert.Null(await provider.GetPaymentMethodAsync(pm.Token));
@@ -126,7 +134,7 @@ public class PaytmTokenisationProviderTests
     public async Task TokeniseAsync_OnNetworkFailure_Throws()
     {
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("dns"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 }

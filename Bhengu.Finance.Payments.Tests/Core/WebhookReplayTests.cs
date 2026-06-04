@@ -3,6 +3,7 @@
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Core.Webhooks;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
@@ -35,7 +36,7 @@ public class WebhookReplayTests
         public TestProvider(string name, Func<string, WebhookEvent?>? parse = null)
         {
             ProviderName = name;
-            Parse = parse ?? (p => new WebhookEvent { GatewayReference = p, Status = PaymentStatus.Completed });
+            Parse = parse ?? (p => new WebhookEvent { GatewayReference = p, Status = PaymentStatus.Completed, Category = WebhookEventCategory.ChargeSucceeded });
         }
 
         public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default) =>

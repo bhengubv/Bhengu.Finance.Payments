@@ -39,7 +39,7 @@ public class PayUIndiaSettlementProviderTests
         var provider = Create(handler);
         var list = await provider.ListSettlementsAsync(
             new DateTime(2026, 5, 1, 0, 0, 0, DateTimeKind.Utc),
-            new DateTime(2026, 5, 2, 0, 0, 0, DateTimeKind.Utc));
+            new DateTime(2026, 5, 2, 0, 0, 0, DateTimeKind.Utc)).ToListAsync();
 
         Assert.Equal(2, list.Count);
         Assert.Equal("S1", list[0].Reference);
@@ -53,7 +53,7 @@ public class PayUIndiaSettlementProviderTests
         var handler = new StubHttpMessageHandler((_, _) =>
             StubHttpMessageHandler.Json(HttpStatusCode.OK, """{"status":"1","settlements":[]}"""));
         var provider = Create(handler);
-        var list = await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow);
+        var list = await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow).ToListAsync();
         Assert.Empty(list);
     }
 
@@ -91,7 +91,7 @@ public class PayUIndiaSettlementProviderTests
                 ]}
                 """));
         var provider = Create(handler);
-        var list = await provider.ListTransactionsAsync("S1");
+        var list = await provider.ListTransactionsAsync("S1").ToListAsync();
         Assert.Equal(2, list.Count);
         Assert.Equal(SettlementTransactionKind.Charge, list[0].Kind);
         Assert.Equal(SettlementTransactionKind.Refund, list[1].Kind);
@@ -102,7 +102,7 @@ public class PayUIndiaSettlementProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("dns"));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<ProviderUnavailableException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+        await Assert.ThrowsAsync<ProviderUnavailableException>(async () =>
+            await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow).ToListAsync());
     }
 }

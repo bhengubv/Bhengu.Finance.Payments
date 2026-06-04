@@ -20,7 +20,14 @@ public class PaymobTokenisationProviderTests
     {
         opts ??= new PaymobOptions { ApiKey = "api_test_key", IntegrationId = 100 };
         var http = new HttpClient(handler);
-        return new PaymobTokenisationProvider(http, Options.Create(opts), NullLogger<PaymobTokenisationProvider>.Instance,
+        return new PaymobTokenisationProvider(http, Options.Create(opts), NullLogger<PaymobTokenisationProvider>.Instance);
+    }
+
+    private static PaymobRawCardTokenisationProvider CreateRaw(StubHttpMessageHandler handler, PaymobOptions? opts = null)
+    {
+        opts ??= new PaymobOptions { ApiKey = "api_test_key", IntegrationId = 100 };
+        var http = new HttpClient(handler);
+        return new PaymobRawCardTokenisationProvider(http, Options.Create(opts), NullLogger<PaymobRawCardTokenisationProvider>.Instance,
             new PaymobIdempotencyCache(new InMemoryBhenguDistributedCache()));
     }
 
@@ -45,8 +52,7 @@ public class PaymobTokenisationProviderTests
     {
         var http = new HttpClient(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
         Assert.Throws<ProviderConfigurationException>(() => new PaymobTokenisationProvider(
-            http, Options.Create(new PaymobOptions()), NullLogger<PaymobTokenisationProvider>.Instance,
-            new PaymobIdempotencyCache(new InMemoryBhenguDistributedCache())));
+            http, Options.Create(new PaymobOptions()), NullLogger<PaymobTokenisationProvider>.Instance));
     }
 
     [Fact]
@@ -60,7 +66,7 @@ public class PaymobTokenisationProviderTests
             return StubHttpMessageHandler.Json(HttpStatusCode.OK,
                 """{"card_token":"CT_abc","masked_pan":"411111******1111","card_subtype":"VISA"}""");
         });
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         var pm = await provider.TokeniseAsync(SampleRequest());
         Assert.Equal("CT_abc", pm.Token);
         Assert.Equal("cust-1", pm.CustomerId);
@@ -79,7 +85,7 @@ public class PaymobTokenisationProviderTests
                 return StubHttpMessageHandler.Json(HttpStatusCode.OK, """{"token":"tok"}""");
             return StubHttpMessageHandler.Json(HttpStatusCode.OK, """{"masked_pan":"411111******1111"}""");
         });
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -87,7 +93,7 @@ public class PaymobTokenisationProviderTests
     public async Task TokeniseAsync_Throws429AsRateLimit()
     {
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "limit"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderRateLimitException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -95,7 +101,7 @@ public class PaymobTokenisationProviderTests
     public async Task TokeniseAsync_Throws5xxAsProviderUnavailable()
     {
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.InternalServerError, "down"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -103,7 +109,7 @@ public class PaymobTokenisationProviderTests
     public async Task TokeniseAsync_WrapsNetworkAsProviderUnavailable()
     {
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("DNS"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -118,7 +124,7 @@ public class PaymobTokenisationProviderTests
             charges++;
             return StubHttpMessageHandler.Json(HttpStatusCode.OK, $$"""{"card_token":"CT_{{charges}}","card_subtype":"VISA"}""");
         });
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         var r1 = await provider.TokeniseAsync(SampleRequest("idem-1"));
         var r2 = await provider.TokeniseAsync(SampleRequest("idem-1"));
         Assert.Equal(r1.Token, r2.Token);

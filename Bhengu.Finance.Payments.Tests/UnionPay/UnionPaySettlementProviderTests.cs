@@ -44,7 +44,7 @@ public class UnionPaySettlementProviderTests
 
         var list = await provider.ListSettlementsAsync(
             new DateTime(2026, 5, 1, 0, 0, 0, DateTimeKind.Utc),
-            new DateTime(2026, 5, 1, 0, 0, 0, DateTimeKind.Utc));
+            new DateTime(2026, 5, 1, 0, 0, 0, DateTimeKind.Utc)).ToListAsync();
 
         Assert.Single(list);
         Assert.Equal("BATCH20260501", list[0].Reference);
@@ -61,7 +61,7 @@ public class UnionPaySettlementProviderTests
         var provider = Create(handler);
         var list = await provider.ListSettlementsAsync(
             new DateTime(2026, 5, 1, 0, 0, 0, DateTimeKind.Utc),
-            new DateTime(2026, 5, 1, 0, 0, 0, DateTimeKind.Utc));
+            new DateTime(2026, 5, 1, 0, 0, 0, DateTimeKind.Utc)).ToListAsync();
         Assert.Empty(list);
     }
 
@@ -84,7 +84,7 @@ public class UnionPaySettlementProviderTests
             StubHttpMessageHandler.Text(HttpStatusCode.OK,
                 "respCode=00&breakDownInfo=tx1,01,100,1,156,20260501120000%0Atx2,04,5000,10,156,20260501130000"));
         var provider = Create(handler);
-        var list = await provider.ListTransactionsAsync("BATCH20260501");
+        var list = await provider.ListTransactionsAsync("BATCH20260501").ToListAsync();
         Assert.Equal(2, list.Count);
         Assert.Equal(SettlementTransactionKind.Charge, list[0].Kind);
         Assert.Equal(SettlementTransactionKind.Refund, list[1].Kind);
@@ -96,6 +96,6 @@ public class UnionPaySettlementProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("dns"));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.ListSettlementsAsync(DateTime.UtcNow, DateTime.UtcNow));
+        await Assert.ThrowsAsync<ProviderUnavailableException>(async () => await provider.ListSettlementsAsync(DateTime.UtcNow, DateTime.UtcNow).ToListAsync());
     }
 }

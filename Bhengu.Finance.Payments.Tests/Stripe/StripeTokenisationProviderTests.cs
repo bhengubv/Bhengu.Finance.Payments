@@ -20,6 +20,11 @@ public class StripeTokenisationProviderTests
             Options.Create(opts ?? new StripeOptions { SecretKey = "sk_test_fake", WebhookSecret = "whsec_test_fake" }),
             NullLogger<StripeTokenisationProvider>.Instance);
 
+    private static StripeRawCardTokenisationProvider CreateRaw(StubHttpMessageHandler handler, StripeOptions? opts = null) =>
+        new(new HttpClient(handler),
+            Options.Create(opts ?? new StripeOptions { SecretKey = "sk_test_fake", WebhookSecret = "whsec_test_fake" }),
+            NullLogger<StripeRawCardTokenisationProvider>.Instance);
+
     private static TokeniseRequest SampleRequest(string? customerId = null, string? idempotencyKey = null) => new()
     {
         Card = new CardDetails
@@ -58,7 +63,7 @@ public class StripeTokenisationProviderTests
                 {"id":"cus_test_1","object":"customer","email":"a@b.com"}
                 """);
         });
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
 
         var result = await provider.TokeniseAsync(SampleRequest());
 
@@ -89,7 +94,7 @@ public class StripeTokenisationProviderTests
                 {"id":"pm_test_2","object":"payment_method","type":"card","card":{"brand":"visa","last4":"4242","exp_month":12,"exp_year":2030}}
                 """);
         });
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
 
         var result = await provider.TokeniseAsync(SampleRequest(customerId: "cus_existing"));
 
@@ -104,7 +109,7 @@ public class StripeTokenisationProviderTests
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.PaymentRequired, """
             {"error":{"type":"card_error","code":"card_declined","message":"Your card was declined."}}
             """));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         var ex = await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.TokeniseAsync(SampleRequest()));
         Assert.Equal("card_declined", ex.ProviderErrorCode);
     }
@@ -115,7 +120,7 @@ public class StripeTokenisationProviderTests
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.TooManyRequests, """
             {"error":{"type":"invalid_request_error","message":"Too many requests"}}
             """));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderRateLimitException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -125,7 +130,7 @@ public class StripeTokenisationProviderTests
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.BadGateway, """
             {"error":{"type":"api_error","message":"Stripe is down"}}
             """));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 

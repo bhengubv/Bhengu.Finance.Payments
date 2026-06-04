@@ -70,7 +70,7 @@ public class StripeMarketplaceProviderTests
             ],"has_more":false}
             """));
         var provider = Create(handler);
-        var accounts = await provider.ListSubAccountsAsync();
+        var accounts = await provider.ListSubAccountsAsync().ToListAsync();
         Assert.Equal(2, accounts.Count);
         Assert.True(accounts[0].IsActive);
         Assert.False(accounts[1].IsActive);

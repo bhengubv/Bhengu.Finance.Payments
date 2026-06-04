@@ -20,7 +20,14 @@ public class KashierTokenisationProviderTests
     {
         opts ??= new KashierOptions { ApiKey = "k", MerchantId = "MID", SecretKey = "s", Currency = "EGP" };
         var http = new HttpClient(handler);
-        return new KashierTokenisationProvider(http, Options.Create(opts), NullLogger<KashierTokenisationProvider>.Instance,
+        return new KashierTokenisationProvider(http, Options.Create(opts), NullLogger<KashierTokenisationProvider>.Instance);
+    }
+
+    private static KashierRawCardTokenisationProvider CreateRaw(StubHttpMessageHandler handler, KashierOptions? opts = null)
+    {
+        opts ??= new KashierOptions { ApiKey = "k", MerchantId = "MID", SecretKey = "s", Currency = "EGP" };
+        var http = new HttpClient(handler);
+        return new KashierRawCardTokenisationProvider(http, Options.Create(opts), NullLogger<KashierRawCardTokenisationProvider>.Instance,
             new KashierIdempotencyCache(new InMemoryBhenguDistributedCache()));
     }
 
@@ -45,7 +52,7 @@ public class KashierTokenisationProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK,
             """{"status":"SUCCESS","response":{"cardToken":"CT_x","shopperReference":"shop-1","brand":"visa","last4":"1111","expiryMonth":"11","expiryYear":"2031"}}"""));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         var pm = await provider.TokeniseAsync(SampleRequest());
         Assert.Equal("CT_x", pm.Token);
         Assert.Equal("shop-1", pm.CustomerId);
@@ -59,7 +66,7 @@ public class KashierTokenisationProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK,
             """{"status":"SUCCESS","response":{"brand":"visa"}}"""));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -67,7 +74,7 @@ public class KashierTokenisationProviderTests
     public async Task TokeniseAsync_Throws429AsRateLimit()
     {
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "rate"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderRateLimitException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -75,7 +82,7 @@ public class KashierTokenisationProviderTests
     public async Task TokeniseAsync_WrapsNetworkAsProviderUnavailable()
     {
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("DNS"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -89,7 +96,7 @@ public class KashierTokenisationProviderTests
             return StubHttpMessageHandler.Json(HttpStatusCode.OK,
                 "{\"status\":\"SUCCESS\",\"response\":{\"cardToken\":\"CT_" + calls + "\",\"brand\":\"visa\"}}");
         });
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         var r1 = await provider.TokeniseAsync(SampleRequest("idem-1"));
         var r2 = await provider.TokeniseAsync(SampleRequest("idem-1"));
         Assert.Equal(r1.Token, r2.Token);
@@ -102,7 +109,7 @@ public class KashierTokenisationProviderTests
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK,
             """{"status":"SUCCESS","response":[{"cardToken":"A","brand":"visa","last4":"1111"},{"cardToken":"B","brand":"mc","last4":"4242"}]}"""));
         var provider = Create(handler);
-        var list = await provider.ListPaymentMethodsAsync("shop-1");
+        var list = await provider.ListPaymentMethodsAsync("shop-1").ToListAsync();
         Assert.Equal(2, list.Count);
         Assert.Equal("4242", list[1].Last4);
     }

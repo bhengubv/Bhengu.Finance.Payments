@@ -34,7 +34,7 @@ public class FawrySettlementProviderTests
                 """);
         });
         var provider = Create(handler);
-        var list = await provider.ListSettlementsAsync(new DateTime(2026, 6, 1), new DateTime(2026, 6, 30));
+        var list = await provider.ListSettlementsAsync(new DateTime(2026, 6, 1), new DateTime(2026, 6, 30)).ToListAsync();
         Assert.Single(list);
         Assert.Equal("S-1", list[0].Reference);
         Assert.Equal(990m, list[0].NetAmount);
@@ -61,7 +61,7 @@ public class FawrySettlementProviderTests
                 ]}
                 """));
         var provider = Create(handler);
-        var txns = await provider.ListTransactionsAsync("S-1");
+        var txns = await provider.ListTransactionsAsync("S-1").ToListAsync();
         Assert.Equal(2, txns.Count);
         Assert.Equal(SettlementTransactionKind.Charge, txns[0].Kind);
         Assert.Equal(SettlementTransactionKind.Refund, txns[1].Kind);
@@ -72,8 +72,8 @@ public class FawrySettlementProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "rate"));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<ProviderRateLimitException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+        await Assert.ThrowsAsync<ProviderRateLimitException>(async () =>
+            await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow).ToListAsync());
     }
 
     [Fact]
@@ -81,8 +81,8 @@ public class FawrySettlementProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.BadRequest, "bad"));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<PaymentDeclinedException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+        await Assert.ThrowsAsync<PaymentDeclinedException>(async () =>
+            await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow).ToListAsync());
     }
 
     [Fact]
@@ -90,7 +90,7 @@ public class FawrySettlementProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("dns"));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<ProviderUnavailableException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+        await Assert.ThrowsAsync<ProviderUnavailableException>(async () =>
+            await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow).ToListAsync());
     }
 }

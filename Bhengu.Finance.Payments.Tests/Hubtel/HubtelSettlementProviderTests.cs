@@ -48,7 +48,7 @@ public class HubtelSettlementProviderTests
                 """);
         });
         var provider = Create(handler);
-        var settlements = await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-30), DateTime.UtcNow);
+        var settlements = await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-30), DateTime.UtcNow).ToListAsync();
         Assert.Equal(2, settlements.Count);
         Assert.Equal("st-1", settlements[0].Reference);
         Assert.Equal(990.50m, settlements[0].NetAmount);
@@ -85,7 +85,7 @@ public class HubtelSettlementProviderTests
                 """);
         });
         var provider = Create(handler);
-        var txns = await provider.ListTransactionsAsync("st-1");
+        var txns = await provider.ListTransactionsAsync("st-1").ToListAsync();
         Assert.Equal(2, txns.Count);
         Assert.Equal(SettlementTransactionKind.Charge, txns[0].Kind);
         Assert.Equal(SettlementTransactionKind.Refund, txns[1].Kind);
@@ -96,6 +96,6 @@ public class HubtelSettlementProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("DNS fail"));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+        await Assert.ThrowsAsync<ProviderUnavailableException>(async () => await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow).ToListAsync());
     }
 }

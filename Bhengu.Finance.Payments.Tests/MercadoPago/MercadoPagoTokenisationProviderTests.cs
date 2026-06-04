@@ -19,6 +19,11 @@ public class MercadoPagoTokenisationProviderTests
             Options.Create(new MercadoPagoOptions { AccessToken = "TEST-token" }),
             NullLogger<MercadoPagoTokenisationProvider>.Instance);
 
+    private static MercadoPagoRawCardTokenisationProvider CreateRaw(StubHttpMessageHandler handler) =>
+        new(new HttpClient(handler),
+            Options.Create(new MercadoPagoOptions { AccessToken = "TEST-token" }),
+            NullLogger<MercadoPagoRawCardTokenisationProvider>.Instance);
+
     private static TokeniseRequest SampleRequest(string? customerId = null) => new()
     {
         Card = new CardDetails
@@ -52,7 +57,7 @@ public class MercadoPagoTokenisationProviderTests
             throw new InvalidOperationException($"Unexpected: {req.RequestUri}");
         });
 
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         var pm = await provider.TokeniseAsync(SampleRequest());
 
         Assert.Equal(3, calls.Count);
@@ -81,7 +86,7 @@ public class MercadoPagoTokenisationProviderTests
             throw new InvalidOperationException($"Unexpected: {req.RequestUri}");
         });
 
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         var pm = await provider.TokeniseAsync(SampleRequest(customerId: "CUST_PRE"));
 
         Assert.Equal(2, calls.Count);
@@ -94,7 +99,7 @@ public class MercadoPagoTokenisationProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) =>
             StubHttpMessageHandler.Text(HttpStatusCode.BadRequest, "card declined"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -138,7 +143,7 @@ public class MercadoPagoTokenisationProviderTests
                 """);
         });
         var provider = Create(handler);
-        var list = await provider.ListPaymentMethodsAsync("CUST_111");
+        var list = await provider.ListPaymentMethodsAsync("CUST_111").ToListAsync();
         Assert.Equal(2, list.Count);
         Assert.Equal("CARD_1", list[0].Token);
         Assert.Equal("Mastercard", list[1].Brand);
