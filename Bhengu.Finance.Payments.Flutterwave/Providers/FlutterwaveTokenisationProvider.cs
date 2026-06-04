@@ -36,7 +36,6 @@ public sealed class FlutterwaveTokenisationProvider : ITokenisationProvider
     private readonly HttpClient _httpClient;
     private readonly FlutterwaveOptions _options;
     private readonly ILogger<FlutterwaveTokenisationProvider> _logger;
-    private readonly FlutterwaveIdempotencyCache _idempotencyCache;
 
     /// <inheritdoc/>
     public string ProviderName => ProviderNames.Flutterwave;
@@ -46,6 +45,88 @@ public sealed class FlutterwaveTokenisationProvider : ITokenisationProvider
         HttpClient httpClient,
         IOptions<FlutterwaveOptions> options,
         ILogger<FlutterwaveTokenisationProvider> logger)
+    {
+        _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
+        _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
+        if (string.IsNullOrWhiteSpace(_options.SecretKey))
+            throw new ProviderConfigurationException(ProviderName, $"{nameof(FlutterwaveOptions.SecretKey)} is required");
+
+        if (_httpClient.BaseAddress is null)
+            _httpClient.BaseAddress = new Uri(_options.BaseUrl ?? "https://api.flutterwave.com/");
+
+        _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _options.SecretKey);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Flutterwave has no public "fetch token" endpoint. We expose what callers already know about
+    /// the token (its value), returning a partially-populated descriptor that survives round-trip
+    /// through callers' UIs. For full card metadata, the caller should persist the
+    /// <see cref="PaymentMethod"/> returned by the raw-card tokenisation provider.
+    /// </remarks>
+    public Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(token);
+        var pm = new PaymentMethod
+        {
+            Token = token,
+            Kind = PaymentMethodKind.Card
+        };
+        return Task.FromResult<PaymentMethod?>(pm);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Flutterwave's saved-cards lookup is keyed by the platform's encryption key + email; the API
+    /// surface is undocumented for general partners. To keep the contract honest we return an empty
+    /// stream rather than fabricate data. Callers that need a customer's token history should persist
+    /// the <see cref="PaymentMethod"/> returned by the raw-card tokenisation provider in their own datastore.
+    /// </remarks>
+#pragma warning disable CS1998 // intentionally async with no awaits — Flutterwave exposes no list endpoint, but the contract demands IAsyncEnumerable.
+    public async IAsyncEnumerable<PaymentMethod> ListPaymentMethodsAsync(string customerId, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(customerId);
+        yield break;
+    }
+#pragma warning restore CS1998
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Flutterwave does not expose a delete-token endpoint — tokens expire when the underlying card
+    /// expires or after extended inactivity. To honour the contract we return <c>true</c> when the
+    /// token is well-formed and let the caller's own datastore mark it as removed.
+    /// </remarks>
+    public Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(token);
+        _logger.LogInformation("Flutterwave has no delete-token API; caller should evict {Token} from their own vault.", token);
+        return Task.FromResult(true);
+    }
+}
+
+/// <summary>
+/// PCI-DSS SAQ-D-scope Flutterwave tokenisation. Sends raw card details to Flutterwave's
+/// <c>/v3/tokenized-charges</c> endpoint with a pre-auth probe and returns the resulting reusable
+/// card token. Strongly prefer Flutterwave's hosted checkout / Inline SDK on the client where
+/// possible — only use this where the merchant is already PCI-DSS Level-1 SAQ-D.
+/// </summary>
+public sealed class FlutterwaveRawCardTokenisationProvider : IRawCardTokenisationProvider
+{
+    private readonly HttpClient _httpClient;
+    private readonly FlutterwaveOptions _options;
+    private readonly ILogger<FlutterwaveRawCardTokenisationProvider> _logger;
+    private readonly FlutterwaveIdempotencyCache _idempotencyCache;
+
+    /// <inheritdoc/>
+    public string ProviderName => ProviderNames.Flutterwave;
+
+    /// <summary>Construct the provider; configures Bearer auth on the injected <paramref name="httpClient"/>.</summary>
+    public FlutterwaveRawCardTokenisationProvider(
+        HttpClient httpClient,
+        IOptions<FlutterwaveOptions> options,
+        ILogger<FlutterwaveRawCardTokenisationProvider> logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
@@ -80,7 +161,6 @@ public sealed class FlutterwaveTokenisationProvider : ITokenisationProvider
                 $"{nameof(FlutterwaveOptions.EncryptionKey)} is required for server-side card tokenisation.");
 
         var card = request.Card;
-        var expiry = $"{card.ExpiryMonth:D2}/{(card.ExpiryYear % 100):D2}";
 
         // Tokenised-charge body — Flutterwave returns a card.token on success that can be reused
         // against /v3/tokenized-charges for subsequent off-session charges.
@@ -118,50 +198,6 @@ public sealed class FlutterwaveTokenisationProvider : ITokenisationProvider
             IsDefault = request.SetAsDefault,
             CreatedAt = DateTime.UtcNow
         };
-    }
-
-    /// <inheritdoc/>
-    /// <remarks>
-    /// Flutterwave has no public "fetch token" endpoint. We expose what callers already know about
-    /// the token (its value), returning a partially-populated descriptor that survives round-trip
-    /// through callers' UIs. For full card metadata, the caller should persist the
-    /// <see cref="PaymentMethod"/> returned by <see cref="TokeniseAsync"/>.
-    /// </remarks>
-    public Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(token);
-        var pm = new PaymentMethod
-        {
-            Token = token,
-            Kind = PaymentMethodKind.Card
-        };
-        return Task.FromResult<PaymentMethod?>(pm);
-    }
-
-    /// <inheritdoc/>
-    /// <remarks>
-    /// Flutterwave's saved-cards lookup is keyed by the platform's encryption key + email; the API
-    /// surface is undocumented for general partners. To keep the contract honest we return an empty
-    /// list rather than fabricate data. Callers that need a customer's token history should persist
-    /// the <see cref="PaymentMethod"/> returned by <see cref="TokeniseAsync"/> in their own datastore.
-    /// </remarks>
-    public Task<IReadOnlyList<PaymentMethod>> ListPaymentMethodsAsync(string customerId, CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(customerId);
-        return Task.FromResult<IReadOnlyList<PaymentMethod>>(Array.Empty<PaymentMethod>());
-    }
-
-    /// <inheritdoc/>
-    /// <remarks>
-    /// Flutterwave does not expose a delete-token endpoint — tokens expire when the underlying card
-    /// expires or after extended inactivity. To honour the contract we return <c>true</c> when the
-    /// token is well-formed and let the caller's own datastore mark it as removed.
-    /// </remarks>
-    public Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(token);
-        _logger.LogInformation("Flutterwave has no delete-token API; caller should evict {Token} from their own vault.", token);
-        return Task.FromResult(true);
     }
 
     private static string Last4Of(string pan) => pan.Length >= 4 ? pan[^4..] : pan;

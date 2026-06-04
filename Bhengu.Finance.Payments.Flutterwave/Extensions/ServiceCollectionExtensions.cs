@@ -65,18 +65,21 @@ public static class ServiceCollectionExtensions
         services.AddFlutterwavePayments(configuration);
 
         services.AddHttpClient<FlutterwaveTokenisationProvider>();
+        services.AddHttpClient<FlutterwaveRawCardTokenisationProvider>();
         services.AddHttpClient<FlutterwaveSubscriptionProvider>();
         services.AddHttpClient<FlutterwaveSettlementProvider>();
         services.AddHttpClient<FlutterwaveMarketplaceProvider>();
         services.AddHttpClient<FlutterwaveDisputeProvider>();
 
         services.AddTransient<ITokenisationProvider>(sp => sp.GetRequiredService<FlutterwaveTokenisationProvider>());
+        services.AddTransient<IRawCardTokenisationProvider>(sp => sp.GetRequiredService<FlutterwaveRawCardTokenisationProvider>());
         services.AddTransient<ISubscriptionProvider>(sp => sp.GetRequiredService<FlutterwaveSubscriptionProvider>());
         services.AddTransient<ISettlementProvider>(sp => sp.GetRequiredService<FlutterwaveSettlementProvider>());
         services.AddTransient<IMarketplaceProvider>(sp => sp.GetRequiredService<FlutterwaveMarketplaceProvider>());
         services.AddTransient<IDisputeProvider>(sp => sp.GetRequiredService<FlutterwaveDisputeProvider>());
 
         services.AddKeyedTransient<ITokenisationProvider>(ProviderNames.Flutterwave, (sp, _) => sp.GetRequiredService<FlutterwaveTokenisationProvider>());
+        services.AddKeyedTransient<IRawCardTokenisationProvider>(ProviderNames.Flutterwave, (sp, _) => sp.GetRequiredService<FlutterwaveRawCardTokenisationProvider>());
         services.AddKeyedTransient<ISubscriptionProvider>(ProviderNames.Flutterwave, (sp, _) => sp.GetRequiredService<FlutterwaveSubscriptionProvider>());
         services.AddKeyedTransient<ISettlementProvider>(ProviderNames.Flutterwave, (sp, _) => sp.GetRequiredService<FlutterwaveSettlementProvider>());
         services.AddKeyedTransient<IMarketplaceProvider>(ProviderNames.Flutterwave, (sp, _) => sp.GetRequiredService<FlutterwaveMarketplaceProvider>());

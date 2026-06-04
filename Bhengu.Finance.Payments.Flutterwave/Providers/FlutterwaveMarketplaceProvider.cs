@@ -3,6 +3,7 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -144,19 +145,17 @@ public sealed class FlutterwaveMarketplaceProvider : IMarketplaceProvider
     }
 
     /// <inheritdoc/>
-    public Task<IReadOnlyList<SubAccount>> ListSubAccountsAsync(CancellationToken ct = default)
-        => FlutterwaveObservability.ObserveAsync("list_sub_accounts", () => ListSubAccountsCoreAsync(ct));
-
-    private async Task<IReadOnlyList<SubAccount>> ListSubAccountsCoreAsync(CancellationToken ct)
+    public async IAsyncEnumerable<SubAccount> ListSubAccountsAsync([EnumeratorCancellation] CancellationToken ct = default)
     {
         var responseBody = await SendAsync(HttpMethod.Get, "v3/subaccounts", body: null, ct, "ListSubAccounts").ConfigureAwait(false);
         var fw = JsonSerializer.Deserialize<FlutterwaveSubAccountListResponse>(responseBody);
-        if (fw?.Data is null) return Array.Empty<SubAccount>();
+        if (fw?.Data is null) yield break;
 
-        var list = new List<SubAccount>(fw.Data.Count);
         foreach (var d in fw.Data)
-            list.Add(ToSubAccount(d));
-        return list;
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return ToSubAccount(d);
+        }
     }
 
     /// <inheritdoc/>

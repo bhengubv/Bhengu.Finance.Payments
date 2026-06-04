@@ -65,7 +65,7 @@ public class FlutterwaveDisputeProviderTests
                 """);
         });
         var provider = Create(handler);
-        var disputes = await provider.ListDisputesAsync();
+        var disputes = await provider.ListDisputesAsync().ToListAsync();
         Assert.Equal(2, disputes.Count);
         Assert.Equal(DisputeStatus.NeedsResponse, disputes[0].Status);
         Assert.Equal(DisputeStatus.Won, disputes[1].Status);
@@ -81,7 +81,7 @@ public class FlutterwaveDisputeProviderTests
             return StubHttpMessageHandler.Json(HttpStatusCode.OK, """{"status":"success","data":[]}""");
         });
         var provider = Create(handler);
-        await provider.ListDisputesAsync(new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc), new DateTime(2026, 1, 31, 0, 0, 0, DateTimeKind.Utc));
+        await provider.ListDisputesAsync(new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc), new DateTime(2026, 1, 31, 0, 0, 0, DateTimeKind.Utc)).ToListAsync();
     }
 
     [Fact]

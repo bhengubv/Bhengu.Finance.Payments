@@ -26,6 +26,18 @@ public class FlutterwaveTokenisationProviderTests
         return new FlutterwaveTokenisationProvider(http, Options.Create(opts), NullLogger<FlutterwaveTokenisationProvider>.Instance);
     }
 
+    private static FlutterwaveRawCardTokenisationProvider CreateRaw(StubHttpMessageHandler handler, FlutterwaveOptions? opts = null)
+    {
+        opts ??= new FlutterwaveOptions
+        {
+            SecretKey = "FLWSECK_TEST-xxx",
+            PublicKey = "FLWPUBK_TEST-xxx",
+            EncryptionKey = "FLWSECK_TEST_enc"
+        };
+        var http = new HttpClient(handler);
+        return new FlutterwaveRawCardTokenisationProvider(http, Options.Create(opts), NullLogger<FlutterwaveRawCardTokenisationProvider>.Instance);
+    }
+
     private static TokeniseRequest SampleRequest() => new()
     {
         Card = new CardDetails
@@ -51,7 +63,7 @@ public class FlutterwaveTokenisationProviderTests
                 {"status":"success","message":"Charge initiated","data":{"id":1,"tx_ref":"vault-1","status":"successful","card":{"token":"flw-tok_abc","first_6digits":"411111","last_4digits":"1111","type":"VISA","expiry":"09/30"}}}
                 """);
         });
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
 
         var pm = await provider.TokeniseAsync(SampleRequest());
 
@@ -66,7 +78,7 @@ public class FlutterwaveTokenisationProviderTests
     [Fact]
     public async Task TokeniseAsync_Throws_WhenCustomerIdMissing()
     {
-        var provider = Create(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
+        var provider = CreateRaw(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
         await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.TokeniseAsync(new TokeniseRequest
         {
             Card = new CardDetails
@@ -79,7 +91,7 @@ public class FlutterwaveTokenisationProviderTests
     [Fact]
     public async Task TokeniseAsync_Throws_WhenEncryptionKeyMissing()
     {
-        var provider = Create(
+        var provider = CreateRaw(
             new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")),
             new FlutterwaveOptions { SecretKey = "k" });
         await Assert.ThrowsAsync<ProviderConfigurationException>(() => provider.TokeniseAsync(SampleRequest()));
@@ -89,7 +101,7 @@ public class FlutterwaveTokenisationProviderTests
     public async Task TokeniseAsync_Wraps4xxAsPaymentDeclinedException()
     {
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.BadRequest, "card declined"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -97,7 +109,7 @@ public class FlutterwaveTokenisationProviderTests
     public async Task TokeniseAsync_Wraps5xxAsProviderUnavailableException()
     {
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.BadGateway, "down"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -105,7 +117,7 @@ public class FlutterwaveTokenisationProviderTests
     public async Task TokeniseAsync_WrapsHttpRequestExceptionAsProviderUnavailableException()
     {
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("DNS fail"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -115,7 +127,7 @@ public class FlutterwaveTokenisationProviderTests
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, """
             {"status":"success","data":{"id":1,"card":{"type":"VISA"}}}
             """));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         var ex = await Assert.ThrowsAsync<BhenguPaymentException>(() => provider.TokeniseAsync(SampleRequest()));
         Assert.Contains("card.token", ex.Message);
     }
@@ -134,7 +146,7 @@ public class FlutterwaveTokenisationProviderTests
     public async Task ListPaymentMethodsAsync_ReturnsEmpty_NoCustomerLookupSupported()
     {
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
-        var list = await provider.ListPaymentMethodsAsync("buyer@example.com");
+        var list = await provider.ListPaymentMethodsAsync("buyer@example.com").ToListAsync();
         Assert.Empty(list);
     }
 

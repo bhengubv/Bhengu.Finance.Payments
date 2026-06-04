@@ -3,6 +3,7 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -53,19 +54,19 @@ public sealed class FlutterwaveSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+    public async IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, [EnumeratorCancellation] CancellationToken ct = default)
     {
         var query = $"from={fromUtc:yyyy-MM-dd}&to={toUtc:yyyy-MM-dd}";
         var responseBody = await SendAsync(HttpMethod.Get, $"v3/settlements?{query}", body: null, ct, "ListSettlements").ConfigureAwait(false);
         var fw = JsonSerializer.Deserialize<FlutterwaveSettlementListResponse>(responseBody);
-        if (fw?.Data is null) return Array.Empty<Settlement>();
+        if (fw?.Data is null) yield break;
 
-        var settlements = new List<Settlement>(fw.Data.Count);
+        _logger.LogInformation("Flutterwave settlements listed: {Count} between {From:O} and {To:O}", fw.Data.Count, fromUtc, toUtc);
         foreach (var d in fw.Data)
-            settlements.Add(ToSettlement(d));
-
-        _logger.LogInformation("Flutterwave settlements listed: {Count} between {From:O} and {To:O}", settlements.Count, fromUtc, toUtc);
-        return settlements;
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return ToSettlement(d);
+        }
     }
 
     /// <inheritdoc/>
@@ -85,17 +86,18 @@ public sealed class FlutterwaveSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
+    public async IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(string settlementReference, [EnumeratorCancellation] CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
         var responseBody = await SendAsync(HttpMethod.Get, $"v3/transactions?settlement_id={Uri.EscapeDataString(settlementReference)}", body: null, ct, "ListSettlementTransactions").ConfigureAwait(false);
         var fw = JsonSerializer.Deserialize<FlutterwaveTransactionListResponse>(responseBody);
-        if (fw?.Data is null) return Array.Empty<SettlementTransaction>();
+        if (fw?.Data is null) yield break;
 
-        var txns = new List<SettlementTransaction>(fw.Data.Count);
         foreach (var d in fw.Data)
-            txns.Add(ToTransaction(d));
-        return txns;
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return ToTransaction(d);
+        }
     }
 
     private static Settlement ToSettlement(FlutterwaveSettlementData d) => new()

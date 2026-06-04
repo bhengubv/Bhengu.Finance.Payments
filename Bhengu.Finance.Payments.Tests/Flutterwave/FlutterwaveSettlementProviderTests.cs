@@ -37,7 +37,7 @@ public class FlutterwaveSettlementProviderTests
         });
         var provider = Create(handler);
 
-        var settlements = await provider.ListSettlementsAsync(new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc), new DateTime(2026, 1, 31, 0, 0, 0, DateTimeKind.Utc));
+        var settlements = await provider.ListSettlementsAsync(new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc), new DateTime(2026, 1, 31, 0, 0, 0, DateTimeKind.Utc)).ToListAsync();
 
         Assert.Equal(2, settlements.Count);
         Assert.Equal("1001", settlements[0].Reference);
@@ -50,7 +50,7 @@ public class FlutterwaveSettlementProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, """{"status":"success","data":[]}"""));
         var provider = Create(handler);
-        var settlements = await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-30), DateTime.UtcNow);
+        var settlements = await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-30), DateTime.UtcNow).ToListAsync();
         Assert.Empty(settlements);
     }
 
@@ -96,7 +96,7 @@ public class FlutterwaveSettlementProviderTests
         });
         var provider = Create(handler);
 
-        var txns = await provider.ListTransactionsAsync("1001");
+        var txns = await provider.ListTransactionsAsync("1001").ToListAsync();
         Assert.Equal(2, txns.Count);
         Assert.Equal(SettlementTransactionKind.Charge, txns[0].Kind);
         Assert.Equal(SettlementTransactionKind.Refund, txns[1].Kind);
@@ -107,8 +107,8 @@ public class FlutterwaveSettlementProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.BadGateway, "down"));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<ProviderUnavailableException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-30), DateTime.UtcNow));
+        await Assert.ThrowsAsync<ProviderUnavailableException>(async () =>
+            await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-30), DateTime.UtcNow).ToListAsync());
     }
 
     [Fact]
@@ -116,7 +116,7 @@ public class FlutterwaveSettlementProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("DNS fail"));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<ProviderUnavailableException>(() =>
-            provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-30), DateTime.UtcNow));
+        await Assert.ThrowsAsync<ProviderUnavailableException>(async () =>
+            await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-30), DateTime.UtcNow).ToListAsync());
     }
 }

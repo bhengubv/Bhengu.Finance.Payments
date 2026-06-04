@@ -3,6 +3,7 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -90,36 +91,43 @@ public sealed class FlutterwaveDisputeProvider : IDisputeProvider
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<Dispute>> ListDisputesAsync(DateTime? fromUtc = null, DateTime? toUtc = null, CancellationToken ct = default)
+    public async IAsyncEnumerable<Dispute> ListDisputesAsync(DateTime? fromUtc = null, DateTime? toUtc = null, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "dispute.list");
-        try
+        // Fetch the page first inside a try/finally so the diagnostics activity wraps the I/O
+        // but the yield-return happens outside (you cannot `yield return` inside a try with catch).
+        List<FlutterwaveDisputeBody>? items;
+        using (var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "dispute.list"))
         {
-            var query = new List<string> { "per_page=50" };
-            if (fromUtc.HasValue)
-                query.Add($"from={Uri.EscapeDataString(fromUtc.Value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture))}");
-            if (toUtc.HasValue)
-                query.Add($"to={Uri.EscapeDataString(toUtc.Value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture))}");
+            try
+            {
+                var query = new List<string> { "per_page=50" };
+                if (fromUtc.HasValue)
+                    query.Add($"from={Uri.EscapeDataString(fromUtc.Value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture))}");
+                if (toUtc.HasValue)
+                    query.Add($"to={Uri.EscapeDataString(toUtc.Value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture))}");
 
-            var path = "v3/chargebacks?" + string.Join("&", query);
-            var raw = await SendAsync(HttpMethod.Get, path, body: null, ct, "ListDisputes").ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<FlutterwaveDisputeEnvelope<List<FlutterwaveDisputeBody>>>(raw, DeserializeOptions);
+                var path = "v3/chargebacks?" + string.Join("&", query);
+                var raw = await SendAsync(HttpMethod.Get, path, body: null, ct, "ListDisputes").ConfigureAwait(false);
+                var response = JsonSerializer.Deserialize<FlutterwaveDisputeEnvelope<List<FlutterwaveDisputeBody>>>(raw, DeserializeOptions);
 
-            _logger.LogInformation("Flutterwave listed {Count} disputes between {From:o} and {To:o}",
-                response?.Data?.Count ?? 0, fromUtc, toUtc);
+                _logger.LogInformation("Flutterwave listed {Count} disputes between {From:o} and {To:o}",
+                    response?.Data?.Count ?? 0, fromUtc, toUtc);
 
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-
-            var list = new List<Dispute>(response?.Data?.Count ?? 0);
-            if (response?.Data is null) return list;
-            foreach (var d in response.Data)
-                list.Add(MapDispute(d));
-            return list;
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+                items = response?.Data;
+            }
+            catch
+            {
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
+                throw;
+            }
         }
-        catch
+
+        if (items is null) yield break;
+        foreach (var d in items)
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
+            ct.ThrowIfCancellationRequested();
+            yield return MapDispute(d);
         }
     }
 

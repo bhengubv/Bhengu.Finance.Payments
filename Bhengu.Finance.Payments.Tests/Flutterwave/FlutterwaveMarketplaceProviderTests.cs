@@ -91,7 +91,7 @@ public class FlutterwaveMarketplaceProviderTests
             ]}
             """));
         var provider = Create(handler);
-        var list = await provider.ListSubAccountsAsync();
+        var list = await provider.ListSubAccountsAsync().ToListAsync();
         Assert.Equal(2, list.Count);
     }
 
