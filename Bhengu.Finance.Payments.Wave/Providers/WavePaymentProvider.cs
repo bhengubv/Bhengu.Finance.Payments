@@ -292,11 +292,20 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
                 });
             }
 
+            var category = lowerType switch
+            {
+                "checkout.session.completed" or "checkout.session.payment_succeeded" => Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.ChargeSucceeded,
+                "checkout.session.payment_failed" => Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.ChargeFailed,
+                "merchant.payment_refunded" or "checkout.session.refunded" => Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.RefundSucceeded,
+                _ => Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.Unknown
+            };
+
             return Task.FromResult<WebhookEvent?>(new WebhookEvent
             {
                 GatewayReference = webhookEvent.Data.Id,
                 Status = status.Value,
-                EventType = webhookEvent.Type
+                EventType = webhookEvent.Type,
+                Category = category
             });
         }
         catch (Exception ex)

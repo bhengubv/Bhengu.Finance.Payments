@@ -260,11 +260,26 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
             if (status is null || string.IsNullOrEmpty(webhook.PaymentId))
                 return Task.FromResult<WebhookEvent?>(null);
 
+            var category = webhook.NotifyType.ToUpperInvariant() switch
+            {
+                "PAYMENT_RESULT" => status.Value == PaymentStatus.Completed
+                    ? Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.ChargeSucceeded
+                    : status.Value == PaymentStatus.Failed
+                        ? Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.ChargeFailed
+                        : Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.ChargePending,
+                "REFUND_RESULT" => Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.RefundSucceeded,
+                "PAYOUT_RESULT" => status.Value == PaymentStatus.Completed
+                    ? Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.PayoutCompleted
+                    : Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.PayoutFailed,
+                _ => Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.Unknown
+            };
+
             return Task.FromResult<WebhookEvent?>(new WebhookEvent
             {
                 GatewayReference = webhook.PaymentId,
                 Status = status.Value,
-                EventType = webhook.NotifyType
+                EventType = webhook.NotifyType,
+                Category = category
             });
         }
         catch (Exception ex)

@@ -262,11 +262,21 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
             if (status is null || string.IsNullOrEmpty(reference))
                 return Task.FromResult<WebhookEvent?>(null);
 
+            var category = webhook.EventType.ToUpperInvariant() switch
+            {
+                "TRANSACTION.SUCCESS" or "PAYMENT.SUCCESS" => Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.ChargeSucceeded,
+                "TRANSACTION.FAIL" or "PAYMENT.FAIL" => Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.ChargeFailed,
+                "REFUND.SUCCESS" => Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.RefundSucceeded,
+                "TRANSACTION.CLOSED" => Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.Unknown,
+                _ => Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.Unknown
+            };
+
             return Task.FromResult<WebhookEvent?>(new WebhookEvent
             {
                 GatewayReference = reference,
                 Status = status.Value,
-                EventType = webhook.EventType
+                EventType = webhook.EventType,
+                Category = category
             });
         }
         catch (Exception ex)

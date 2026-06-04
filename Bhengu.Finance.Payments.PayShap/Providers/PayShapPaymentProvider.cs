@@ -198,11 +198,20 @@ public sealed class PayShapPaymentProvider : IPaymentGatewayProvider
             var evt = JsonSerializer.Deserialize<InboundPaymentEvent>(payload);
             if (evt is null) return Task.FromResult<WebhookEvent?>(null);
 
+            var mappedStatus = MapStatus(evt.Data.Status);
             return Task.FromResult<WebhookEvent?>(new WebhookEvent
             {
                 GatewayReference = evt.Data.TransactionId,
-                Status = MapStatus(evt.Data.Status),
+                Status = mappedStatus,
                 EventType = evt.EventType,
+                Category = mappedStatus switch
+                {
+                    PaymentStatus.Completed => Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.ChargeSucceeded,
+                    PaymentStatus.Failed => Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.ChargeFailed,
+                    PaymentStatus.Pending => Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.ChargePending,
+                    PaymentStatus.Refunded => Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.RefundSucceeded,
+                    _ => Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.Unknown
+                },
                 RawPayload = new Dictionary<string, string>
                 {
                     ["event_id"] = evt.EventId,
