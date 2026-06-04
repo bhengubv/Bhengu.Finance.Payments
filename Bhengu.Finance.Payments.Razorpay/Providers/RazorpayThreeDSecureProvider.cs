@@ -6,7 +6,6 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.ThreeDSecure;
-using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Razorpay.Configuration;
 using Microsoft.Extensions.Logging;
@@ -46,12 +45,10 @@ public sealed class RazorpayThreeDSecureProvider : BhenguProviderBase, IThreeDSe
     }
 
     /// <inheritdoc />
-    public async Task<ThreeDSecureChallenge> StartAuthenticationAsync(PaymentRequest chargeIntent, CancellationToken ct = default)
+    public Task<ThreeDSecureChallenge> StartAuthenticationAsync(PaymentRequest chargeIntent, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(chargeIntent);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "three_d_secure.start");
-        try
+        return RunOperationAsync("start_3ds_authentication", async () =>
         {
             var amountInPaise = (long)(chargeIntent.Amount * 100);
             var currency = chargeIntent.Currency.ToUpperInvariant();
@@ -79,8 +76,6 @@ public sealed class RazorpayThreeDSecureProvider : BhenguProviderBase, IThreeDSe
             Logger.LogInformation("Razorpay 3DS challenge: paymentId={PaymentId} status={Status} nextAction={NextAction}",
                 response.Id, response.Status, response.Next?.Action);
 
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-
             var status = response.Status?.ToLowerInvariant() switch
             {
                 "captured" or "authorized" or "authenticated" => ThreeDSecureStatus.Authenticated,
@@ -100,26 +95,17 @@ public sealed class RazorpayThreeDSecureProvider : BhenguProviderBase, IThreeDSe
                 ProtocolVersion = response.Authentication?.Version ?? "2.2.0",
                 DsTransactionId = response.Authentication?.DsTransactionId
             };
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+        }, ct);
     }
 
     /// <inheritdoc />
-    public async Task<ThreeDSecureChallenge> GetChallengeAsync(string challengeReference, CancellationToken ct = default)
+    public Task<ThreeDSecureChallenge> GetChallengeAsync(string challengeReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(challengeReference);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "three_d_secure.get");
-        try
+        return RunOperationAsync("get_3ds_challenge", async () =>
         {
             var raw = await _http.GetAsync($"v1/payments/{Uri.EscapeDataString(challengeReference)}", ct, "GetChallenge").ConfigureAwait(false);
             var response = RazorpayHttpClient.DeserialiseOrThrow<RazorpayPaymentJsonResponse>(raw, ProviderName, "GetChallenge");
-
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
 
             var status = response.Status?.ToLowerInvariant() switch
             {
@@ -137,12 +123,7 @@ public sealed class RazorpayThreeDSecureProvider : BhenguProviderBase, IThreeDSe
                 ProtocolVersion = response.Authentication?.Version ?? "2.2.0",
                 DsTransactionId = response.Authentication?.DsTransactionId
             };
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+        }, ct);
     }
 
     private sealed class RazorpayPaymentJsonResponse
