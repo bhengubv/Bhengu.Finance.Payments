@@ -1,8 +1,6 @@
 # Bhengu.Finance.Payments.JamboPay
 
-JamboPay (Kenya) provider for the [Bhengu.Finance.Payments](https://github.com/bhengubv/Bhengu.Finance.Payments) SDK family.
-
-Cards, M-Pesa, Airtel Money, and bank rails for Kenya via the JamboPay v1 REST API.
+JamboPay adapter for the Bhengu.Finance.Payments family — cards, M-Pesa, Airtel Money, and bank rails for Kenya via the JamboPay v1 REST API. Charge, refund, webhook verification, and payouts behind the Bhengu canonical contracts.
 
 ## Install
 
@@ -10,9 +8,22 @@ Cards, M-Pesa, Airtel Money, and bank rails for Kenya via the JamboPay v1 REST A
 dotnet add package Bhengu.Finance.Payments.JamboPay
 ```
 
-## Configuration
+## What this package gives you
 
-```json
+| Contract | Provider class | Notes |
+|---|---|---|
+| `IPaymentGatewayProvider` | `JamboPayPaymentProvider` | Charge / refund / webhook verify |
+| `IPayoutProvider` | `JamboPayPaymentProvider` | Mobile-money or bank disbursement |
+
+## Wiring
+
+```csharp
+builder.Services.AddJamboPayPayments(builder.Configuration);
+```
+
+Bind options from `Bhengu:Finance:Payments:JamboPay`:
+
+```jsonc
 {
   "Bhengu": {
     "Finance": {
@@ -23,8 +34,10 @@ dotnet add package Bhengu.Finance.Payments.JamboPay
           "ClientSecret": "...",
           "MerchantCode": "...",
           "WebhookSecret": "...",
-          "CallbackUrl": "https://yoursite.example/webhooks/jambopay",
-          "Currency": "KES"
+          "CallbackUrl": "https://example.com/webhooks/jambopay",
+          "Currency": "KES",
+          "UseSandbox": false,
+          "BaseUrl": null         // optional override
         }
       }
     }
@@ -32,75 +45,31 @@ dotnet add package Bhengu.Finance.Payments.JamboPay
 }
 ```
 
-Required: `ApiKey` (sent on `x-api-key`), `ClientId` + `ClientSecret` (OAuth2 client_credentials against `/oauth/token`), and `MerchantCode`.
-
-## Wire it up
+## Usage
 
 ```csharp
-builder.Services.AddJamboPayPayments(builder.Configuration);
-```
-
-Validates all four required options at registration. Tokens cached until 30s before expiry.
-
-## `PaymentMethodToken` semantics
-
-The merchant **`transaction_ref`** — your reference. JamboPay returns the same value (or its own gateway ref) in `GatewayReference`.
-
-## Metadata keys
-
-| Key | Required | Format | Example |
-| --- | --- | --- | --- |
-| `email` | Optional | E-mail | `buyer@example.com` |
-| `msisdn` | Optional | Phone number | `254712345678` |
-| `name` | Optional | Display name | `Thandi Bhengu` |
-| `payment_method` | Optional | `CARD`, `MPESA`, `AIRTEL`, `BANK` (defaults to `CARD`) | `MPESA` |
-
-## `PayoutRequest.DestinationToken` format
-
-Two forms:
-- `"msisdn:<phone>"` — mobile-money payout (e.g. `"msisdn:254700000000"`)
-- `"bank:<bankCode>:<accountNumber>"` — bank payout (e.g. `"bank:KCBLKENX:1234567890"`)
-
-Invalid format throws `BhenguPaymentException`.
-
-## Settlement
-
-**Asynchronous.** `ProcessPaymentAsync` calls `payments/initiate` and returns `Pending` plus the hosted-checkout URL as `RedirectUrl`. Final outcome arrives via webhook.
-
-## Refunds
-
-Yes — `ProcessRefundAsync` calls `POST payments/refund` with `transaction_ref`, `amount`, and `reason`.
-
-## Payouts
-
-**Yes.** `IPayoutProvider.ProcessPayoutAsync` calls `POST payouts/initiate`.
-
-## Webhook
-
-HMAC-SHA256 of the body, hex-encoded lowercase, in the `x-jambopay-signature` header.
-
-```csharp
-app.MapPost("/webhooks/jambopay", async (HttpContext ctx,
-    [FromKeyedServices(ProviderNames.JamboPay)] IPaymentGatewayProvider provider) =>
+[ApiController]
+public class CheckoutController(
+    [FromKeyedServices(ProviderNames.JamboPay)] IPaymentGatewayProvider gateway) : ControllerBase
 {
-    using var reader = new StreamReader(ctx.Request.Body);
-    var body = await reader.ReadToEndAsync();
-    var signature = ctx.Request.Headers["x-jambopay-signature"].ToString();
-
-    if (!provider.VerifyWebhookSignature(body, signature))
-        return Results.Unauthorized();
-
-    var evt = await provider.ParseWebhookAsync(body);
-    return Results.Ok();
-});
+    [HttpPost("charge")]
+    public async Task<PaymentResponse> Charge([FromBody] PaymentRequest request)
+        => await gateway.ProcessPaymentAsync(request);
+}
 ```
 
-Recognised event types: `payment.completed`, `payment.success`, `payment.failed`, `payment.cancelled`, `refund.completed`, `payout.completed`, `payout.failed`.
+## Capabilities at runtime
 
-## Capabilities
+```csharp
+if (gateway.Capabilities.HasFlag(ProviderCapabilities.Refund))
+    await gateway.ProcessRefundAsync(refundRequest);
+```
 
-`Charge | Refund | Payout | Webhook | Cards | MobileMoney | BankTransfer`.
+## Status
 
-## License
+- Apache-2.0
+- Multi-target: net8.0 + net10.0
+- Source: https://github.com/bhengubv/Bhengu.Finance.Payments
 
-Apache 2.0. © 2026 The Other Bhengu (Pty) Ltd t/a The Geek.
+For full SDK docs, observability wiring, resilience configuration and the family map see
+the [main README](https://github.com/bhengubv/Bhengu.Finance.Payments).

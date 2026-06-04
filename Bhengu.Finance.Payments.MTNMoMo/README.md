@@ -1,8 +1,6 @@
 # Bhengu.Finance.Payments.MTNMoMo
 
-MTN Mobile Money (MoMo) provider for the [Bhengu.Finance.Payments](https://github.com/bhengubv/Bhengu.Finance.Payments) SDK family.
-
-Countries: Uganda · Ghana · Côte d'Ivoire · Cameroon · Zambia · Rwanda · Benin · Congo · Guinea · Liberia. MTN's Collection (RequestToPay) and Disbursement (Transfer) products via the MoMo Open API.
+MTN Mobile Money (MoMo) adapter for the Bhengu.Finance.Payments family. Collection (RequestToPay) and Disbursement (Transfer) via the MoMo Open API across Uganda, Ghana, Côte d'Ivoire, Cameroon, Zambia, Rwanda, Benin, Congo, Guinea and Liberia, behind the Bhengu canonical contracts.
 
 ## Install
 
@@ -10,9 +8,23 @@ Countries: Uganda · Ghana · Côte d'Ivoire · Cameroon · Zambia · Rwanda · 
 dotnet add package Bhengu.Finance.Payments.MTNMoMo
 ```
 
-## Configuration
+## What this package gives you
 
-```json
+| Contract | Provider class | Notes |
+|---|---|---|
+| `IPaymentGatewayProvider` | `MTNMoMoPaymentProvider` | RequestToPay charge / callback verify (no refund API upstream) |
+| `IPayoutProvider` | `MTNMoMoPaymentProvider` | Disbursement Transfer |
+| `IPayoutProvider` | `MTNMoMoPayoutProvider` | Standalone payout adapter |
+
+## Wiring
+
+```csharp
+builder.Services.AddMTNMoMoPayments(builder.Configuration);
+```
+
+Bind options from `Bhengu:Finance:Payments:MTNMoMo`:
+
+```jsonc
 {
   "Bhengu": {
     "Finance": {
@@ -21,9 +33,10 @@ dotnet add package Bhengu.Finance.Payments.MTNMoMo
           "SubscriptionKey": "...",
           "ApiUserId": "...",
           "ApiKey": "...",
-          "TargetEnvironment": "sandbox",
-          "CallbackUrl": "https://yoursite.example/momo/callback",
-          "UseSandbox": true
+          "TargetEnvironment": "sandbox",   // or "mtnuganda", "mtnghana", ...
+          "CallbackUrl": "https://example.com/momo/callback",
+          "UseSandbox": true,
+          "BaseUrl": null                    // optional override
         }
       }
     }
@@ -31,81 +44,34 @@ dotnet add package Bhengu.Finance.Payments.MTNMoMo
 }
 ```
 
-Required: `SubscriptionKey` (Ocp-Apim-Subscription-Key), `ApiUserId` UUID (created via the Provisioning API), `ApiKey` (paired with ApiUserId for Basic-auth on token exchange), and `TargetEnvironment` (`sandbox` for testing, or a market code in production: `mtnuganda`, `mtnghana`, `mtnivorycoast`, `mtncameroon`, `mtnzambia`, …). Get credentials from https://momodeveloper.mtn.com/.
-
-## Wire it up
+## Usage
 
 ```csharp
-builder.Services.AddMTNMoMoPayments(builder.Configuration);
-```
-
-Validates all four required options at registration. Access tokens are minted per product (`collection`, `disbursement`) and cached until 60s before expiry.
-
-## `PaymentMethodToken` semantics
-
-**The payer's MSISDN** (international format, e.g. `256777123456` for Uganda) — NOT a tokenised card or persistent identifier.
-
-```csharp
-var response = await provider.ProcessPaymentAsync(new PaymentRequest
+[ApiController]
+public class CheckoutController(
+    [FromKeyedServices(ProviderNames.MTNMoMo)] IPaymentGatewayProvider gateway) : ControllerBase
 {
-    PaymentMethodToken = "256777123456",
-    Amount = 100.00m,
-    Currency = "UGX",
-    Description = "Order #123"
-});
+    [HttpPost("charge")]
+    public async Task<PaymentResponse> Charge([FromBody] PaymentRequest request)
+        => await gateway.ProcessPaymentAsync(request);
+}
 ```
 
-Missing MSISDN throws `PaymentDeclinedException` with `ProviderErrorCode = "missing_msisdn"`.
+`PaymentRequest.PaymentMethodToken` is the payer's MSISDN in international format
+(e.g. `256777123456` for Uganda).
 
-## Metadata keys
-
-| Key | Required | Format | Example |
-| --- | --- | --- | --- |
-| `external_id` | Optional | Merchant correlator (defaults to the request's referenceId) | `order-123` |
-
-## Settlement
-
-**Asynchronous.** RequestToPay returns HTTP 202 — `ProcessPaymentAsync` returns `Pending` with the MoMo `ReferenceId` as `GatewayReference`. The real outcome arrives via callback to `CallbackUrl`, or by polling the status endpoint.
-
-## Refunds
-
-`ProcessRefundAsync` throws `BhenguPaymentException` — **MoMo has no refund API**. Reverse a collection by issuing a Disbursement Transfer to the original payer's MSISDN via `ProcessPayoutAsync`.
-
-## Payouts
-
-**Yes.** `IPayoutProvider.ProcessPayoutAsync` issues a Disbursement Transfer to the recipient's MSISDN.
+## Capabilities at runtime
 
 ```csharp
-var payout = await payoutProvider.ProcessPayoutAsync(new PayoutRequest
-{
-    DestinationToken = "256777123456",
-    Amount = 500.00m,
-    Currency = "UGX",
-    Description = "Vendor settlement"
-});
+if (gateway.Capabilities.HasFlag(ProviderCapabilities.Payout))
+    await gateway.ProcessPayoutAsync(payoutRequest);
 ```
 
-## Webhook
+## Status
 
-**MoMo does NOT cryptographically sign callbacks.** `VerifyWebhookSignature` returns `false` and logs a warning. Authenticity relies on (a) the callback URL being unguessable, and (b) matching the `externalId` in the body against a known transaction.
+- Apache-2.0
+- Multi-target: net8.0 + net10.0
+- Source: https://github.com/bhengubv/Bhengu.Finance.Payments
 
-```csharp
-app.MapPost("/momo/callback", async (HttpContext ctx,
-    [FromKeyedServices(ProviderNames.MTNMoMo)] IPaymentGatewayProvider provider) =>
-{
-    using var reader = new StreamReader(ctx.Request.Body);
-    var body = await reader.ReadToEndAsync();
-
-    // No cryptographic signature — match evt.GatewayReference / externalId against your DB.
-    var evt = await provider.ParseWebhookAsync(body);
-    return Results.Ok();
-});
-```
-
-## Capabilities
-
-`Charge | Payout | Webhook | MobileMoney`.
-
-## License
-
-Apache 2.0. © 2026 The Other Bhengu (Pty) Ltd t/a The Geek.
+For full SDK docs, observability wiring, resilience configuration and the family map see
+the [main README](https://github.com/bhengubv/Bhengu.Finance.Payments).

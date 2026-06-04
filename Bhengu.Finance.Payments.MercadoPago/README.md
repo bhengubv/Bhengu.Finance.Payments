@@ -1,8 +1,6 @@
 # Bhengu.Finance.Payments.MercadoPago
 
-Mercado Pago (Latin America) provider for the [Bhengu.Finance.Payments](https://github.com/bhengubv/Bhengu.Finance.Payments) SDK family.
-
-Argentina · Brazil · Chile · Colombia · Mexico · Peru · Uruguay · Venezuela. Cards, PIX, boleto, and Mercado wallet via the Mercado Pago REST API.
+Mercado Pago adapter for the Bhengu.Finance.Payments family — Argentina, Brazil, Chile, Colombia, Mexico, Peru, Uruguay and Venezuela. Cards, PIX, boleto, and Mercado wallet via the Mercado Pago REST API, with charge, refund, webhook verification, payouts, vaulted tokenisation, recurring subscriptions, marketplace splits, and PIX QR generation behind the Bhengu canonical contracts.
 
 ## Install
 
@@ -10,19 +8,38 @@ Argentina · Brazil · Chile · Colombia · Mexico · Peru · Uruguay · Venezue
 dotnet add package Bhengu.Finance.Payments.MercadoPago
 ```
 
-## Configuration
+## What this package gives you
 
-```json
+| Contract | Provider class | Notes |
+|---|---|---|
+| `IPaymentGatewayProvider` | `MercadoPagoPaymentProvider` | Charge / refund / webhook verify |
+| `IPayoutProvider` | `MercadoPagoPaymentProvider` | Money-request disbursement |
+| `ITokenisationProvider` | `MercadoPagoTokenisationProvider` | Read vaulted card tokens |
+| `ISubscriptionProvider` | `MercadoPagoSubscriptionProvider` | Plans + subscriptions |
+| `IMarketplaceProvider` | `MercadoPagoMarketplaceProvider` | Split payments + sub-accounts |
+| `IQrCodeProvider` | `MercadoPagoQrCodeProvider` | PIX QR-code generation |
+
+## Wiring
+
+```csharp
+builder.Services.AddMercadoPagoPayments(builder.Configuration);
+```
+
+Bind options from `Bhengu:Finance:Payments:MercadoPago`:
+
+```jsonc
 {
   "Bhengu": {
     "Finance": {
       "Payments": {
         "MercadoPago": {
           "AccessToken": "TEST-...",
-          "PublicKey": "TEST-...",
+          "PublicKey": "TEST-...",                                // optional
           "WebhookSecret": "...",
-          "NotificationUrl": "https://yoursite.example/webhooks/mp",
-          "Currency": "BRL"
+          "NotificationUrl": "https://example.com/webhooks/mp",   // optional
+          "Currency": "BRL",
+          "UseSandbox": false,
+          "BaseUrl": null                                          // optional override
         }
       }
     }
@@ -30,78 +47,34 @@ dotnet add package Bhengu.Finance.Payments.MercadoPago
 }
 ```
 
-Required: `AccessToken` (production prefix `APP_USR-`, test prefix `TEST-`; used as the Bearer token). `PublicKey` is for client-side Checkout Bricks tokenisation; `WebhookSecret` verifies the `x-signature` HMAC.
-
-## Wire it up
+## Usage
 
 ```csharp
-builder.Services.AddMercadoPagoPayments(builder.Configuration);
-```
-
-Validates `AccessToken` at registration.
-
-## `PaymentMethodToken` semantics
-
-A **Mercado Pago card token** (`tkn_...`) from Checkout Bricks for card payments. **Ignored** for PIX (`payment_method_id=pix`) and boleto (`payment_method_id=bol*`) — those flows don't need a token.
-
-## Metadata keys
-
-| Key | Required | Format | Example |
-| --- | --- | --- | --- |
-| `payment_method_id` | Optional | `visa`, `master`, `pix`, `bolbradesco`, ... (defaults to `visa`) | `pix` |
-| `payer_email` / `email` | Required | E-mail | `buyer@example.com` |
-| `first_name` | Optional | Given name | `Maria` |
-| `last_name` | Optional | Family name | `Silva` |
-| `identification_type` | Optional | Tax ID type (defaults to `CPF`) | `CNPJ` |
-| `identification_number` | Optional | Tax ID number | `12345678901` |
-| `installments` | Optional | Integer (defaults to 1) | `12` |
-
-Missing `payer_email`/`email` throws `PaymentDeclinedException` with `ProviderErrorCode = "missing_payer_email"`.
-
-## `PayoutRequest.DestinationToken` format
-
-The recipient's Mercado Pago **payee email** (used as `payee.email` in the money-request body).
-
-## Settlement
-
-**Synchronous-ish.** Cards typically return `Completed` or `Failed`; PIX returns `Pending` plus QR code data (in `point_of_interaction.transaction_data` — currently surfaced via the raw response, not the SDK's `Message` field). Final state arrives via webhook. Every POST is sent with an `X-Idempotency-Key`.
-
-## Refunds
-
-Yes — `ProcessRefundAsync` calls `POST /v1/payments/{paymentId}/refunds` with `amount` (full refund if omitted, but the SDK always sends it).
-
-## Payouts
-
-**Yes.** `IPayoutProvider.ProcessPayoutAsync` calls `POST /v1/money_requests`.
-
-## Webhook
-
-HMAC-SHA256 with the `x-signature` header (format `ts=<unix>,v1=<sig>`). The caller must construct the **canonical manifest** Mercado Pago documents — `id:<data.id>;request-id:<x-request-id>;ts:<ts>;` — before invoking `VerifyWebhookSignature`.
-
-```csharp
-app.MapPost("/webhooks/mercadopago", async (HttpContext ctx,
-    [FromKeyedServices(ProviderNames.MercadoPago)] IPaymentGatewayProvider provider) =>
+[ApiController]
+public class CheckoutController(
+    [FromKeyedServices(ProviderNames.MercadoPago)] IPaymentGatewayProvider gateway) : ControllerBase
 {
-    using var reader = new StreamReader(ctx.Request.Body);
-    var body = await reader.ReadToEndAsync();
-    var sigHeader = ctx.Request.Headers["x-signature"].ToString();
-    var reqId = ctx.Request.Headers["x-request-id"].ToString();
-
-    var manifest = BuildMpManifest(body, reqId, sigHeader);  // id:..;request-id:..;ts:..;
-    if (!provider.VerifyWebhookSignature(manifest, sigHeader))
-        return Results.Unauthorized();
-
-    var evt = await provider.ParseWebhookAsync(body);
-    return Results.Ok();
-});
+    [HttpPost("charge")]
+    public async Task<PaymentResponse> Charge([FromBody] PaymentRequest request)
+        => await gateway.ProcessPaymentAsync(request);
+}
 ```
 
-Recognised event types: `payment.created`/`payment.updated` → Pending; `payment.approved` → Completed; `payment.failed`/`payment.rejected` → Failed; `payment.cancelled` → Cancelled; any `refund` type → Refunded.
+## Capabilities at runtime
 
-## Capabilities
+```csharp
+if (gateway.Capabilities.HasFlag(ProviderCapabilities.Refund))
+    await gateway.ProcessRefundAsync(refundRequest);
 
-`Charge | Refund | Payout | Webhook | Cards | BankTransfer`.
+if (gateway is IQrCodeProvider qr)
+    var pix = await qr.GenerateAsync(qrRequest);
+```
 
-## License
+## Status
 
-Apache 2.0. © 2026 The Other Bhengu (Pty) Ltd t/a The Geek.
+- Apache-2.0
+- Multi-target: net8.0 + net10.0
+- Source: https://github.com/bhengubv/Bhengu.Finance.Payments
+
+For full SDK docs, observability wiring, resilience configuration and the family map see
+the [main README](https://github.com/bhengubv/Bhengu.Finance.Payments).

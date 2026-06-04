@@ -1,8 +1,6 @@
 # Bhengu.Finance.Payments.Moniepoint
 
-Moniepoint (Nigeria) provider for the [Bhengu.Finance.Payments](https://github.com/bhengubv/Bhengu.Finance.Payments) SDK family.
-
-Nigeria's largest agent-banking network. Wraps the Moniepoint REST API for hosted checkout initialisation, refunds, and inter-bank transfers.
+Moniepoint adapter for the Bhengu.Finance.Payments family — Nigeria's largest agent-banking network. Hosted checkout, refunds, inter-bank transfers, and settlement reconciliation via the Moniepoint REST API behind the Bhengu canonical contracts.
 
 ## Install
 
@@ -10,9 +8,23 @@ Nigeria's largest agent-banking network. Wraps the Moniepoint REST API for hoste
 dotnet add package Bhengu.Finance.Payments.Moniepoint
 ```
 
-## Configuration
+## What this package gives you
 
-```json
+| Contract | Provider class | Notes |
+|---|---|---|
+| `IPaymentGatewayProvider` | `MoniepointPaymentProvider` | Charge / refund / webhook verify |
+| `IPayoutProvider` | `MoniepointPaymentProvider` | Inter-bank transfers |
+| `ISettlementProvider` | `MoniepointSettlementProvider` | Reconciliation feed |
+
+## Wiring
+
+```csharp
+builder.Services.AddMoniepointPayments(builder.Configuration);
+```
+
+Bind options from `Bhengu:Finance:Payments:Moniepoint`:
+
+```jsonc
 {
   "Bhengu": {
     "Finance": {
@@ -21,8 +33,9 @@ dotnet add package Bhengu.Finance.Payments.Moniepoint
           "ApiKey": "mpt_...",
           "WebhookSecret": "...",
           "MerchantId": "...",
-          "RedirectUrl": "https://yoursite.example/moniepoint/return",
-          "UseSandbox": true
+          "RedirectUrl": "https://example.com/moniepoint/return",
+          "UseSandbox": true,
+          "BaseUrl": null         // optional override
         }
       }
     }
@@ -30,71 +43,31 @@ dotnet add package Bhengu.Finance.Payments.Moniepoint
 }
 ```
 
-Required: `ApiKey` (Bearer token on every request). `WebhookSecret` is HMAC-SHA512 secret — falls back to `ApiKey` if not set.
-
-## Wire it up
+## Usage
 
 ```csharp
-builder.Services.AddMoniepointPayments(builder.Configuration);
-```
-
-Validates `ApiKey` at registration.
-
-## `PaymentMethodToken` semantics
-
-The **payment method** the checkout should preselect — e.g. `card`, `bank_transfer`, `ussd`. Passed verbatim as `paymentMethod` in the initialise body.
-
-## Metadata keys
-
-| Key | Required | Format | Example |
-| --- | --- | --- | --- |
-| `reference` | Optional | Merchant ref (defaults to `mpt-<guid>`) | `order-123` |
-| `email` | Optional | E-mail (defaults to `noreply@bhengu.example`) | `buyer@example.com` |
-| `name` | Optional | Display name (defaults to `Bhengu Customer`) | `Thandi Bhengu` |
-| `phone` | Optional | Phone number | `+2348012345678` |
-
-## `PayoutRequest.DestinationToken` format
-
-`"<bankCode>:<accountNumber>"` or just `"<accountNumber>"` (bank defaults to empty — provide via the format).
-
-## Settlement
-
-**Asynchronous.** `ProcessPaymentAsync` initialises a transaction and returns `Pending` plus the reference; the payer is sent to the hosted checkout URL. Real outcome arrives via webhook.
-
-## Refunds
-
-Yes — `ProcessRefundAsync` calls `POST api/v1/transactions/{reference}/refund` with `amount` and `reason`.
-
-## Payouts
-
-**Yes.** `IPayoutProvider.ProcessPayoutAsync` calls `POST api/v1/transfers`.
-
-## Webhook
-
-HMAC-SHA512 of the body, hex-encoded lowercase, in the `x-moniepoint-signature` header.
-
-```csharp
-app.MapPost("/webhooks/moniepoint", async (HttpContext ctx,
-    [FromKeyedServices(ProviderNames.Moniepoint)] IPaymentGatewayProvider provider) =>
+[ApiController]
+public class CheckoutController(
+    [FromKeyedServices(ProviderNames.Moniepoint)] IPaymentGatewayProvider gateway) : ControllerBase
 {
-    using var reader = new StreamReader(ctx.Request.Body);
-    var body = await reader.ReadToEndAsync();
-    var signature = ctx.Request.Headers["x-moniepoint-signature"].ToString();
-
-    if (!provider.VerifyWebhookSignature(body, signature))
-        return Results.Unauthorized();
-
-    var evt = await provider.ParseWebhookAsync(body);
-    return Results.Ok();
-});
+    [HttpPost("charge")]
+    public async Task<PaymentResponse> Charge([FromBody] PaymentRequest request)
+        => await gateway.ProcessPaymentAsync(request);
+}
 ```
 
-Recognised event types: `transaction.successful`, `transfer.successful`, `transaction.failed`, `transfer.failed`, `refund.successful`, `refund.processed`.
+## Capabilities at runtime
 
-## Capabilities
+```csharp
+if (gateway.Capabilities.HasFlag(ProviderCapabilities.Refund))
+    await gateway.ProcessRefundAsync(refundRequest);
+```
 
-`Charge | Refund | Payout | Webhook | Cards | BankTransfer`.
+## Status
 
-## License
+- Apache-2.0
+- Multi-target: net8.0 + net10.0
+- Source: https://github.com/bhengubv/Bhengu.Finance.Payments
 
-Apache 2.0. © 2026 The Other Bhengu (Pty) Ltd t/a The Geek.
+For full SDK docs, observability wiring, resilience configuration and the family map see
+the [main README](https://github.com/bhengubv/Bhengu.Finance.Payments).

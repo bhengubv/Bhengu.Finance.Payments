@@ -1,8 +1,6 @@
 # Bhengu.Finance.Payments.OPay
 
-OPay (Nigeria / Egypt / Pakistan) provider for the [Bhengu.Finance.Payments](https://github.com/bhengubv/Bhengu.Finance.Payments) SDK family.
-
-OPay International cashier (hosted checkout), refund, and payout via the OPay REST API. Cards plus OPay-wallet plus bank rails.
+OPay adapter for the Bhengu.Finance.Payments family — OPay International cashier across Nigeria, Egypt, and Pakistan. Hosted checkout, refunds, payouts, tokenisation (vaulted + SAQ-D raw card), and settlement reconciliation via the OPay REST API behind the Bhengu canonical contracts.
 
 ## Install
 
@@ -10,9 +8,25 @@ OPay International cashier (hosted checkout), refund, and payout via the OPay RE
 dotnet add package Bhengu.Finance.Payments.OPay
 ```
 
-## Configuration
+## What this package gives you
 
-```json
+| Contract | Provider class | Notes |
+|---|---|---|
+| `IPaymentGatewayProvider` | `OPayPaymentProvider` | Charge / refund / webhook verify |
+| `IPayoutProvider` | `OPayPaymentProvider` | Cross-border payouts |
+| `ITokenisationProvider` | `OPayTokenisationProvider` | Read vaulted card tokens |
+| `IRawCardTokenisationProvider` | `OPayRawCardTokenisationProvider` | SAQ-D — accepts raw PAN+CVV |
+| `ISettlementProvider` | `OPaySettlementProvider` | Reconciliation feed |
+
+## Wiring
+
+```csharp
+builder.Services.AddOPayPayments(builder.Configuration);
+```
+
+Bind options from `Bhengu:Finance:Payments:OPay`:
+
+```jsonc
 {
   "Bhengu": {
     "Finance": {
@@ -22,9 +36,11 @@ dotnet add package Bhengu.Finance.Payments.OPay
           "SecretKey": "OPAYPRV...",
           "MerchantId": "...",
           "Country": "NG",
-          "CallbackUrl": "https://yoursite.example/webhooks/opay",
-          "ReturnUrl": "https://yoursite.example/opay/return",
-          "UseSandbox": true
+          "CallbackUrl": "https://example.com/webhooks/opay",
+          "ReturnUrl": "https://example.com/opay/return",
+          "UseSandbox": true,
+          "BaseUrl": null,        // optional override
+          "SandboxUrl": null      // optional override
         }
       }
     }
@@ -32,72 +48,31 @@ dotnet add package Bhengu.Finance.Payments.OPay
 }
 ```
 
-Required: `PublicKey`, `SecretKey` (HMAC-SHA512 signs every request body, sent in `Authorization: Bearer <sig>`), `MerchantId` (the OPay "sn" short name).
-
-## Wire it up
+## Usage
 
 ```csharp
-builder.Services.AddOPayPayments(builder.Configuration);
-```
-
-Validates the three required options at registration.
-
-## `PaymentMethodToken` semantics
-
-The **OPay `payMethod`** (e.g. `BankCard`, `Account`, `BankTransfer`, `Wallet`) — controls which option is preselected on OPay's hosted cashier.
-
-## Metadata keys
-
-| Key | Required | Format | Example |
-| --- | --- | --- | --- |
-| `reference` | Optional | Merchant ref (defaults to `opay-<guid>`) | `order-123` |
-| `userId` | Optional | Customer id (defaults to `anonymous`) | `cust-42` |
-| `userEmail` | Optional | E-mail (defaults to `noreply@bhengu.example`) | `buyer@example.com` |
-| `userMobile` | Optional | Phone number | `+2348012345678` |
-| `userName` | Optional | Display name (defaults to `Bhengu Customer`) | `Thandi Bhengu` |
-
-## `PayoutRequest.DestinationToken` format
-
-The recipient identifier OPay routes to — the OPay account number or wallet ID, passed verbatim as `receiver.receiverId`.
-
-## Settlement
-
-**Asynchronous.** `ProcessPaymentAsync` creates a cashier session and returns `Pending` plus a `RedirectUrl` (the hosted checkout). Real outcome arrives via webhook. OPay envelope code `00000` = success; anything else maps to `Failed`. Amounts sent in smallest currency unit (Amount × 100).
-
-## Refunds
-
-Yes — `ProcessRefundAsync` calls `POST api/v1/international/refund/create` with `orderNo`, `refundAmount`, and `reason`.
-
-## Payouts
-
-**Yes.** `IPayoutProvider.ProcessPayoutAsync` calls `POST api/v1/international/payout/create`.
-
-## Webhook
-
-HMAC-SHA512 of the body, hex-encoded lowercase, in `Authorization` (accepts `Bearer ` prefix).
-
-```csharp
-app.MapPost("/webhooks/opay", async (HttpContext ctx,
-    [FromKeyedServices(ProviderNames.OPay)] IPaymentGatewayProvider provider) =>
+[ApiController]
+public class CheckoutController(
+    [FromKeyedServices(ProviderNames.OPay)] IPaymentGatewayProvider gateway) : ControllerBase
 {
-    using var reader = new StreamReader(ctx.Request.Body);
-    var body = await reader.ReadToEndAsync();
-    var signature = ctx.Request.Headers["Authorization"].ToString();
-
-    if (!provider.VerifyWebhookSignature(body, signature))
-        return Results.Unauthorized();
-
-    var evt = await provider.ParseWebhookAsync(body);
-    return Results.Ok();
-});
+    [HttpPost("charge")]
+    public async Task<PaymentResponse> Charge([FromBody] PaymentRequest request)
+        => await gateway.ProcessPaymentAsync(request);
+}
 ```
 
-Recognised event types: `transaction.success`, `payment.success`, `transaction.failed`, `payment.failed`, `refund.success`, `refund.completed`. Falls back to the embedded `payload.status` (`success`, `failed`, `refunded`).
+## Capabilities at runtime
 
-## Capabilities
+```csharp
+if (gateway.Capabilities.HasFlag(ProviderCapabilities.Refund))
+    await gateway.ProcessRefundAsync(refundRequest);
+```
 
-`Charge | Refund | Payout | Webhook | RedirectFlow | Cards | MobileMoney`.
+## Status
 
-## License
+- Apache-2.0
+- Multi-target: net8.0 + net10.0
+- Source: https://github.com/bhengubv/Bhengu.Finance.Payments
 
-Apache 2.0. © 2026 The Other Bhengu (Pty) Ltd t/a The Geek.
+For full SDK docs, observability wiring, resilience configuration and the family map see
+the [main README](https://github.com/bhengubv/Bhengu.Finance.Payments).

@@ -1,8 +1,6 @@
 # Bhengu.Finance.Payments.Onafriq
 
-Onafriq (formerly MFS Africa) provider for the [Bhengu.Finance.Payments](https://github.com/bhengubv/Bhengu.Finance.Payments) SDK family.
-
-Cross-border wallet-to-wallet transfers across 35+ African countries. Primarily a **disbursement rail** — use it for payouts; collections are available but secondary.
+Onafriq (formerly MFS Africa) adapter for the Bhengu.Finance.Payments family. Cross-border wallet-to-wallet transfers across 35+ African countries — primarily a disbursement rail, with collections as a secondary capability. Charge, webhook verification, and payouts behind the Bhengu canonical contracts.
 
 ## Install
 
@@ -10,9 +8,22 @@ Cross-border wallet-to-wallet transfers across 35+ African countries. Primarily 
 dotnet add package Bhengu.Finance.Payments.Onafriq
 ```
 
-## Configuration
+## What this package gives you
 
-```json
+| Contract | Provider class | Notes |
+|---|---|---|
+| `IPaymentGatewayProvider` | `OnafriqPaymentProvider` | Charge (collection) / webhook verify; no refund API upstream |
+| `IPayoutProvider` | `OnafriqPaymentProvider` | Wallet-to-wallet cross-border disbursement |
+
+## Wiring
+
+```csharp
+builder.Services.AddOnafriqPayments(builder.Configuration);
+```
+
+Bind options from `Bhengu:Finance:Payments:Onafriq`:
+
+```jsonc
 {
   "Bhengu": {
     "Finance": {
@@ -21,8 +32,9 @@ dotnet add package Bhengu.Finance.Payments.Onafriq
           "ApiKey": "...",
           "MerchantId": "...",
           "WebhookSecret": "...",
-          "CallbackUrl": "https://yoursite.example/webhooks/onafriq",
-          "UseSandbox": true
+          "CallbackUrl": "https://example.com/webhooks/onafriq",
+          "UseSandbox": true,
+          "BaseUrl": null         // optional override
         }
       }
     }
@@ -30,70 +42,34 @@ dotnet add package Bhengu.Finance.Payments.Onafriq
 }
 ```
 
-Required: `ApiKey` (sent on both `X-API-Key` header and as Bearer token) and `MerchantId`.
-
-## Wire it up
+## Usage
 
 ```csharp
-builder.Services.AddOnafriqPayments(builder.Configuration);
-```
-
-Validates `ApiKey` and `MerchantId` at registration.
-
-## `PaymentMethodToken` semantics
-
-For collections (`ProcessPaymentAsync`): the payer wallet, formatted `"<country>:<walletNumber>"`. If no `:` is present, country defaults to `ZA`.
-
-Example: `"ZA:27710000000"` — South Africa wallet `27710000000`.
-
-## `PayoutRequest.DestinationToken` format
-
-Same format as `PaymentMethodToken`: `"<country>:<walletNumber>"`. If no `:` is present, country defaults to `GH`.
-
-Example: `"GH:233244000000"` — Ghana wallet `233244000000`.
-
-## Metadata
-
-`Metadata` is not read by the provider — wallet routing is encoded in the token string.
-
-## Settlement
-
-**Asynchronous.** Both collections and transfers return `Pending` immediately; the final outcome arrives via webhook to `CallbackUrl`.
-
-## Refunds
-
-`ProcessRefundAsync` throws `BhenguPaymentException` with `ProviderErrorCode = "refund_unsupported"` — **Onafriq money movement is one-directional.** Reverse a transaction by issuing a new opposite payout from your merchant wallet back to the original payer's wallet.
-
-## Payouts
-
-**Yes — this is the primary capability.** `IPayoutProvider.ProcessPayoutAsync` calls `POST v1/transactions` (wallet-to-wallet transfer).
-
-## Webhook
-
-HMAC-SHA256 of the body, hex-encoded lowercase, in the `X-Signature` header.
-
-```csharp
-app.MapPost("/webhooks/onafriq", async (HttpContext ctx,
-    [FromKeyedServices(ProviderNames.Onafriq)] IPaymentGatewayProvider provider) =>
+[ApiController]
+public class PayoutsController(
+    [FromKeyedServices(ProviderNames.Onafriq)] IPaymentGatewayProvider gateway) : ControllerBase
 {
-    using var reader = new StreamReader(ctx.Request.Body);
-    var body = await reader.ReadToEndAsync();
-    var signature = ctx.Request.Headers["X-Signature"].ToString();
-
-    if (!provider.VerifyWebhookSignature(body, signature))
-        return Results.Unauthorized();
-
-    var evt = await provider.ParseWebhookAsync(body);
-    return Results.Ok();
-});
+    [HttpPost("payout")]
+    public async Task<PayoutResponse> Payout([FromBody] PayoutRequest request)
+        => await gateway.ProcessPayoutAsync(request);
+}
 ```
 
-Recognised event types: `transaction.completed`, `transaction.successful`, `transaction.failed`, `transaction.rejected`, `transaction.pending`, `collection.completed`, `collection.failed`.
+`PayoutRequest.DestinationToken` format: `"<country>:<walletNumber>"`
+(e.g. `"GH:233244000000"`).
 
-## Capabilities
+## Capabilities at runtime
 
-`Charge | Payout | Webhook | MobileMoney | CrossBorder`.
+```csharp
+if (gateway.Capabilities.HasFlag(ProviderCapabilities.Payout))
+    await gateway.ProcessPayoutAsync(payoutRequest);
+```
 
-## License
+## Status
 
-Apache 2.0. © 2026 The Other Bhengu (Pty) Ltd t/a The Geek.
+- Apache-2.0
+- Multi-target: net8.0 + net10.0
+- Source: https://github.com/bhengubv/Bhengu.Finance.Payments
+
+For full SDK docs, observability wiring, resilience configuration and the family map see
+the [main README](https://github.com/bhengubv/Bhengu.Finance.Payments).

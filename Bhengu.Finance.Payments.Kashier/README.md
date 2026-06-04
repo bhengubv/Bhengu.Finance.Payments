@@ -1,8 +1,6 @@
 # Bhengu.Finance.Payments.Kashier
 
-Kashier (Egypt / UAE / KSA) provider for the [Bhengu.Finance.Payments](https://github.com/bhengubv/Bhengu.Finance.Payments) SDK family.
-
-Server-to-server card charges, marketplace payouts, and hosted-payment-page redirect via the Kashier REST API.
+Kashier adapter for the Bhengu.Finance.Payments family — server-to-server card charges, marketplace payouts, and hosted-payment-page redirect for Egypt, the UAE and KSA via the Kashier REST API. Charge, refund, webhook verification, payouts, vaulted tokenisation, and 3-D Secure step-up behind the Bhengu canonical contracts.
 
 ## Install
 
@@ -10,9 +8,24 @@ Server-to-server card charges, marketplace payouts, and hosted-payment-page redi
 dotnet add package Bhengu.Finance.Payments.Kashier
 ```
 
-## Configuration
+## What this package gives you
 
-```json
+| Contract | Provider class | Notes |
+|---|---|---|
+| `IPaymentGatewayProvider` | `KashierPaymentProvider` | Charge / refund / webhook verify |
+| `IPayoutProvider` | `KashierPaymentProvider` | Marketplace payouts |
+| `ITokenisationProvider` | `KashierTokenisationProvider` | Read vaulted card tokens |
+| `IThreeDSecureProvider` | `KashierThreeDSecureProvider` | SCA step-up flow |
+
+## Wiring
+
+```csharp
+builder.Services.AddKashierPayments(builder.Configuration);
+```
+
+Bind options from `Bhengu:Finance:Payments:Kashier`:
+
+```jsonc
 {
   "Bhengu": {
     "Finance": {
@@ -24,9 +37,10 @@ dotnet add package Bhengu.Finance.Payments.Kashier
           "WebhookSecret": "...",
           "Currency": "EGP",
           "Mode": "test",
-          "RedirectUrl": "https://yoursite.example/kashier/return",
-          "ServerWebhookUrl": "https://yoursite.example/webhooks/kashier",
-          "UseSandbox": true
+          "RedirectUrl": "https://example.com/kashier/return",          // optional
+          "ServerWebhookUrl": "https://example.com/webhooks/kashier",   // optional
+          "UseSandbox": true,
+          "BaseUrl": null                                                // optional override
         }
       }
     }
@@ -34,74 +48,34 @@ dotnet add package Bhengu.Finance.Payments.Kashier
 }
 ```
 
-Required: `ApiKey` (sent as the literal `Authorization` header) and `MerchantId`. `SecretKey` is used to sign hosted-page redirect URLs; `WebhookSecret` is HMAC-SHA256 for webhook verification (falls back to `SecretKey`).
-
-## Wire it up
+## Usage
 
 ```csharp
-builder.Services.AddKashierPayments(builder.Configuration);
-```
-
-Validates `ApiKey` and `MerchantId` at registration.
-
-## `PaymentMethodToken` semantics
-
-A **Kashier card token** (`cardData` from the Kashier hosted page / iframe SDK) sent as `cardData` on the server-to-server charge.
-
-## Metadata keys
-
-| Key | Required | Format | Example |
-| --- | --- | --- | --- |
-| `orderId` | Optional | Merchant order id (defaults to `kashier-<guid>`) | `order-123` |
-| `shopperReference` | Optional | Persistent customer id | `cust-42` |
-
-## `PayoutRequest.DestinationToken` format
-
-A Kashier **destination identifier** (wallet, bank account, or marketplace seller id) passed verbatim as `destination`.
-
-## Settlement
-
-**Synchronous** for server-to-server charges with a card token — `ProcessPaymentAsync` returns `Completed`/`Pending`/`Failed` directly. Amounts formatted as `"0.00"`.
-
-## Refunds
-
-Yes — `ProcessRefundAsync` calls `POST payments/refund` with `merchantId`, `orderId`/`transactionId`, `amount`, and `reason`. Successful refunds are normalised to `Status = Refunded`.
-
-## Payouts
-
-**Yes.** `IPayoutProvider.ProcessPayoutAsync` calls `POST payouts` for marketplace disbursements.
-
-## Webhook
-
-HMAC-SHA256 of the body, hex-encoded lowercase, in the `x-kashier-signature` header.
-
-```csharp
-app.MapPost("/webhooks/kashier", async (HttpContext ctx,
-    [FromKeyedServices(ProviderNames.Kashier)] IPaymentGatewayProvider provider) =>
+[ApiController]
+public class CheckoutController(
+    [FromKeyedServices(ProviderNames.Kashier)] IPaymentGatewayProvider gateway) : ControllerBase
 {
-    using var reader = new StreamReader(ctx.Request.Body);
-    var body = await reader.ReadToEndAsync();
-    var signature = ctx.Request.Headers["x-kashier-signature"].ToString();
-
-    if (!provider.VerifyWebhookSignature(body, signature))
-        return Results.Unauthorized();
-
-    var evt = await provider.ParseWebhookAsync(body);
-    return Results.Ok();
-});
+    [HttpPost("charge")]
+    public async Task<PaymentResponse> Charge([FromBody] PaymentRequest request)
+        => await gateway.ProcessPaymentAsync(request);
+}
 ```
 
-Recognised event types: `PAY`/`CAPTURE` (Completed when `data.status == SUCCESS`), `REFUND` → Refunded, `VOID` → Cancelled, `FAILED` → Failed.
+## Capabilities at runtime
 
-## Provider-specific extras
+```csharp
+if (gateway.Capabilities.HasFlag(ProviderCapabilities.Refund))
+    await gateway.ProcessRefundAsync(refundRequest);
 
-Inject the concrete `KashierPaymentProvider` for:
-- `BuildHostedPaymentUrl(orderId, amount, currency)` — generate a signed redirect URL for the Kashier hosted page (computes the SHA-256 hash from `merchantId.orderId.amount.currency` + `SecretKey`)
+if (gateway is IThreeDSecureProvider tds)
+    var challenge = await tds.StartAuthenticationAsync(intent);
+```
 
-## Capabilities
+## Status
 
-`Charge | Refund | Payout | Webhook | RedirectFlow | Cards`.
+- Apache-2.0
+- Multi-target: net8.0 + net10.0
+- Source: https://github.com/bhengubv/Bhengu.Finance.Payments
 
-## License
-
-Apache 2.0. © 2026 The Other Bhengu (Pty) Ltd t/a The Geek.
+For full SDK docs, observability wiring, resilience configuration and the family map see
+the [main README](https://github.com/bhengubv/Bhengu.Finance.Payments).

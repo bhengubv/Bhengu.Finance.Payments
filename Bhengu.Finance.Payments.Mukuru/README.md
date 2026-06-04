@@ -1,8 +1,6 @@
 # Bhengu.Finance.Payments.Mukuru
 
-Mukuru (South Africa outbound remittance) provider for the [Bhengu.Finance.Payments](https://github.com/bhengubv/Bhengu.Finance.Payments) SDK family.
-
-B2B remittance from South Africa to Zimbabwe, Malawi, Mozambique, Zambia, Ghana, Kenya, Uganda, Nigeria, Tanzania, Côte d'Ivoire — via cash pickup, mobile money, or bank transfer.
+Mukuru adapter for the Bhengu.Finance.Payments family — B2B outbound remittance from South Africa to Zimbabwe, Malawi, Mozambique, Zambia, Ghana, Kenya, Uganda, Nigeria, Tanzania, and Côte d'Ivoire via cash pickup, mobile money, or bank transfer. Charge, refund (pre-collection only), webhook verification, payouts, and recurring mandates behind the Bhengu canonical contracts.
 
 ## Install
 
@@ -10,9 +8,23 @@ B2B remittance from South Africa to Zimbabwe, Malawi, Mozambique, Zambia, Ghana,
 dotnet add package Bhengu.Finance.Payments.Mukuru
 ```
 
-## Configuration
+## What this package gives you
 
-```json
+| Contract | Provider class | Notes |
+|---|---|---|
+| `IPaymentGatewayProvider` | `MukuruPaymentProvider` | Charge (wallet top-up) / refund / webhook verify |
+| `IPayoutProvider` | `MukuruPaymentProvider` | Cross-border remittance disbursement |
+| `IMandateProvider` | `MukuruMandateProvider` | Debit-order / pull-payment mandates |
+
+## Wiring
+
+```csharp
+builder.Services.AddMukuruPayments(builder.Configuration);
+```
+
+Bind options from `Bhengu:Finance:Payments:Mukuru`:
+
+```jsonc
 {
   "Bhengu": {
     "Finance": {
@@ -24,8 +36,10 @@ dotnet add package Bhengu.Finance.Payments.Mukuru
           "WebhookSecret": "...",
           "SenderCountry": "ZA",
           "DefaultCurrency": "ZAR",
-          "CallbackUrl": "https://yoursite.co.za/webhooks/mukuru",
-          "UseSandbox": true
+          "CallbackUrl": "https://example.com/webhooks/mukuru",
+          "UseSandbox": true,
+          "BaseUrl": null,        // optional override
+          "SandboxUrl": null      // optional override
         }
       }
     }
@@ -33,75 +47,34 @@ dotnet add package Bhengu.Finance.Payments.Mukuru
 }
 ```
 
-Required: `ClientId` and `ClientSecret` (OAuth2 client_credentials). `WebhookSecret` is HMAC-SHA256 secret for callback verification.
-
-## Wire it up
+## Usage
 
 ```csharp
-builder.Services.AddMukuruPayments(builder.Configuration);
-```
-
-Validates `ClientId` and `ClientSecret` at registration. Tokens are minted lazily on first call and cached until 30s before expiry.
-
-## `PaymentMethodToken` semantics
-
-For `ProcessPaymentAsync` (wallet top-up): the merchant's funding reference. The actual money movement is `IPayoutProvider`-driven — `PaymentMethodToken` on the payment is just a tracking string.
-
-## `PayoutRequest.DestinationToken` format
-
-`"<recipientCountry>:<payoutMethod>:<accountOrMsisdn>[:bankCode]"`
-
-Examples:
-- `"ZW:CASH_PICKUP:"` — Zimbabwe cash collection
-- `"MW:MOBILE_MONEY:265888123456"` — Malawi mobile money
-- `"ZM:BANK:0123456789:ZNB"` — Zambia ZNB bank transfer
-
-Invalid format throws `BhenguPaymentException` with `ProviderErrorCode = "invalid_destination"`.
-
-## Metadata keys
-
-| Key | Required | Format | Example |
-| --- | --- | --- | --- |
-| `payment_method` | Optional | Top-up funding method (defaults to `EFT`) | `EFT`, `CARD` |
-
-## Settlement
-
-**Asynchronous.** Both wallet top-up and outbound transactions return `Pending` immediately; the real outcome lands via webhook to `CallbackUrl`.
-
-## Refunds
-
-`ProcessRefundAsync` calls Mukuru's `cancel-transaction` endpoint — valid **only before the recipient collects** the funds. After collection, refunds are not possible and Mukuru's API will return an error which surfaces as `PaymentDeclinedException`.
-
-## Payouts
-
-**Yes.** `IPayoutProvider.ProcessPayoutAsync` is the primary capability — it wraps `POST v1/transactions` (Create Transaction). See the `DestinationToken` format above.
-
-## Webhook
-
-HMAC-SHA256 of the body, hex-encoded lowercase, in the `X-Mukuru-Signature` header (accepts `sha256=...` prefix).
-
-```csharp
-app.MapPost("/webhooks/mukuru", async (HttpContext ctx,
-    [FromKeyedServices(ProviderNames.Mukuru)] IPaymentGatewayProvider provider) =>
+[ApiController]
+public class CheckoutController(
+    [FromKeyedServices(ProviderNames.Mukuru)] IPaymentGatewayProvider gateway) : ControllerBase
 {
-    using var reader = new StreamReader(ctx.Request.Body);
-    var body = await reader.ReadToEndAsync();
-    var signature = ctx.Request.Headers["X-Mukuru-Signature"].ToString();
-
-    if (!provider.VerifyWebhookSignature(body, signature))
-        return Results.Unauthorized();
-
-    var evt = await provider.ParseWebhookAsync(body);
-    return Results.Ok();
-});
+    [HttpPost("payout")]
+    public async Task<PayoutResponse> Payout([FromBody] PayoutRequest request)
+        => await gateway.ProcessPayoutAsync(request);
+}
 ```
 
-Recognised event types: `transaction.completed`, `transaction.paid`, `transaction.collected`, `transaction.pending`, `transaction.created`, `transaction.failed`, `transaction.rejected`, `transaction.cancelled`, `transaction.refunded`.
+`PayoutRequest.DestinationToken` format: `"<country>:<method>:<accountOrMsisdn>[:bankCode]"`
+(e.g. `"MW:MOBILE_MONEY:265888123456"`).
 
-## Capabilities
+## Capabilities at runtime
 
-`Charge | Refund | Payout | Webhook | CrossBorder | MobileMoney | BankTransfer`.
+```csharp
+if (gateway.Capabilities.HasFlag(ProviderCapabilities.Payout))
+    await gateway.ProcessPayoutAsync(payoutRequest);
+```
 
-## License
+## Status
 
-Apache 2.0. © 2026 The Other Bhengu (Pty) Ltd t/a The Geek.
+- Apache-2.0
+- Multi-target: net8.0 + net10.0
+- Source: https://github.com/bhengubv/Bhengu.Finance.Payments
+
+For full SDK docs, observability wiring, resilience configuration and the family map see
+the [main README](https://github.com/bhengubv/Bhengu.Finance.Payments).
