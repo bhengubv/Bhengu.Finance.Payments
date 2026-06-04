@@ -11,7 +11,6 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Marketplace;
-using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.MercadoPago.Configuration;
 using Microsoft.Extensions.Logging;
@@ -64,12 +63,10 @@ public sealed class MercadoPagoMarketplaceProvider : BhenguProviderBase, IMarket
     }
 
     /// <inheritdoc />
-    public async Task<SubAccount> CreateSubAccountAsync(SubAccountRequest request, CancellationToken ct = default)
+    public Task<SubAccount> CreateSubAccountAsync(SubAccountRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "marketplace.create_subaccount");
-        try
+        return RunOperationAsync("create_subaccount", async () =>
         {
             var body = new
             {
@@ -94,7 +91,6 @@ public sealed class MercadoPagoMarketplaceProvider : BhenguProviderBase, IMarket
             var account = JsonSerializer.Deserialize<MercadoPagoAccountResponse>(raw, DeserializeOptions);
 
             Logger.LogInformation("Mercado Pago marketplace account created: {AccountId}", account?.Id);
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
 
             return new SubAccount
             {
@@ -105,48 +101,37 @@ public sealed class MercadoPagoMarketplaceProvider : BhenguProviderBase, IMarket
                 IsActive = string.Equals(account?.Status, "active", StringComparison.OrdinalIgnoreCase),
                 OnboardingUrl = account?.OnboardingUrl
             };
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+        }, ct);
     }
 
     /// <inheritdoc />
-    public async Task<SubAccount?> GetSubAccountAsync(string subAccountReference, CancellationToken ct = default)
+    public Task<SubAccount?> GetSubAccountAsync(string subAccountReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(subAccountReference);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "marketplace.get_subaccount");
-        try
+        return RunOperationAsync<SubAccount?>("get_subaccount", async () =>
         {
-            var raw = await SendAsync(HttpMethod.Get, $"v1/accounts/{Uri.EscapeDataString(subAccountReference)}", body: null, ct, "GetSubAccount", idempotencyKey: null).ConfigureAwait(false);
-            var account = JsonSerializer.Deserialize<MercadoPagoAccountResponse>(raw, DeserializeOptions);
-
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-
-            if (account?.Id is null)
-                return null;
-
-            return new SubAccount
+            try
             {
-                Reference = account.Id,
-                BusinessName = account.AdditionalInfo?.BusinessName ?? string.Empty,
-                ContactEmail = account.Email,
-                IsActive = string.Equals(account.Status, "active", StringComparison.OrdinalIgnoreCase),
-                OnboardingUrl = account.OnboardingUrl
-            };
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            return null;
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+                var raw = await SendAsync(HttpMethod.Get, $"v1/accounts/{Uri.EscapeDataString(subAccountReference)}", body: null, ct, "GetSubAccount", idempotencyKey: null).ConfigureAwait(false);
+                var account = JsonSerializer.Deserialize<MercadoPagoAccountResponse>(raw, DeserializeOptions);
+
+                if (account?.Id is null)
+                    return null;
+
+                return new SubAccount
+                {
+                    Reference = account.Id,
+                    BusinessName = account.AdditionalInfo?.BusinessName ?? string.Empty,
+                    ContactEmail = account.Email,
+                    IsActive = string.Equals(account.Status, "active", StringComparison.OrdinalIgnoreCase),
+                    OnboardingUrl = account.OnboardingUrl
+                };
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return null;
+            }
+        }, ct);
     }
 
     /// <inheritdoc />
@@ -162,22 +147,22 @@ public sealed class MercadoPagoMarketplaceProvider : BhenguProviderBase, IMarket
     public Task<SplitDefinition> CreateSplitAsync(SplitDefinitionRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "marketplace.create_split");
-
-        var reference = $"mp_split_{Guid.NewGuid():N}";
-        var split = new SplitDefinition
+        return RunOperationAsync("create_split", () =>
         {
-            Reference = reference,
-            Name = request.Name,
-            Currency = request.Currency.ToUpperInvariant(),
-            Rules = request.Rules
-        };
-        SplitCache[reference] = split;
+            var reference = $"mp_split_{Guid.NewGuid():N}";
+            var split = new SplitDefinition
+            {
+                Reference = reference,
+                Name = request.Name,
+                Currency = request.Currency.ToUpperInvariant(),
+                Rules = request.Rules
+            };
+            SplitCache[reference] = split;
 
-        Logger.LogInformation("Mercado Pago split cached locally as {SplitId} ({Count} beneficiaries)",
-            reference, request.Rules.Count);
-        activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-        return Task.FromResult(split);
+            Logger.LogInformation("Mercado Pago split cached locally as {SplitId} ({Count} beneficiaries)",
+                reference, request.Rules.Count);
+            return Task.FromResult(split);
+        }, ct);
     }
 
     /// <inheritdoc />
@@ -188,14 +173,13 @@ public sealed class MercadoPagoMarketplaceProvider : BhenguProviderBase, IMarket
     }
 
     /// <inheritdoc />
-    public async Task<PaymentResponse> ChargeWithSplitAsync(ChargeWithSplitRequest request, CancellationToken ct = default)
+    public Task<PaymentResponse> ChargeWithSplitAsync(ChargeWithSplitRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
         if (request.SplitReference is null && (request.InlineRules is null || request.InlineRules.Count == 0))
             throw new BhenguPaymentException(ProviderName, "Either SplitReference or InlineRules must be supplied");
 
-        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Payment.Currency);
-        try
+        return RunChargeAsync(request.Payment.Currency, async () =>
         {
             IReadOnlyList<SplitRule>? rules = request.InlineRules;
             if (rules is null && request.SplitReference is not null
@@ -261,11 +245,6 @@ public sealed class MercadoPagoMarketplaceProvider : BhenguProviderBase, IMarket
                 _ => PaymentStatus.Pending
             };
 
-            activity.SetOutcome(status == PaymentStatus.Completed ? BhenguPaymentDiagnostics.Outcomes.Success : BhenguPaymentDiagnostics.Outcomes.Pending);
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", status == PaymentStatus.Completed ? "success" : "pending"));
-
             return new PaymentResponse
             {
                 GatewayReference = response?.Id?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty,
@@ -275,12 +254,7 @@ public sealed class MercadoPagoMarketplaceProvider : BhenguProviderBase, IMarket
                 ProcessedAt = DateTime.UtcNow,
                 Message = response?.StatusDetail
             };
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+        }, ct);
     }
 
     private static string MapSiteId(string country) => country.ToUpperInvariant() switch
