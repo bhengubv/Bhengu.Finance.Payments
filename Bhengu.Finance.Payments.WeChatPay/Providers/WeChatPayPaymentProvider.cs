@@ -12,8 +12,9 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.WeChatPay.Configuration;
-using Bhengu.Finance.Payments.WeChatPay.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -24,7 +25,7 @@ namespace Bhengu.Finance.Payments.WeChatPay.Providers;
 /// charges, refunds and partner batch-transfer payouts. RSA-SHA256 signed Authorization
 /// headers; webhook notifications are AEAD-AES-256-GCM ciphertext that the SDK decrypts.
 /// </summary>
-public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class WeChatPayPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private const string NativePath = "/v3/pay/transactions/native";
     private const string RefundPath = "/v3/refund/domestic/refunds";
@@ -32,9 +33,8 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
 
     private readonly HttpClient _httpClient;
     private readonly WeChatPayOptions _options;
-    private readonly ILogger<WeChatPayPaymentProvider> _logger;
 
-    public string ProviderName => ProviderNames.WeChatPay;
+    public override string ProviderName => ProviderNames.WeChatPay;
 
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
@@ -48,10 +48,10 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
         HttpClient httpClient,
         IOptions<WeChatPayOptions> options,
         ILogger<WeChatPayPaymentProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.AppId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(WeChatPayOptions.AppId)} is required");
@@ -70,7 +70,7 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return WeChatPayObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+        return RunChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct), ct);
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
@@ -93,7 +93,7 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
         var responseBody = await SendAsync(HttpMethod.Post, NativePath, body, ct, "ProcessPayment").ConfigureAwait(false);
         var parsed = JsonSerializer.Deserialize<WeChatPayNativeResponse>(responseBody);
 
-        _logger.LogInformation("WeChat Pay Native charge created: out_trade_no={OutTradeNo} code_url={CodeUrl}",
+        Logger.LogInformation("WeChat Pay Native charge created: out_trade_no={OutTradeNo} code_url={CodeUrl}",
             outTradeNo, parsed?.CodeUrl);
 
         return new PaymentResponse
@@ -111,7 +111,7 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return WeChatPayObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+        return RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct), ct);
     }
 
     private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
@@ -132,7 +132,7 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
         var responseBody = await SendAsync(HttpMethod.Post, RefundPath, body, ct, "ProcessRefund").ConfigureAwait(false);
         var parsed = JsonSerializer.Deserialize<WeChatPayRefundResponse>(responseBody);
 
-        _logger.LogInformation("WeChat Pay refund created: refund_id={RefundId} status={Status}",
+        Logger.LogInformation("WeChat Pay refund created: refund_id={RefundId} status={Status}",
             parsed?.RefundId, parsed?.Status);
 
         return new RefundResponse
@@ -149,7 +149,7 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return WeChatPayObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+        return RunPayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct), ct);
     }
 
     private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
@@ -181,7 +181,7 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
         var responseBody = await SendAsync(HttpMethod.Post, TransferBatchesPath, body, ct, "ProcessPayout").ConfigureAwait(false);
         var parsed = JsonSerializer.Deserialize<WeChatPayTransferResponse>(responseBody);
 
-        _logger.LogInformation("WeChat Pay transfer batch created: batch_id={BatchId} state={State}",
+        Logger.LogInformation("WeChat Pay transfer batch created: batch_id={BatchId} state={State}",
             parsed?.BatchId, parsed?.BatchStatus);
 
         return new PayoutResponse
@@ -202,36 +202,30 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
 
         if (string.IsNullOrWhiteSpace(_options.WeChatPayPlatformCertificate))
         {
-            _logger.LogWarning("WeChat Pay WeChatPayPlatformCertificate not configured — webhook signature verification cannot succeed.");
-            WeChatPayObservability.RecordWebhookVerification(false);
-            return false;
+            Logger.LogWarning("WeChat Pay WeChatPayPlatformCertificate not configured — webhook signature verification cannot succeed.");
+            return RunWebhookVerify(() => false);
         }
 
-        bool verified;
-        try
+        return RunWebhookVerify(() =>
         {
-            var sigBytes = Convert.FromBase64String(signature);
-            using var rsa = LoadPublicKey(_options.WeChatPayPlatformCertificate);
-            verified = rsa.VerifyData(
-                Encoding.UTF8.GetBytes(payload),
-                sigBytes,
-                HashAlgorithmName.SHA256,
-                RSASignaturePadding.Pkcs1);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "WeChat Pay webhook signature verification raised");
-            verified = false;
-        }
-        WeChatPayObservability.RecordWebhookVerification(verified);
-        return verified;
+            try
+            {
+                using var rsa = LoadPublicKey(_options.WeChatPayPlatformCertificate);
+                return SignatureHelpers.VerifyRsaSha256(payload, signature, rsa, SignatureHelpers.Encoding.Base64);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "WeChat Pay webhook signature verification raised");
+                return false;
+            }
+        });
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        return WeChatPayObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+        return RunOperationAsync("parse_webhook", () => ParseWebhookCoreAsync(payload, ct), ct);
     }
 
     private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
@@ -242,7 +236,7 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
             if (webhook is null || string.IsNullOrEmpty(webhook.EventType))
                 return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed WeChat Pay webhook event: {EventType}", webhook.EventType);
+            Logger.LogInformation("Parsed WeChat Pay webhook event: {EventType}", webhook.EventType);
 
             var status = webhook.EventType.ToUpperInvariant() switch
             {
@@ -281,7 +275,7 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse WeChat Pay webhook event");
+            Logger.LogError(ex, "Failed to parse WeChat Pay webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -337,16 +331,8 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
         req.Headers.Authorization = new AuthenticationHeaderValue("WECHATPAY2-SHA256-RSA2048", authValue);
         req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to WeChat Pay failed", ex);
-        }
-
+        // HttpRequestException is auto-translated to ProviderUnavailableException by BhenguProviderBase.
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -357,7 +343,7 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("WeChat Pay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("WeChat Pay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

@@ -12,6 +12,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.QrCode;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.WeChatPay.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -37,27 +38,26 @@ namespace Bhengu.Finance.Payments.WeChatPay.Providers;
 /// the SDK dependency-free.
 /// </para>
 /// </summary>
-public sealed class WeChatPayQrCodeProvider : IQrCodeProvider
+public sealed class WeChatPayQrCodeProvider : BhenguProviderBase, IQrCodeProvider
 {
     private const string NativePath = "/v3/pay/transactions/native";
     private const string QueryPathTemplate = "/v3/pay/transactions/out-trade-no/{0}?mchid={1}";
 
     private readonly HttpClient _httpClient;
     private readonly WeChatPayOptions _options;
-    private readonly ILogger<WeChatPayQrCodeProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.WeChatPay;
+    public override string ProviderName => ProviderNames.WeChatPay;
 
     /// <summary>Construct a WeChat Pay QR provider.</summary>
     public WeChatPayQrCodeProvider(
         HttpClient httpClient,
         IOptions<WeChatPayOptions> options,
         ILogger<WeChatPayQrCodeProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.AppId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(WeChatPayOptions.AppId)} is required");
@@ -118,7 +118,7 @@ public sealed class WeChatPayQrCodeProvider : IQrCodeProvider
         }
 
         if (!string.IsNullOrWhiteSpace(request.IdempotencyKey))
-            _logger.LogDebug("WeChat Pay Native IdempotencyKey={Key} (out_trade_no is the natural dedupe key)", request.IdempotencyKey);
+            Logger.LogDebug("WeChat Pay Native IdempotencyKey={Key} (out_trade_no is the natural dedupe key)", request.IdempotencyKey);
 
         var responseBody = await SendAsync(HttpMethod.Post, NativePath, body, ct, "GenerateQr").ConfigureAwait(false);
         var parsed = JsonSerializer.Deserialize<WeChatPayNativeResponse>(responseBody);
@@ -130,7 +130,7 @@ public sealed class WeChatPayQrCodeProvider : IQrCodeProvider
                 "WeChat Pay Native call returned no code_url.");
         }
 
-        _logger.LogInformation(
+        Logger.LogInformation(
             "WeChat Pay QR generated: out_trade_no={OutTradeNo} code_url={CodeUrl}",
             request.MerchantReference,
             parsed.CodeUrl);
@@ -210,7 +210,7 @@ public sealed class WeChatPayQrCodeProvider : IQrCodeProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError(
+            Logger.LogError(
                 "WeChat Pay {Operation} failed: {StatusCode} {Body}",
                 operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
