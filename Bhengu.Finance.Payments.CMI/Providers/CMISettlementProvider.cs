@@ -10,7 +10,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Settlement;
-using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -26,24 +26,23 @@ namespace Bhengu.Finance.Payments.CMI.Providers;
 /// the canonical surface. This adapter wraps the CC5 <c>OrderHistory</c> /
 /// <c>SettlementsReport</c> XML endpoint exposed for partner integrations.
 /// </remarks>
-public sealed class CMISettlementProvider : ISettlementProvider
+public sealed class CMISettlementProvider : BhenguProviderBase, ISettlementProvider
 {
     private readonly HttpClient _httpClient;
     private readonly CMIOptions _options;
-    private readonly ILogger<CMISettlementProvider> _logger;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.CMI;
+    public override string ProviderName => ProviderNames.CMI;
 
     /// <summary>Construct a settlement provider. Designed to be registered via DI.</summary>
     public CMISettlementProvider(
         HttpClient httpClient,
         IOptions<CMIOptions> options,
         ILogger<CMISettlementProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ClientId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(CMIOptions.ClientId)} is required");
@@ -54,14 +53,10 @@ public sealed class CMISettlementProvider : ISettlementProvider
     /// <inheritdoc/>
     public async IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        XDocument? doc;
-        using (BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list"))
-        {
-            var xml = BuildSettlementsReportXml(fromUtc, toUtc);
-            var body = await CMIHttpClient.SendFormAsync(_httpClient, _logger, "fim/api",
-                new Dictionary<string, string> { ["DATA"] = xml }, "ListSettlements", ct).ConfigureAwait(false);
-            doc = TryParseXml(body);
-        }
+        var xml = BuildSettlementsReportXml(fromUtc, toUtc);
+        var body = await CMIHttpClient.SendFormAsync(_httpClient, Logger, "fim/api",
+            new Dictionary<string, string> { ["DATA"] = xml }, "ListSettlements", ct).ConfigureAwait(false);
+        var doc = TryParseXml(body);
 
         if (doc?.Root is null) yield break;
         foreach (var s in doc.Root.Elements("Settlement"))
@@ -82,15 +77,18 @@ public sealed class CMISettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
+    public Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.get");
+        return RunOperationAsync("get_settlement", () => GetSettlementCoreAsync(settlementReference, ct), ct);
+    }
 
+    private async Task<Settlement?> GetSettlementCoreAsync(string settlementReference, CancellationToken ct)
+    {
         var xml = BuildSettlementInquiryXml(settlementReference);
         try
         {
-            var body = await CMIHttpClient.SendFormAsync(_httpClient, _logger, "fim/api",
+            var body = await CMIHttpClient.SendFormAsync(_httpClient, Logger, "fim/api",
                 new Dictionary<string, string> { ["DATA"] = xml }, "GetSettlement", ct).ConfigureAwait(false);
             var doc = TryParseXml(body);
             var s = doc?.Root?.Element("Settlement");
@@ -118,14 +116,10 @@ public sealed class CMISettlementProvider : ISettlementProvider
     public async IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(string settlementReference, [EnumeratorCancellation] CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-        XDocument? doc;
-        using (BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.transactions"))
-        {
-            var xml = BuildSettlementTransactionsXml(settlementReference);
-            var body = await CMIHttpClient.SendFormAsync(_httpClient, _logger, "fim/api",
-                new Dictionary<string, string> { ["DATA"] = xml }, "SettlementTransactions", ct).ConfigureAwait(false);
-            doc = TryParseXml(body);
-        }
+        var xml = BuildSettlementTransactionsXml(settlementReference);
+        var body = await CMIHttpClient.SendFormAsync(_httpClient, Logger, "fim/api",
+            new Dictionary<string, string> { ["DATA"] = xml }, "SettlementTransactions", ct).ConfigureAwait(false);
+        var doc = TryParseXml(body);
 
         if (doc?.Root is null) yield break;
         foreach (var t in doc.Root.Elements("Transaction"))
@@ -186,7 +180,7 @@ public sealed class CMISettlementProvider : ISettlementProvider
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "CMI settlement response could not be parsed: {Body}", body);
+            Logger.LogWarning(ex, "CMI settlement response could not be parsed: {Body}", body);
             return null;
         }
     }

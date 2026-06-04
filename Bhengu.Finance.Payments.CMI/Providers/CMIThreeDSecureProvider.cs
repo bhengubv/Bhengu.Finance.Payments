@@ -1,7 +1,6 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Globalization;
-using System.Security.Cryptography;
 using System.Text;
 using System.Xml.Linq;
 using Bhengu.Finance.Payments.CMI.Configuration;
@@ -11,7 +10,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.ThreeDSecure;
-using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -29,24 +28,23 @@ namespace Bhengu.Finance.Payments.CMI.Providers;
 /// <para><see cref="GetChallengeAsync"/> issues a CC5 <c>Inquiry</c> XML against
 /// <c>/fim/api</c> to read back the latest known status for a previously-issued <c>oid</c>.</para>
 /// </remarks>
-public sealed class CMIThreeDSecureProvider : IThreeDSecureProvider
+public sealed class CMIThreeDSecureProvider : BhenguProviderBase, IThreeDSecureProvider
 {
     private readonly HttpClient _httpClient;
     private readonly CMIOptions _options;
-    private readonly ILogger<CMIThreeDSecureProvider> _logger;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.CMI;
+    public override string ProviderName => ProviderNames.CMI;
 
     /// <summary>Construct the provider. Designed to be registered via DI.</summary>
     public CMIThreeDSecureProvider(
         HttpClient httpClient,
         IOptions<CMIOptions> options,
         ILogger<CMIThreeDSecureProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ClientId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(CMIOptions.ClientId)} is required");
@@ -60,9 +58,11 @@ public sealed class CMIThreeDSecureProvider : IThreeDSecureProvider
     public Task<ThreeDSecureChallenge> StartAuthenticationAsync(PaymentRequest chargeIntent, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(chargeIntent);
+        return RunOperationAsync("start_3ds", () => StartAuthenticationCoreAsync(chargeIntent), ct);
+    }
 
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "3ds.start");
-
+    private Task<ThreeDSecureChallenge> StartAuthenticationCoreAsync(PaymentRequest chargeIntent)
+    {
         var orderId = string.IsNullOrWhiteSpace(chargeIntent.PaymentMethodToken)
             ? $"cmi-3ds-{Guid.NewGuid():N}"
             : chargeIntent.PaymentMethodToken;
@@ -105,7 +105,7 @@ public sealed class CMIThreeDSecureProvider : IThreeDSecureProvider
             sb.Append(Uri.EscapeDataString(kv.Key)).Append('=').Append(Uri.EscapeDataString(kv.Value));
         }
 
-        _logger.LogInformation("CMI 3DS challenge started: oid={Oid} amount={Amount}", orderId, amount);
+        Logger.LogInformation("CMI 3DS challenge started: oid={Oid} amount={Amount}", orderId, amount);
 
         return Task.FromResult(new ThreeDSecureChallenge
         {
@@ -117,12 +117,14 @@ public sealed class CMIThreeDSecureProvider : IThreeDSecureProvider
     }
 
     /// <inheritdoc/>
-    public async Task<ThreeDSecureChallenge> GetChallengeAsync(string challengeReference, CancellationToken ct = default)
+    public Task<ThreeDSecureChallenge> GetChallengeAsync(string challengeReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(challengeReference);
+        return RunOperationAsync("get_3ds_challenge", () => GetChallengeCoreAsync(challengeReference, ct), ct);
+    }
 
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "3ds.get");
-
+    private async Task<ThreeDSecureChallenge> GetChallengeCoreAsync(string challengeReference, CancellationToken ct)
+    {
         var xml = new XDocument(
             new XDeclaration("1.0", "ISO-8859-9", null),
             new XElement("CC5Request",
@@ -137,7 +139,7 @@ public sealed class CMIThreeDSecureProvider : IThreeDSecureProvider
 
         try
         {
-            var body = await CMIHttpClient.SendFormAsync(_httpClient, _logger, "fim/api",
+            var body = await CMIHttpClient.SendFormAsync(_httpClient, Logger, "fim/api",
                 new Dictionary<string, string> { ["DATA"] = xml }, "3ds.Inquire", ct).ConfigureAwait(false);
 
             var doc = XDocument.Parse(body);

@@ -1,6 +1,5 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
-using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
@@ -12,7 +11,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
-using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -30,14 +29,13 @@ namespace Bhengu.Finance.Payments.CMI.Providers;
 /// the issuer's <c>mdStatus</c> is 1 (full auth) or 2/3/4 (attempted, Visa-only shift). See
 /// <see cref="CMIThreeDSecureProvider"/> for an explicit step-up API.
 /// </remarks>
-public sealed class CMIPaymentProvider : IPaymentGatewayProvider
+public sealed class CMIPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider
 {
     private readonly HttpClient _httpClient;
     private readonly CMIOptions _options;
-    private readonly ILogger<CMIPaymentProvider> _logger;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.CMI;
+    public override string ProviderName => ProviderNames.CMI;
 
     /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
@@ -56,10 +54,10 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
         HttpClient httpClient,
         IOptions<CMIOptions> options,
         ILogger<CMIPaymentProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ClientId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(CMIOptions.ClientId)} is required");
@@ -73,9 +71,11 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return RunChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request), ct);
+    }
 
-        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
-
+    private Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request)
+    {
         var orderId = string.IsNullOrWhiteSpace(request.PaymentMethodToken)
             ? $"cmi-{Guid.NewGuid():N}"
             : request.PaymentMethodToken;
@@ -120,13 +120,8 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
 
         var redirectUrl = sb.ToString();
 
-        _logger.LogInformation("CMI redirect URL built for oid={OrderId} amount={Amount} currency={Currency}",
+        Logger.LogInformation("CMI redirect URL built for oid={OrderId} amount={Amount} currency={Currency}",
             orderId, amount, currency);
-
-        activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Pending);
-        BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-            new KeyValuePair<string, object?>("provider", ProviderName),
-            new KeyValuePair<string, object?>("outcome", BhenguPaymentDiagnostics.Outcomes.Pending));
 
         return Task.FromResult(new PaymentResponse
         {
@@ -140,24 +135,24 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
     }
 
     /// <inheritdoc/>
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct), ct);
+    }
 
-        using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
         var total = request.Amount.ToString("0.00", CultureInfo.InvariantCulture);
         var xml = BuildCC5Request("Credit", request.GatewayReference, total);
-        var body = await CMIHttpClient.SendFormAsync(_httpClient, _logger, "fim/api",
+        var body = await CMIHttpClient.SendFormAsync(_httpClient, Logger, "fim/api",
             new Dictionary<string, string> { ["DATA"] = xml }, "ProcessRefund", ct).ConfigureAwait(false);
 
         var parsed = ParseCC5Response(body);
-        _logger.LogInformation("CMI refund for oid={OrderId} response={Response} procReturnCode={Code}",
+        Logger.LogInformation("CMI refund for oid={OrderId} response={Response} procReturnCode={Code}",
             request.GatewayReference, parsed.Response, parsed.ProcReturnCode);
 
         var status = parsed.Response == "Approved" ? PaymentStatus.Refunded : PaymentStatus.Failed;
-        BhenguPaymentDiagnostics.RefundsTotal.Add(1,
-            new KeyValuePair<string, object?>("provider", ProviderName),
-            new KeyValuePair<string, object?>("outcome", status == PaymentStatus.Refunded ? BhenguPaymentDiagnostics.Outcomes.Success : BhenguPaymentDiagnostics.Outcomes.Error));
 
         return new RefundResponse
         {
@@ -175,43 +170,40 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        bool valid;
         if (string.IsNullOrWhiteSpace(_options.StoreKey))
         {
-            _logger.LogWarning("CMI StoreKey not configured — callback hash verification cannot succeed.");
-            valid = false;
+            Logger.LogWarning("CMI StoreKey not configured — callback hash verification cannot succeed.");
+            return RunWebhookVerify(() => false);
         }
-        else
+
+        return RunWebhookVerify(() =>
         {
             try
             {
+                // CMI uses raw SHA-512 (NOT HMAC-SHA-512) over payload+storeKey. Base64 wire format.
                 var canonical = payload + _options.StoreKey;
-                var bytes = SHA512.HashData(Encoding.UTF8.GetBytes(canonical));
-                var computed = Convert.ToBase64String(bytes);
-
-                valid = CryptographicOperations.FixedTimeEquals(
-                    Encoding.UTF8.GetBytes(signature),
-                    Encoding.UTF8.GetBytes(computed));
+                var computed = SHA512.HashData(Encoding.UTF8.GetBytes(canonical));
+                var supplied = Convert.FromBase64String(signature);
+                return supplied.Length == computed.Length
+                    && CryptographicOperations.FixedTimeEquals(supplied, computed);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "CMI callback hash verification raised");
-                valid = false;
+                Logger.LogError(ex, "CMI callback hash verification raised");
+                return false;
             }
-        }
-
-        BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
-            new KeyValuePair<string, object?>("provider", ProviderName),
-            new KeyValuePair<string, object?>("valid", valid));
-        return valid;
+        });
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+        return RunOperationAsync("parse_webhook", () => ParseWebhookCoreAsync(payload), ct);
+    }
 
-        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload)
+    {
         try
         {
             var pairs = ParseFormUrlEncoded(payload);
@@ -222,7 +214,7 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
             var amount = decimal.TryParse(pairs.GetValueOrDefault("amount"), NumberStyles.Number, CultureInfo.InvariantCulture, out var amt) ? amt : 0m;
             var currency = pairs.GetValueOrDefault("currency") ?? _options.Currency;
 
-            _logger.LogInformation("Parsed CMI callback: oid={Oid} response={Response} procReturn={Proc} mdStatus={MdStatus}",
+            Logger.LogInformation("Parsed CMI callback: oid={Oid} response={Response} procReturn={Proc} mdStatus={MdStatus}",
                 oid, response, procReturnCode, mdStatus);
 
             if (string.IsNullOrEmpty(oid))
@@ -285,7 +277,7 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse CMI callback");
+            Logger.LogError(ex, "Failed to parse CMI callback");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -335,7 +327,7 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "CMI XML response could not be parsed: {Body}", body);
+            Logger.LogWarning(ex, "CMI XML response could not be parsed: {Body}", body);
             return (null, null, null);
         }
     }
