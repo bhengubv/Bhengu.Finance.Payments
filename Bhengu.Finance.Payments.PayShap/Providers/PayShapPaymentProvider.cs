@@ -5,13 +5,13 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.PayShap.Configuration;
 using Bhengu.Finance.Payments.PayShap.Models.Events;
 using Bhengu.Finance.Payments.PayShap.Models.Requests;
 using Bhengu.Finance.Payments.PayShap.Models.Responses;
-using Bhengu.Finance.Payments.PayShap.Internals;
 using Bhengu.Finance.Payments.PayShap.Services.Interfaces;
-using Bhengu.Finance.Payments.PayShap.Utilities;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -46,14 +46,15 @@ namespace Bhengu.Finance.Payments.PayShap.Providers;
 /// <see cref="PaymentRequest.PaymentMethodToken"/> is treated as the payee proxy alias when no explicit
 /// <c>payshap.payee.identifier_value</c> is provided.
 /// </summary>
-public sealed class PayShapPaymentProvider : IPaymentGatewayProvider
+public sealed class PayShapPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider
 {
     private readonly IPayShapService _payShapService;
     private readonly PayShapSettings _settings;
-    private readonly ILogger<PayShapPaymentProvider> _logger;
 
-    public string ProviderName => ProviderNames.PayShap;
+    /// <inheritdoc/>
+    public override string ProviderName => ProviderNames.PayShap;
 
+    /// <summary>Capabilities advertised by the PayShap payment provider.</summary>
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
         ProviderCapabilities.Webhook |
@@ -61,21 +62,22 @@ public sealed class PayShapPaymentProvider : IPaymentGatewayProvider
         ProviderCapabilities.BankTransfer |
         ProviderCapabilities.QrCode;
 
+    /// <summary>Construct the provider; the <paramref name="payShapService"/> wraps the underlying HTTP client.</summary>
     public PayShapPaymentProvider(
         IPayShapService payShapService,
         IOptions<PayShapSettings> settings,
         ILogger<PayShapPaymentProvider> logger)
+        : base(logger)
     {
         _payShapService = payShapService ?? throw new ArgumentNullException(nameof(payShapService));
         _settings = settings?.Value ?? throw new ArgumentNullException(nameof(settings));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
     /// <inheritdoc/>
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return PayShapObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+        return RunChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct), ct);
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
@@ -119,17 +121,14 @@ public sealed class PayShapPaymentProvider : IPaymentGatewayProvider
         {
             rtc = await _payShapService.InitiateRtcPaymentAsync(rtcRequest).ConfigureAwait(false);
         }
-        catch (HttpRequestException ex)
+        catch (Exception ex) when (ex is not BhenguPaymentException and not HttpRequestException)
         {
-            throw new ProviderUnavailableException(ProviderName, "PayShap RTC call failed", ex);
-        }
-        catch (Exception ex) when (ex is not BhenguPaymentException)
-        {
+            // HttpRequestException is auto-translated to ProviderUnavailableException by BhenguProviderBase.
             throw new BhenguPaymentException(ProviderName,
                 "PayShap RTC payment failed", providerErrorMessage: ex.Message, innerException: ex);
         }
 
-        _logger.LogInformation("PayShap RTC initiated: txn={TxnId} status={Status}", rtc.TransactionId, rtc.Status);
+        Logger.LogInformation("PayShap RTC initiated: txn={TxnId} status={Status}", rtc.TransactionId, rtc.Status);
 
         return new PaymentResponse
         {
@@ -149,10 +148,11 @@ public sealed class PayShapPaymentProvider : IPaymentGatewayProvider
     /// </summary>
     /// <inheritdoc/>
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default) =>
-        PayShapObservability.ObserveRefundAsync<RefundResponse>(request?.GatewayReference ?? "n/a", () =>
+        RunRefundAsync<RefundResponse>(request?.GatewayReference ?? "n/a", () =>
             throw new BhenguPaymentException(
                 ProviderName,
-                "PayShap has no refund API. To reverse a transfer, initiate a new RTC payment with payer and payee swapped."));
+                "PayShap has no refund API. To reverse a transfer, initiate a new RTC payment with payer and payee swapped."),
+            ct);
 
     /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
@@ -162,36 +162,21 @@ public sealed class PayShapPaymentProvider : IPaymentGatewayProvider
 
         if (string.IsNullOrWhiteSpace(_settings.SignatureKey))
         {
-            _logger.LogWarning("PayShap SignatureKey not configured — signature verification cannot succeed.");
-            PayShapObservability.RecordWebhookVerification(false);
-            return false;
+            Logger.LogWarning("PayShap SignatureKey not configured — signature verification cannot succeed.");
+            return RunWebhookVerify(() => false);
         }
 
-        bool verified;
-        try
-        {
-            var expected = PayShapSignatureHelper.GenerateSignature(payload, _settings.SignatureKey);
-            verified = System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
-                System.Text.Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
-                System.Text.Encoding.UTF8.GetBytes(expected));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "PayShap webhook signature verification raised");
-            verified = false;
-        }
-        PayShapObservability.RecordWebhookVerification(verified);
-        return verified;
+        return RunWebhookVerify(() => SignatureHelpers.VerifyHmacSha256(payload, signature, _settings.SignatureKey));
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        return PayShapObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+        return RunOperationAsync("parse_webhook", () => ParseWebhookCoreAsync(payload), ct);
     }
 
-    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload)
     {
         try
         {
@@ -227,7 +212,7 @@ public sealed class PayShapPaymentProvider : IPaymentGatewayProvider
         }
         catch (JsonException ex)
         {
-            _logger.LogError(ex, "Failed to parse PayShap webhook payload");
+            Logger.LogError(ex, "Failed to parse PayShap webhook payload");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }

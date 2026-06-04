@@ -7,6 +7,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.QrCode;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.PayShap.Configuration;
 using Bhengu.Finance.Payments.PayShap.Models.Requests;
 using Bhengu.Finance.Payments.PayShap.Services.Interfaces;
@@ -34,24 +35,23 @@ namespace Bhengu.Finance.Payments.PayShap.Providers;
 /// endpoint; PayShap also delivers status via webhook, so webhook is the preferred channel.
 /// </para>
 /// </summary>
-public sealed class PayShapQrCodeProvider : IQrCodeProvider
+public sealed class PayShapQrCodeProvider : BhenguProviderBase, IQrCodeProvider
 {
     private readonly IPayShapService _payShapService;
     private readonly PayShapSettings _settings;
-    private readonly ILogger<PayShapQrCodeProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.PayShap;
+    public override string ProviderName => ProviderNames.PayShap;
 
     /// <summary>Construct a PayShap QR provider.</summary>
     public PayShapQrCodeProvider(
         IPayShapService payShapService,
         IOptions<PayShapSettings> settings,
         ILogger<PayShapQrCodeProvider> logger)
+        : base(logger)
     {
         _payShapService = payShapService ?? throw new ArgumentNullException(nameof(payShapService));
         _settings = settings?.Value ?? throw new ArgumentNullException(nameof(settings));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
     /// <inheritdoc />
@@ -108,7 +108,7 @@ public sealed class PayShapQrCodeProvider : IQrCodeProvider
         }
 
         var payload = sb.ToString();
-        _logger.LogInformation(
+        Logger.LogInformation(
             "PayShap QR generated: ref={Reference} amount={Amount} static={IsStatic}",
             request.MerchantReference,
             request.Amount,
