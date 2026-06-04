@@ -85,29 +85,29 @@ public sealed class RemitaSettlementProvider : BhenguProviderBase, ISettlementPr
     }
 
     /// <inheritdoc />
-    public async Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
+    public Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "get_settlement");
-        try
+        return RunOperationAsync<Settlement?>("get_settlement", async () =>
         {
-            var hash = RemitaHttpClient.Sha512Hex(_options.MerchantId + settlementReference + _options.ApiKey);
-            var body = new
+            try
             {
-                merchantId = _options.MerchantId,
-                settlementId = settlementReference,
-                hash
-            };
-            var json = await _http.SendAsync(HttpMethod.Post, SettlementDetailPath, body, "GetSettlement", hash, ct).ConfigureAwait(false);
-            var resp = JsonSerializer.Deserialize<RemitaSettlementData>(json, RemitaHttpClient.Json);
-            activity?.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return resp is null || string.IsNullOrEmpty(resp.SettlementId) ? null : MapSettlement(resp);
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            activity?.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return null;
-        }
+                var hash = RemitaHttpClient.Sha512Hex(_options.MerchantId + settlementReference + _options.ApiKey);
+                var body = new
+                {
+                    merchantId = _options.MerchantId,
+                    settlementId = settlementReference,
+                    hash
+                };
+                var json = await _http.SendAsync(HttpMethod.Post, SettlementDetailPath, body, "GetSettlement", hash, ct).ConfigureAwait(false);
+                var resp = JsonSerializer.Deserialize<RemitaSettlementData>(json, RemitaHttpClient.Json);
+                return resp is null || string.IsNullOrEmpty(resp.SettlementId) ? null : MapSettlement(resp);
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return null;
+            }
+        }, ct);
     }
 
     /// <inheritdoc />

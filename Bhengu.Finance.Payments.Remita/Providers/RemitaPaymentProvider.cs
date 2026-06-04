@@ -12,7 +12,6 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
-using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Remita.Configuration;
 using Bhengu.Finance.Payments.Remita.Internals;
 using Microsoft.Extensions.Logging;
@@ -95,12 +94,8 @@ public sealed class RemitaPaymentProvider : BhenguProviderBase, IPaymentGatewayP
                 () => ProcessPaymentCoreAsync(request, ct), ct);
     }
 
-    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
-    {
-        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
-        try
+    private Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+        => RunChargeAsync(request.Currency, async () =>
         {
             var orderId = request.PaymentMethodToken;
             var amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture);
@@ -131,12 +126,6 @@ public sealed class RemitaPaymentProvider : BhenguProviderBase, IPaymentGatewayP
                 orderId, remitaResponse?.Rrr, remitaResponse?.StatusCode);
 
             var status = MapStatusCode(remitaResponse?.StatusCode);
-            outcome = status switch
-            {
-                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
-                _ => BhenguPaymentDiagnostics.Outcomes.Declined
-            };
 
             return new PaymentResponse
             {
@@ -147,19 +136,7 @@ public sealed class RemitaPaymentProvider : BhenguProviderBase, IPaymentGatewayP
                 ProcessedAt = DateTime.UtcNow,
                 Message = remitaResponse?.Status
             };
-        }
-        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
-        finally
-        {
-            activity?.SetOutcome(outcome);
-            sw.Stop();
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
-            BhenguPaymentDiagnostics.ChargeDurationMs.Record(sw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
-        }
-    }
+        }, ct);
 
     /// <inheritdoc />
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
@@ -171,11 +148,8 @@ public sealed class RemitaPaymentProvider : BhenguProviderBase, IPaymentGatewayP
                 () => ProcessRefundCoreAsync(request, ct), ct);
     }
 
-    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
-    {
-        using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
-        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
-        try
+    private Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+        => RunRefundAsync(request.GatewayReference, async () =>
         {
             var amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture);
             var hash = Sha512Hex(_options.MerchantId + request.GatewayReference + amount + _options.ApiKey);
@@ -199,12 +173,6 @@ public sealed class RemitaPaymentProvider : BhenguProviderBase, IPaymentGatewayP
                 refundResponse?.RefundReference, request.GatewayReference);
 
             var status = MapStatusCode(refundResponse?.StatusCode);
-            outcome = status switch
-            {
-                PaymentStatus.Completed or PaymentStatus.Refunded => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
-                _ => BhenguPaymentDiagnostics.Outcomes.Declined
-            };
 
             return new RefundResponse
             {
@@ -214,17 +182,7 @@ public sealed class RemitaPaymentProvider : BhenguProviderBase, IPaymentGatewayP
                 ProcessedAt = DateTime.UtcNow,
                 Message = refundResponse?.Status
             };
-        }
-        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
-        finally
-        {
-            activity?.SetOutcome(outcome);
-            BhenguPaymentDiagnostics.RefundsTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
-        }
-    }
+        }, ct);
 
     /// <inheritdoc />
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
@@ -236,11 +194,8 @@ public sealed class RemitaPaymentProvider : BhenguProviderBase, IPaymentGatewayP
                 () => ProcessPayoutCoreAsync(request, ct), ct);
     }
 
-    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
-    {
-        using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, request.Currency);
-        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
-        try
+    private Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+        => RunPayoutAsync(request.Currency, async () =>
         {
             if (string.IsNullOrWhiteSpace(_options.FromBank) || string.IsNullOrWhiteSpace(_options.DebitAccount))
                 throw new ProviderConfigurationException(ProviderName,
@@ -283,12 +238,6 @@ public sealed class RemitaPaymentProvider : BhenguProviderBase, IPaymentGatewayP
                 transRef, payoutResponse?.StatusCode);
 
             var status = MapStatusCode(payoutResponse?.StatusCode);
-            outcome = status switch
-            {
-                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
-                _ => BhenguPaymentDiagnostics.Outcomes.Declined
-            };
 
             return new PayoutResponse
             {
@@ -298,17 +247,7 @@ public sealed class RemitaPaymentProvider : BhenguProviderBase, IPaymentGatewayP
                 Currency = request.Currency,
                 ProcessedAt = DateTime.UtcNow
             };
-        }
-        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
-        finally
-        {
-            activity?.SetOutcome(outcome);
-            BhenguPaymentDiagnostics.PayoutsTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
-        }
-    }
+        }, ct);
 
     /// <summary>
     /// Verify a Remita webhook callback. Remita signs callbacks with SHA-512 of
@@ -321,59 +260,55 @@ public sealed class RemitaPaymentProvider : BhenguProviderBase, IPaymentGatewayP
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        var valid = false;
-        try
+        return RunWebhookVerify(() =>
         {
-            if (string.IsNullOrWhiteSpace(_options.ApiKey))
+            try
             {
-                Logger.LogWarning("Remita ApiKey not configured — signature verification cannot succeed.");
+                if (string.IsNullOrWhiteSpace(_options.ApiKey))
+                {
+                    Logger.LogWarning("Remita ApiKey not configured — signature verification cannot succeed.");
+                    return false;
+                }
+
+                var callback = JsonSerializer.Deserialize<RemitaWebhookEvent>(payload, s_caseInsensitive);
+                if (callback is null || string.IsNullOrEmpty(callback.Rrr) || string.IsNullOrEmpty(callback.Status))
+                    return false;
+
+                var expected = Sha512Hex(callback.Rrr + callback.Status + _options.ApiKey);
+                return CryptographicOperations.FixedTimeEquals(
+                    Encoding.UTF8.GetBytes(signature),
+                    Encoding.UTF8.GetBytes(expected));
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Remita webhook signature verification raised");
                 return false;
             }
-
-            var callback = JsonSerializer.Deserialize<RemitaWebhookEvent>(payload, s_caseInsensitive);
-            if (callback is null || string.IsNullOrEmpty(callback.Rrr) || string.IsNullOrEmpty(callback.Status))
-                return false;
-
-            var expected = Sha512Hex(callback.Rrr + callback.Status + _options.ApiKey);
-            valid = CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(signature),
-                Encoding.UTF8.GetBytes(expected));
-            return valid;
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Remita webhook signature verification raised");
-            return false;
-        }
-        finally
-        {
-            BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("valid", valid));
-        }
+        });
     }
 
     /// <inheritdoc />
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-
-        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
-        try
+        return RunOperationAsync("parse_webhook", () =>
         {
-            var callback = JsonSerializer.Deserialize<RemitaWebhookEvent>(payload, s_caseInsensitive);
-            if (callback is null) return Task.FromResult<WebhookEvent?>(null);
+            try
+            {
+                var callback = JsonSerializer.Deserialize<RemitaWebhookEvent>(payload, s_caseInsensitive);
+                if (callback is null) return Task.FromResult<WebhookEvent?>(null);
 
-            Logger.LogInformation("Parsed Remita webhook: rrr={Rrr} status={Status} type={Type}",
-                callback.Rrr, callback.Status, callback.NotificationType);
+                Logger.LogInformation("Parsed Remita webhook: rrr={Rrr} status={Status} type={Type}",
+                    callback.Rrr, callback.Status, callback.NotificationType);
 
-            return Task.FromResult(MapWebhookEvent(callback));
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Failed to parse Remita webhook event");
-            return Task.FromResult<WebhookEvent?>(null);
-        }
+                return Task.FromResult(MapWebhookEvent(callback));
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Failed to parse Remita webhook event");
+                return Task.FromResult<WebhookEvent?>(null);
+            }
+        }, ct);
     }
 
     private static WebhookEvent? MapWebhookEvent(RemitaWebhookEvent callback)

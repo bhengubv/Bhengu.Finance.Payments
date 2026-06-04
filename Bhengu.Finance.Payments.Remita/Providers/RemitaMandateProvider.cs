@@ -9,7 +9,6 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Mandate;
-using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Remita.Configuration;
 using Bhengu.Finance.Payments.Remita.Internals;
 using Microsoft.Extensions.Logging;
@@ -73,11 +72,8 @@ public sealed class RemitaMandateProvider : BhenguProviderBase, IMandateProvider
             () => CreateMandateCoreAsync(request, ct), ct);
     }
 
-    private async Task<Mandate> CreateMandateCoreAsync(MandateRequest request, CancellationToken ct)
-    {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "mandate_create");
-        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
-        try
+    private Task<Mandate> CreateMandateCoreAsync(MandateRequest request, CancellationToken ct)
+        => RunOperationAsync("create_mandate", async () =>
         {
             // BankAccountToken format: "<bankCode>:<accountNumber>" (matches payout convention).
             var colon = request.BankAccountToken.IndexOf(':');
@@ -119,7 +115,6 @@ public sealed class RemitaMandateProvider : BhenguProviderBase, IMandateProvider
             var resp = JsonSerializer.Deserialize<RemitaMandateResponse>(json, RemitaHttpClient.Json)
                 ?? throw new BhenguPaymentException(ProviderName, "Remita mandate-setup returned empty body", "empty_response");
 
-            outcome = BhenguPaymentDiagnostics.Outcomes.Success;
             return new Mandate
             {
                 Reference = resp.MandateId ?? resp.RequestId ?? requestRef,
@@ -130,104 +125,87 @@ public sealed class RemitaMandateProvider : BhenguProviderBase, IMandateProvider
                 AuthorisedAt = null,
                 AuthorisationUrl = resp.AuthorisationUrl
             };
-        }
-        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
-        finally
+        }, ct);
+
+    /// <inheritdoc />
+    public Task<Mandate?> GetMandateAsync(string mandateReference, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(mandateReference);
+        return RunOperationAsync<Mandate?>("get_mandate", async () =>
         {
-            activity?.SetOutcome(outcome);
-        }
+            try
+            {
+                var hash = RemitaHttpClient.Sha512Hex(_options.MerchantId + mandateReference + _options.ApiKey);
+                var body = new
+                {
+                    merchantId = _options.MerchantId,
+                    mandateId = mandateReference,
+                    hash
+                };
+                var json = await _http.SendAsync(HttpMethod.Post, MandateStatusPath, body, "GetMandate", hash, ct).ConfigureAwait(false);
+                var resp = JsonSerializer.Deserialize<RemitaMandateResponse>(json, RemitaHttpClient.Json);
+                if (resp is null || string.IsNullOrEmpty(resp.MandateId)) return null;
+
+                return new Mandate
+                {
+                    Reference = resp.MandateId,
+                    CustomerId = resp.PayerEmail ?? string.Empty,
+                    Status = MapMandateStatus(resp.Status, resp.StatusCode),
+                    AmountLimit = decimal.TryParse(resp.MaxAmount, NumberStyles.Any, CultureInfo.InvariantCulture, out var ma) ? ma : 0m,
+                    Currency = _options.Currency,
+                    AuthorisedAt = resp.AuthorisedAt,
+                    AuthorisationUrl = resp.AuthorisationUrl
+                };
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return null;
+            }
+        }, ct);
     }
 
     /// <inheritdoc />
-    public async Task<Mandate?> GetMandateAsync(string mandateReference, CancellationToken ct = default)
+    public Task<Mandate> CancelMandateAsync(string mandateReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(mandateReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "mandate_get");
-        try
+        return RunOperationAsync("cancel_mandate", async () =>
         {
-            var hash = RemitaHttpClient.Sha512Hex(_options.MerchantId + mandateReference + _options.ApiKey);
-            var body = new
+            try
             {
-                merchantId = _options.MerchantId,
-                mandateId = mandateReference,
-                hash
-            };
-            var json = await _http.SendAsync(HttpMethod.Post, MandateStatusPath, body, "GetMandate", hash, ct).ConfigureAwait(false);
-            var resp = JsonSerializer.Deserialize<RemitaMandateResponse>(json, RemitaHttpClient.Json);
-            if (resp is null || string.IsNullOrEmpty(resp.MandateId)) return null;
+                var hash = RemitaHttpClient.Sha512Hex(_options.MerchantId + mandateReference + _options.ApiKey);
+                var body = new
+                {
+                    merchantId = _options.MerchantId,
+                    mandateId = mandateReference,
+                    hash
+                };
+                var json = await _http.SendAsync(HttpMethod.Post, MandateCancelPath, body, "CancelMandate", hash, ct).ConfigureAwait(false);
+                var resp = JsonSerializer.Deserialize<RemitaMandateResponse>(json, RemitaHttpClient.Json);
 
-            activity?.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return new Mandate
+                return new Mandate
+                {
+                    Reference = mandateReference,
+                    CustomerId = resp?.PayerEmail ?? string.Empty,
+                    Status = MandateStatus.Cancelled,
+                    AmountLimit = decimal.TryParse(resp?.MaxAmount, NumberStyles.Any, CultureInfo.InvariantCulture, out var ma) ? ma : 0m,
+                    Currency = _options.Currency,
+                    CancelledAt = DateTime.UtcNow
+                };
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorMessage?.Contains("already", StringComparison.OrdinalIgnoreCase) == true)
             {
-                Reference = resp.MandateId,
-                CustomerId = resp.PayerEmail ?? string.Empty,
-                Status = MapMandateStatus(resp.Status, resp.StatusCode),
-                AmountLimit = decimal.TryParse(resp.MaxAmount, NumberStyles.Any, CultureInfo.InvariantCulture, out var ma) ? ma : 0m,
-                Currency = _options.Currency,
-                AuthorisedAt = resp.AuthorisedAt,
-                AuthorisationUrl = resp.AuthorisationUrl
-            };
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            activity?.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return null;
-        }
-    }
-
-    /// <inheritdoc />
-    public async Task<Mandate> CancelMandateAsync(string mandateReference, CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(mandateReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "mandate_cancel");
-        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
-        try
-        {
-            var hash = RemitaHttpClient.Sha512Hex(_options.MerchantId + mandateReference + _options.ApiKey);
-            var body = new
-            {
-                merchantId = _options.MerchantId,
-                mandateId = mandateReference,
-                hash
-            };
-            var json = await _http.SendAsync(HttpMethod.Post, MandateCancelPath, body, "CancelMandate", hash, ct).ConfigureAwait(false);
-            var resp = JsonSerializer.Deserialize<RemitaMandateResponse>(json, RemitaHttpClient.Json);
-
-            outcome = BhenguPaymentDiagnostics.Outcomes.Success;
-            return new Mandate
-            {
-                Reference = mandateReference,
-                CustomerId = resp?.PayerEmail ?? string.Empty,
-                Status = MandateStatus.Cancelled,
-                AmountLimit = decimal.TryParse(resp?.MaxAmount, NumberStyles.Any, CultureInfo.InvariantCulture, out var ma) ? ma : 0m,
-                Currency = _options.Currency,
-                CancelledAt = DateTime.UtcNow
-            };
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorMessage?.Contains("already", StringComparison.OrdinalIgnoreCase) == true)
-        {
-            // Already cancelled — return idempotent success.
-            outcome = BhenguPaymentDiagnostics.Outcomes.Success;
-            return new Mandate
-            {
-                Reference = mandateReference,
-                CustomerId = string.Empty,
-                Status = MandateStatus.Cancelled,
-                AmountLimit = 0m,
-                Currency = _options.Currency,
-                CancelledAt = DateTime.UtcNow
-            };
-        }
-        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
-        finally
-        {
-            activity?.SetOutcome(outcome);
-        }
+                // Already cancelled — return idempotent success.
+                return new Mandate
+                {
+                    Reference = mandateReference,
+                    CustomerId = string.Empty,
+                    Status = MandateStatus.Cancelled,
+                    AmountLimit = 0m,
+                    Currency = _options.Currency,
+                    CancelledAt = DateTime.UtcNow
+                };
+            }
+        }, ct);
     }
 
     /// <inheritdoc />
@@ -238,12 +216,8 @@ public sealed class RemitaMandateProvider : BhenguProviderBase, IMandateProvider
             () => ChargeMandateCoreAsync(request, ct), ct);
     }
 
-    private async Task<PaymentResponse> ChargeMandateCoreAsync(MandateChargeRequest request, CancellationToken ct)
-    {
-        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
-        try
+    private Task<PaymentResponse> ChargeMandateCoreAsync(MandateChargeRequest request, CancellationToken ct)
+        => RunChargeAsync(request.Currency, async () =>
         {
             var amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture);
             var requestRef = request.IdempotencyKey ?? $"mandate-debit-{Guid.NewGuid():N}";
@@ -265,12 +239,6 @@ public sealed class RemitaMandateProvider : BhenguProviderBase, IMandateProvider
                 ?? throw new BhenguPaymentException(ProviderName, "Remita mandate-debit returned empty body", "empty_response");
 
             var status = MapDebitStatus(resp.Status, resp.StatusCode);
-            outcome = status switch
-            {
-                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
-                _ => BhenguPaymentDiagnostics.Outcomes.Declined
-            };
 
             return new PaymentResponse
             {
@@ -281,19 +249,7 @@ public sealed class RemitaMandateProvider : BhenguProviderBase, IMandateProvider
                 ProcessedAt = DateTime.UtcNow,
                 Message = resp.Status
             };
-        }
-        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
-        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
-        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
-        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
-        finally
-        {
-            activity?.SetOutcome(outcome);
-            sw.Stop();
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
-            BhenguPaymentDiagnostics.ChargeDurationMs.Record(sw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
-        }
-    }
+        }, ct);
 
     private static MandateStatus MapMandateStatus(string? status, string? code)
     {
