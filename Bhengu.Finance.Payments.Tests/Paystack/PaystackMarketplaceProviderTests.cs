@@ -79,7 +79,7 @@ public class PaystackMarketplaceProviderTests
             {"status":true,"data":[{"subaccount_code":"A","business_name":"X","active":true},{"subaccount_code":"B","business_name":"Y","active":false}]}
             """));
         var provider = Create(handler);
-        var list = await provider.ListSubAccountsAsync();
+        var list = await provider.ListSubAccountsAsync().ToListAsync();
         Assert.Equal(2, list.Count);
     }
 

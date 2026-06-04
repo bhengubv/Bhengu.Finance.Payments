@@ -42,7 +42,7 @@ public class PaystackSettlementProviderTests
                 """);
         });
         var provider = Create(handler);
-        var settlements = await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-30), DateTime.UtcNow);
+        var settlements = await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-30), DateTime.UtcNow).ToListAsync();
         Assert.Equal(2, settlements.Count);
         Assert.Equal("11", settlements[0].Reference);
         Assert.Equal(1000m, settlements[0].NetAmount);
@@ -88,7 +88,7 @@ public class PaystackSettlementProviderTests
                 """);
         });
         var provider = Create(handler);
-        var txs = await provider.ListTransactionsAsync("STL_1");
+        var txs = await provider.ListTransactionsAsync("STL_1").ToListAsync();
         Assert.Equal(2, txs.Count);
         Assert.Equal(SettlementTransactionKind.Charge, txs[0].Kind);
         Assert.Equal(SettlementTransactionKind.Refund, txs[1].Kind);
@@ -99,7 +99,7 @@ public class PaystackSettlementProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "slow"));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<ProviderRateLimitException>(() => provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow));
+        await Assert.ThrowsAsync<ProviderRateLimitException>(async () => await provider.ListSettlementsAsync(DateTime.UtcNow.AddDays(-1), DateTime.UtcNow).ToListAsync());
     }
 
     [Fact]
@@ -107,6 +107,6 @@ public class PaystackSettlementProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("connection refused"));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.ListTransactionsAsync("STL_x"));
+        await Assert.ThrowsAsync<ProviderUnavailableException>(async () => await provider.ListTransactionsAsync("STL_x").ToListAsync());
     }
 }

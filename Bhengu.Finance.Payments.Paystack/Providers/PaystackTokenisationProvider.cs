@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
@@ -33,7 +34,6 @@ public sealed class PaystackTokenisationProvider : ITokenisationProvider
     private readonly HttpClient _httpClient;
     private readonly PaystackOptions _options;
     private readonly ILogger<PaystackTokenisationProvider> _logger;
-    private readonly PaystackIdempotencyCache _idempotency;
 
     /// <inheritdoc/>
     public string ProviderName => ProviderNames.Paystack;
@@ -42,7 +42,178 @@ public sealed class PaystackTokenisationProvider : ITokenisationProvider
     public PaystackTokenisationProvider(
         HttpClient httpClient,
         IOptions<PaystackOptions> options,
-        ILogger<PaystackTokenisationProvider> logger,
+        ILogger<PaystackTokenisationProvider> logger)
+    {
+        _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
+        _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
+        if (string.IsNullOrWhiteSpace(_options.SecretKey))
+            throw new ProviderConfigurationException(ProviderName, $"{nameof(PaystackOptions.SecretKey)} is required");
+
+        PaystackHttpClient.ConfigureClient(_httpClient, _options);
+    }
+
+    /// <inheritdoc/>
+    public Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(token);
+        return PaystackObservability.ObserveAsync("get_payment_method", () => GetPaymentMethodCoreAsync(token, ct));
+    }
+
+    private async Task<PaymentMethod?> GetPaymentMethodCoreAsync(string token, CancellationToken ct)
+    {
+        // Paystack does not have a single "get authorization" endpoint — but the authorization is
+        // surfaced via Customer:fetch. The token itself is opaque; without a customer side reference
+        // we attempt the customer endpoint keyed on the token. If the call fails the method is gone.
+        try
+        {
+            var customerListBody = await PaystackHttpClient.SendAsync(
+                _httpClient, _logger, HttpMethod.Get, "customer?perPage=100", null, "GetPaymentMethod", ct).ConfigureAwait(false);
+            var customers = JsonSerializer.Deserialize<PaystackCustomerListResponse>(customerListBody, PaystackHttpClient.Json);
+            if (customers?.Data is null) return null;
+
+            foreach (var customer in customers.Data)
+            {
+                if (customer.Authorizations is null) continue;
+                foreach (var auth in customer.Authorizations)
+                {
+                    if (string.Equals(auth.AuthorizationCode, token, StringComparison.Ordinal))
+                        return MapAuthorization(auth, customer.CustomerCode);
+                }
+            }
+            return null;
+        }
+        catch (PaymentDeclinedException)
+        {
+            return null;
+        }
+    }
+
+    /// <inheritdoc/>
+    public async IAsyncEnumerable<PaymentMethod> ListPaymentMethodsAsync(string customerId, [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(customerId);
+
+        var responseBody = await PaystackHttpClient.SendAsync(
+            _httpClient, _logger, HttpMethod.Get, $"customer/{Uri.EscapeDataString(customerId)}", null, "ListPaymentMethods", ct).ConfigureAwait(false);
+        var customer = JsonSerializer.Deserialize<PaystackCustomerResponse>(responseBody, PaystackHttpClient.Json);
+
+        if (customer?.Data?.Authorizations is null)
+            yield break;
+
+        foreach (var auth in customer.Data.Authorizations)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return MapAuthorization(auth, customer.Data.CustomerCode);
+        }
+    }
+
+    /// <inheritdoc/>
+    public Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(token);
+        return PaystackObservability.ObserveAsync("delete_payment_method", () => DeletePaymentMethodCoreAsync(token, ct));
+    }
+
+    private async Task<bool> DeletePaymentMethodCoreAsync(string token, CancellationToken ct)
+    {
+        try
+        {
+            var body = new { authorization_code = token };
+            await PaystackHttpClient.SendAsync(
+                _httpClient, _logger, HttpMethod.Post, "customer/deactivate_authorization", body, "DeletePaymentMethod", ct).ConfigureAwait(false);
+            return true;
+        }
+        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+        {
+            return false;
+        }
+    }
+
+    internal static PaymentMethod MapAuthorization(PaystackAuthorization auth, string? customerCode) => new()
+    {
+        Token = auth.AuthorizationCode ?? string.Empty,
+        CustomerId = customerCode,
+        Kind = string.Equals(auth.Channel, "bank", StringComparison.OrdinalIgnoreCase)
+            ? PaymentMethodKind.BankAccount
+            : PaymentMethodKind.Card,
+        Brand = auth.Brand,
+        Last4 = auth.Last4,
+        ExpiryMonth = int.TryParse(auth.ExpMonth, NumberStyles.Integer, CultureInfo.InvariantCulture, out var em) ? em : null,
+        ExpiryYear = int.TryParse(auth.ExpYear, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ey) ? ey : null,
+        IsDefault = false,
+        CreatedAt = null
+    };
+
+    // === Paystack API shapes (internal) ===
+
+    internal sealed class PaystackCustomerResponse
+    {
+        [JsonPropertyName("status")] public bool Status { get; set; }
+        [JsonPropertyName("message")] public string? Message { get; set; }
+        [JsonPropertyName("data")] public PaystackCustomerData? Data { get; set; }
+    }
+
+    internal sealed class PaystackCustomerListResponse
+    {
+        [JsonPropertyName("status")] public bool Status { get; set; }
+        [JsonPropertyName("data")] public List<PaystackCustomerData>? Data { get; set; }
+    }
+
+    internal sealed class PaystackCustomerData
+    {
+        [JsonPropertyName("customer_code")] public string? CustomerCode { get; set; }
+        [JsonPropertyName("email")] public string? Email { get; set; }
+        [JsonPropertyName("authorizations")] public List<PaystackAuthorization>? Authorizations { get; set; }
+    }
+
+    internal sealed class PaystackChargeResponse
+    {
+        [JsonPropertyName("status")] public bool Status { get; set; }
+        [JsonPropertyName("message")] public string? Message { get; set; }
+        [JsonPropertyName("data")] public PaystackChargeData? Data { get; set; }
+    }
+
+    internal sealed class PaystackChargeData
+    {
+        [JsonPropertyName("status")] public string? Status { get; set; }
+        [JsonPropertyName("reference")] public string? Reference { get; set; }
+        [JsonPropertyName("authorization")] public PaystackAuthorization? Authorization { get; set; }
+    }
+
+    internal sealed class PaystackAuthorization
+    {
+        [JsonPropertyName("authorization_code")] public string? AuthorizationCode { get; set; }
+        [JsonPropertyName("brand")] public string? Brand { get; set; }
+        [JsonPropertyName("last4")] public string? Last4 { get; set; }
+        [JsonPropertyName("exp_month")] public string? ExpMonth { get; set; }
+        [JsonPropertyName("exp_year")] public string? ExpYear { get; set; }
+        [JsonPropertyName("channel")] public string? Channel { get; set; }
+    }
+}
+
+/// <summary>
+/// PCI-DSS SAQ-D-scope Paystack tokenisation. Submits raw card details to Paystack's
+/// <c>/charge</c> endpoint and returns the resulting authorization-code. Prefer Paystack Inline
+/// / Popup on the client so the payer's browser sends raw PAN directly to Paystack and your
+/// server only sees the short-lived authorization-code.
+/// </summary>
+public sealed class PaystackRawCardTokenisationProvider : IRawCardTokenisationProvider
+{
+    private readonly HttpClient _httpClient;
+    private readonly PaystackOptions _options;
+    private readonly ILogger<PaystackRawCardTokenisationProvider> _logger;
+    private readonly PaystackIdempotencyCache _idempotency;
+
+    /// <inheritdoc/>
+    public string ProviderName => ProviderNames.Paystack;
+
+    /// <summary>Construct a raw-card tokenisation provider. Designed to be registered via DI.</summary>
+    public PaystackRawCardTokenisationProvider(
+        HttpClient httpClient,
+        IOptions<PaystackOptions> options,
+        ILogger<PaystackRawCardTokenisationProvider> logger,
         PaystackIdempotencyCache idempotency)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
@@ -83,7 +254,7 @@ public sealed class PaystackTokenisationProvider : ITokenisationProvider
 
         var customerResponseBody = await PaystackHttpClient.SendAsync(
             _httpClient, _logger, HttpMethod.Post, "customer", customerBody, "TokeniseCustomerCreate", ct).ConfigureAwait(false);
-        var customer = JsonSerializer.Deserialize<PaystackCustomerResponse>(customerResponseBody, PaystackHttpClient.Json);
+        var customer = JsonSerializer.Deserialize<PaystackTokenisationProvider.PaystackCustomerResponse>(customerResponseBody, PaystackHttpClient.Json);
         var customerCode = customer?.Data?.CustomerCode ?? customerEmail;
 
         // Step 2 — submit raw card to /charge. Paystack returns an authorization_code we can reuse.
@@ -107,7 +278,7 @@ public sealed class PaystackTokenisationProvider : ITokenisationProvider
 
         var chargeResponseBody = await PaystackHttpClient.SendAsync(
             _httpClient, _logger, HttpMethod.Post, "charge", chargeBody, "TokeniseCharge", ct).ConfigureAwait(false);
-        var charge = JsonSerializer.Deserialize<PaystackChargeResponse>(chargeResponseBody, PaystackHttpClient.Json);
+        var charge = JsonSerializer.Deserialize<PaystackTokenisationProvider.PaystackChargeResponse>(chargeResponseBody, PaystackHttpClient.Json);
 
         var auth = charge?.Data?.Authorization
             ?? throw new BhenguPaymentException(ProviderName, "Paystack did not return an authorization on charge", "no_authorization");
@@ -132,146 +303,5 @@ public sealed class PaystackTokenisationProvider : ITokenisationProvider
             IsDefault = request.SetAsDefault,
             CreatedAt = DateTime.UtcNow
         };
-    }
-
-    /// <inheritdoc/>
-    public Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(token);
-        return PaystackObservability.ObserveAsync("get_payment_method", () => GetPaymentMethodCoreAsync(token, ct));
-    }
-
-    private async Task<PaymentMethod?> GetPaymentMethodCoreAsync(string token, CancellationToken ct)
-    {
-        // Paystack does not have a single "get authorization" endpoint — but the authorization is
-        // surfaced via Customer:fetch. The token itself is opaque; without a customer side reference
-        // we attempt the customer endpoint keyed on the token. If the call fails the method is gone.
-        try
-        {
-            var customerListBody = await PaystackHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get, "customer?perPage=100", null, "GetPaymentMethod", ct).ConfigureAwait(false);
-            var customers = JsonSerializer.Deserialize<PaystackCustomerListResponse>(customerListBody, PaystackHttpClient.Json);
-            if (customers?.Data is null) return null;
-
-            foreach (var customer in customers.Data)
-            {
-                if (customer.Authorizations is null) continue;
-                foreach (var auth in customer.Authorizations)
-                {
-                    if (string.Equals(auth.AuthorizationCode, token, StringComparison.Ordinal))
-                        return MapAuthorization(auth, customer.CustomerCode);
-                }
-            }
-            return null;
-        }
-        catch (PaymentDeclinedException)
-        {
-            return null;
-        }
-    }
-
-    /// <inheritdoc/>
-    public Task<IReadOnlyList<PaymentMethod>> ListPaymentMethodsAsync(string customerId, CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(customerId);
-        return PaystackObservability.ObserveAsync("list_payment_methods", () => ListPaymentMethodsCoreAsync(customerId, ct));
-    }
-
-    private async Task<IReadOnlyList<PaymentMethod>> ListPaymentMethodsCoreAsync(string customerId, CancellationToken ct)
-    {
-        var responseBody = await PaystackHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Get, $"customer/{Uri.EscapeDataString(customerId)}", null, "ListPaymentMethods", ct).ConfigureAwait(false);
-        var customer = JsonSerializer.Deserialize<PaystackCustomerResponse>(responseBody, PaystackHttpClient.Json);
-
-        if (customer?.Data?.Authorizations is null)
-            return Array.Empty<PaymentMethod>();
-
-        var result = new List<PaymentMethod>(customer.Data.Authorizations.Count);
-        foreach (var auth in customer.Data.Authorizations)
-            result.Add(MapAuthorization(auth, customer.Data.CustomerCode));
-        return result;
-    }
-
-    /// <inheritdoc/>
-    public Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(token);
-        return PaystackObservability.ObserveAsync("delete_payment_method", () => DeletePaymentMethodCoreAsync(token, ct));
-    }
-
-    private async Task<bool> DeletePaymentMethodCoreAsync(string token, CancellationToken ct)
-    {
-        try
-        {
-            var body = new { authorization_code = token };
-            await PaystackHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Post, "customer/deactivate_authorization", body, "DeletePaymentMethod", ct).ConfigureAwait(false);
-            return true;
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            return false;
-        }
-    }
-
-    private static PaymentMethod MapAuthorization(PaystackAuthorization auth, string? customerCode) => new()
-    {
-        Token = auth.AuthorizationCode ?? string.Empty,
-        CustomerId = customerCode,
-        Kind = string.Equals(auth.Channel, "bank", StringComparison.OrdinalIgnoreCase)
-            ? PaymentMethodKind.BankAccount
-            : PaymentMethodKind.Card,
-        Brand = auth.Brand,
-        Last4 = auth.Last4,
-        ExpiryMonth = int.TryParse(auth.ExpMonth, NumberStyles.Integer, CultureInfo.InvariantCulture, out var em) ? em : null,
-        ExpiryYear = int.TryParse(auth.ExpYear, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ey) ? ey : null,
-        IsDefault = false,
-        CreatedAt = null
-    };
-
-    // === Paystack API shapes (internal) ===
-
-    private sealed class PaystackCustomerResponse
-    {
-        [JsonPropertyName("status")] public bool Status { get; set; }
-        [JsonPropertyName("message")] public string? Message { get; set; }
-        [JsonPropertyName("data")] public PaystackCustomerData? Data { get; set; }
-    }
-
-    private sealed class PaystackCustomerListResponse
-    {
-        [JsonPropertyName("status")] public bool Status { get; set; }
-        [JsonPropertyName("data")] public List<PaystackCustomerData>? Data { get; set; }
-    }
-
-    private sealed class PaystackCustomerData
-    {
-        [JsonPropertyName("customer_code")] public string? CustomerCode { get; set; }
-        [JsonPropertyName("email")] public string? Email { get; set; }
-        [JsonPropertyName("authorizations")] public List<PaystackAuthorization>? Authorizations { get; set; }
-    }
-
-    private sealed class PaystackChargeResponse
-    {
-        [JsonPropertyName("status")] public bool Status { get; set; }
-        [JsonPropertyName("message")] public string? Message { get; set; }
-        [JsonPropertyName("data")] public PaystackChargeData? Data { get; set; }
-    }
-
-    private sealed class PaystackChargeData
-    {
-        [JsonPropertyName("status")] public string? Status { get; set; }
-        [JsonPropertyName("reference")] public string? Reference { get; set; }
-        [JsonPropertyName("authorization")] public PaystackAuthorization? Authorization { get; set; }
-    }
-
-    private sealed class PaystackAuthorization
-    {
-        [JsonPropertyName("authorization_code")] public string? AuthorizationCode { get; set; }
-        [JsonPropertyName("brand")] public string? Brand { get; set; }
-        [JsonPropertyName("last4")] public string? Last4 { get; set; }
-        [JsonPropertyName("exp_month")] public string? ExpMonth { get; set; }
-        [JsonPropertyName("exp_year")] public string? ExpYear { get; set; }
-        [JsonPropertyName("channel")] public string? Channel { get; set; }
     }
 }

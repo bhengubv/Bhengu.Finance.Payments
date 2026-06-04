@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -45,10 +46,7 @@ public sealed class PaystackSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
-        => PaystackObservability.ObserveAsync("list_settlements", () => ListSettlementsCoreAsync(fromUtc, toUtc, ct));
-
-    private async Task<IReadOnlyList<Settlement>> ListSettlementsCoreAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct)
+    public async IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, [EnumeratorCancellation] CancellationToken ct = default)
     {
         var qs = new StringBuilder("settlement?perPage=100")
             .Append("&from=").Append(Uri.EscapeDataString(fromUtc.ToString("o", CultureInfo.InvariantCulture)))
@@ -57,11 +55,13 @@ public sealed class PaystackSettlementProvider : ISettlementProvider
         var responseBody = await PaystackHttpClient.SendAsync(
             _httpClient, _logger, HttpMethod.Get, qs.ToString(), null, "ListSettlements", ct).ConfigureAwait(false);
         var response = JsonSerializer.Deserialize<PaystackSettlementListResponse>(responseBody, PaystackHttpClient.Json);
-        if (response?.Data is null) return Array.Empty<Settlement>();
+        if (response?.Data is null) yield break;
 
-        var result = new List<Settlement>(response.Data.Count);
-        foreach (var s in response.Data) result.Add(MapSettlement(s));
-        return result;
+        foreach (var s in response.Data)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return MapSettlement(s);
+        }
     }
 
     /// <inheritdoc/>
@@ -87,22 +87,20 @@ public sealed class PaystackSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
+    public async IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(string settlementReference, [EnumeratorCancellation] CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-        return PaystackObservability.ObserveAsync("list_settlement_transactions", () => ListTransactionsCoreAsync(settlementReference, ct));
-    }
 
-    private async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsCoreAsync(string settlementReference, CancellationToken ct)
-    {
         var responseBody = await PaystackHttpClient.SendAsync(
             _httpClient, _logger, HttpMethod.Get, $"settlement/{Uri.EscapeDataString(settlementReference)}/transactions?perPage=100", null, "ListSettlementTransactions", ct).ConfigureAwait(false);
         var response = JsonSerializer.Deserialize<PaystackSettlementTransactionListResponse>(responseBody, PaystackHttpClient.Json);
-        if (response?.Data is null) return Array.Empty<SettlementTransaction>();
+        if (response?.Data is null) yield break;
 
-        var result = new List<SettlementTransaction>(response.Data.Count);
-        foreach (var tx in response.Data) result.Add(MapTransaction(tx));
-        return result;
+        foreach (var tx in response.Data)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return MapTransaction(tx);
+        }
     }
 
     private static Settlement MapSettlement(PaystackSettlementData s) => new()

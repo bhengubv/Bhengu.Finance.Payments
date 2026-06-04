@@ -38,6 +38,7 @@ public static class ServiceCollectionExtensions
 
         services.AddHttpClient<PaystackPaymentProvider>();
         services.AddHttpClient<PaystackTokenisationProvider>();
+        services.AddHttpClient<PaystackRawCardTokenisationProvider>();
         services.AddHttpClient<PaystackSubscriptionProvider>();
         services.AddHttpClient<PaystackDisputeProvider>();
         services.AddHttpClient<PaystackSettlementProvider>();
@@ -50,6 +51,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<PaystackPaymentProvider>());
         services.AddTransient<ITokenisationProvider, PaystackTokenisationProvider>(sp =>
             sp.GetRequiredService<PaystackTokenisationProvider>());
+        services.AddTransient<IRawCardTokenisationProvider, PaystackRawCardTokenisationProvider>(sp =>
+            sp.GetRequiredService<PaystackRawCardTokenisationProvider>());
         services.AddTransient<ISubscriptionProvider, PaystackSubscriptionProvider>(sp =>
             sp.GetRequiredService<PaystackSubscriptionProvider>());
         services.AddTransient<IDisputeProvider, PaystackDisputeProvider>(sp =>
@@ -63,6 +66,8 @@ public static class ServiceCollectionExtensions
             (sp, _) => sp.GetRequiredService<PaystackPaymentProvider>());
         services.AddKeyedTransient<ITokenisationProvider>(ProviderNames.Paystack,
             (sp, _) => sp.GetRequiredService<PaystackTokenisationProvider>());
+        services.AddKeyedTransient<IRawCardTokenisationProvider>(ProviderNames.Paystack,
+            (sp, _) => sp.GetRequiredService<PaystackRawCardTokenisationProvider>());
         services.AddKeyedTransient<ISubscriptionProvider>(ProviderNames.Paystack,
             (sp, _) => sp.GetRequiredService<PaystackSubscriptionProvider>());
         services.AddKeyedTransient<IDisputeProvider>(ProviderNames.Paystack,

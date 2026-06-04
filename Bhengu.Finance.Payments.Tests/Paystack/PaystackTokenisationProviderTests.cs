@@ -27,7 +27,22 @@ public class PaystackTokenisationProviderTests
         return new PaystackTokenisationProvider(
             http,
             Options.Create(opts),
-            NullLogger<PaystackTokenisationProvider>.Instance,
+            NullLogger<PaystackTokenisationProvider>.Instance);
+    }
+
+    private static PaystackRawCardTokenisationProvider CreateRaw(StubHttpMessageHandler handler, PaystackOptions? opts = null)
+    {
+        opts ??= new PaystackOptions
+        {
+            SecretKey = "sk_test_xx",
+            WebhookSecret = "webhook-test-secret",
+            DefaultEmail = "buyer@example.com"
+        };
+        var http = new HttpClient(handler);
+        return new PaystackRawCardTokenisationProvider(
+            http,
+            Options.Create(opts),
+            NullLogger<PaystackRawCardTokenisationProvider>.Instance,
             new PaystackIdempotencyCache());
     }
 
@@ -46,6 +61,13 @@ public class PaystackTokenisationProviderTests
         IdempotencyKey = idempotencyKey
     };
 
+    private static async Task<List<PaymentMethod>> ToListAsync(IAsyncEnumerable<PaymentMethod> source)
+    {
+        var list = new List<PaymentMethod>();
+        await foreach (var item in source) list.Add(item);
+        return list;
+    }
+
     [Fact]
     public void Constructor_Throws_WhenSecretKeyMissing()
     {
@@ -53,8 +75,7 @@ public class PaystackTokenisationProviderTests
         Assert.Throws<ProviderConfigurationException>(() => new PaystackTokenisationProvider(
             http,
             Options.Create(new PaystackOptions()),
-            NullLogger<PaystackTokenisationProvider>.Instance,
-            new PaystackIdempotencyCache()));
+            NullLogger<PaystackTokenisationProvider>.Instance));
     }
 
     [Fact]
@@ -76,7 +97,7 @@ public class PaystackTokenisationProviderTests
                 """);
         });
 
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         var pm = await provider.TokeniseAsync(SampleRequest());
 
         Assert.Equal("AUTH_xyz", pm.Token);
@@ -100,7 +121,7 @@ public class PaystackTokenisationProviderTests
                 {"status":true,"message":"declined","data":{"status":"failed","authorization":{}}}
                 """);
         });
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -108,7 +129,7 @@ public class PaystackTokenisationProviderTests
     public async Task TokeniseAsync_Throws429AsRateLimit()
     {
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "rate limited"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderRateLimitException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -116,7 +137,7 @@ public class PaystackTokenisationProviderTests
     public async Task TokeniseAsync_Throws5xxAsProviderUnavailable()
     {
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.InternalServerError, "down"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -124,7 +145,7 @@ public class PaystackTokenisationProviderTests
     public async Task TokeniseAsync_ThrowsProviderUnavailable_OnNetworkError()
     {
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("DNS failure"));
-        var provider = Create(handler);
+        var provider = CreateRaw(handler);
         await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.TokeniseAsync(SampleRequest()));
     }
 
@@ -134,7 +155,7 @@ public class PaystackTokenisationProviderTests
         var handler = new StubHttpMessageHandler((_, _) =>
             StubHttpMessageHandler.Json(HttpStatusCode.OK, """{"status":true,"data":{"customer_code":"CUS_a","authorizations":[]}}"""));
         var provider = Create(handler);
-        var methods = await provider.ListPaymentMethodsAsync("CUS_a");
+        var methods = await ToListAsync(provider.ListPaymentMethodsAsync("CUS_a"));
         Assert.Empty(methods);
     }
 
@@ -149,7 +170,7 @@ public class PaystackTokenisationProviderTests
                 ]}}
                 """));
         var provider = Create(handler);
-        var methods = await provider.ListPaymentMethodsAsync("CUS_b");
+        var methods = await ToListAsync(provider.ListPaymentMethodsAsync("CUS_b"));
         Assert.Equal(2, methods.Count);
         Assert.Equal(PaymentMethodKind.Card, methods[0].Kind);
         Assert.Equal(PaymentMethodKind.BankAccount, methods[1].Kind);

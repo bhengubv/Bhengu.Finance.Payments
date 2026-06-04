@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -72,10 +73,7 @@ public sealed class PaystackDisputeProvider : IDisputeProvider
     }
 
     /// <inheritdoc/>
-    public Task<IReadOnlyList<Dispute>> ListDisputesAsync(DateTime? fromUtc = null, DateTime? toUtc = null, CancellationToken ct = default)
-        => PaystackObservability.ObserveAsync("list_disputes", () => ListDisputesCoreAsync(fromUtc, toUtc, ct));
-
-    private async Task<IReadOnlyList<Dispute>> ListDisputesCoreAsync(DateTime? fromUtc, DateTime? toUtc, CancellationToken ct)
+    public async IAsyncEnumerable<Dispute> ListDisputesAsync(DateTime? fromUtc = null, DateTime? toUtc = null, [EnumeratorCancellation] CancellationToken ct = default)
     {
         var qs = new StringBuilder("dispute?perPage=100");
         if (fromUtc.HasValue)
@@ -87,11 +85,13 @@ public sealed class PaystackDisputeProvider : IDisputeProvider
             _httpClient, _logger, HttpMethod.Get, qs.ToString(), null, "ListDisputes", ct).ConfigureAwait(false);
         var response = JsonSerializer.Deserialize<PaystackDisputeListResponse>(responseBody, PaystackHttpClient.Json);
         if (response?.Data is null)
-            return Array.Empty<Dispute>();
+            yield break;
 
-        var result = new List<Dispute>(response.Data.Count);
-        foreach (var d in response.Data) result.Add(MapDispute(d));
-        return result;
+        foreach (var d in response.Data)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return MapDispute(d);
+        }
     }
 
     /// <inheritdoc/>

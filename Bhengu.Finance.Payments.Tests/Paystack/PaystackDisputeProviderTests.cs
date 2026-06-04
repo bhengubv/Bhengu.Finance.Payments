@@ -69,7 +69,7 @@ public class PaystackDisputeProviderTests
                 """);
         });
         var provider = Create(handler);
-        var disputes = await provider.ListDisputesAsync(DateTime.UtcNow.AddDays(-30), DateTime.UtcNow);
+        var disputes = await provider.ListDisputesAsync(DateTime.UtcNow.AddDays(-30), DateTime.UtcNow).ToListAsync();
         Assert.Equal(2, disputes.Count);
         Assert.Equal(DisputeStatus.Won, disputes[0].Status);
         Assert.Equal(DisputeStatus.Expired, disputes[1].Status);
@@ -80,7 +80,7 @@ public class PaystackDisputeProviderTests
     {
         var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "slow"));
         var provider = Create(handler);
-        await Assert.ThrowsAsync<ProviderRateLimitException>(() => provider.ListDisputesAsync(null, null));
+        await Assert.ThrowsAsync<ProviderRateLimitException>(async () => await provider.ListDisputesAsync(null, null).ToListAsync());
     }
 
     [Fact]

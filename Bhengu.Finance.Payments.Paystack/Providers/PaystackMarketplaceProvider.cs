@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
@@ -120,19 +121,18 @@ public sealed class PaystackMarketplaceProvider : IMarketplaceProvider
     }
 
     /// <inheritdoc/>
-    public Task<IReadOnlyList<SubAccount>> ListSubAccountsAsync(CancellationToken ct = default)
-        => PaystackObservability.ObserveAsync("list_sub_accounts", () => ListSubAccountsCoreAsync(ct));
-
-    private async Task<IReadOnlyList<SubAccount>> ListSubAccountsCoreAsync(CancellationToken ct)
+    public async IAsyncEnumerable<SubAccount> ListSubAccountsAsync([EnumeratorCancellation] CancellationToken ct = default)
     {
         var responseBody = await PaystackHttpClient.SendAsync(
             _httpClient, _logger, HttpMethod.Get, "subaccount?perPage=100", null, "ListSubAccounts", ct).ConfigureAwait(false);
         var response = JsonSerializer.Deserialize<PaystackSubAccountListResponse>(responseBody, PaystackHttpClient.Json);
-        if (response?.Data is null) return Array.Empty<SubAccount>();
+        if (response?.Data is null) yield break;
 
-        var result = new List<SubAccount>(response.Data.Count);
-        foreach (var data in response.Data) result.Add(MapSubAccount(data, null));
-        return result;
+        foreach (var data in response.Data)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return MapSubAccount(data, null);
+        }
     }
 
     /// <inheritdoc/>
