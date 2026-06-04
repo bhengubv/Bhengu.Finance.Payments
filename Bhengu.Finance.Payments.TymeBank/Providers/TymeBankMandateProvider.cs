@@ -11,6 +11,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Mandate;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.TymeBank.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -50,18 +51,17 @@ namespace Bhengu.Finance.Payments.TymeBank.Providers;
 /// 60 seconds before expiry under a <see cref="SemaphoreSlim"/>).
 /// </para>
 /// </remarks>
-public sealed class TymeBankMandateProvider : IMandateProvider
+public sealed class TymeBankMandateProvider : BhenguProviderBase, IMandateProvider
 {
     private readonly HttpClient _httpClient;
     private readonly TymeBankOptions _options;
-    private readonly ILogger<TymeBankMandateProvider> _logger;
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
 
     private string? _cachedToken;
     private DateTimeOffset _cachedTokenExpiresAt = DateTimeOffset.MinValue;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.TymeBank;
+    public override string ProviderName => ProviderNames.TymeBank;
 
     /// <summary>
     /// Construct the provider. Throws <see cref="ProviderConfigurationException"/> when
@@ -71,10 +71,10 @@ public sealed class TymeBankMandateProvider : IMandateProvider
         HttpClient httpClient,
         IOptions<TymeBankOptions> options,
         ILogger<TymeBankMandateProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ClientId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(TymeBankOptions.ClientId)} is required");
@@ -117,7 +117,7 @@ public sealed class TymeBankMandateProvider : IMandateProvider
             .ConfigureAwait(false);
         var mandateResp = JsonSerializer.Deserialize<TymeBankMandateResponse>(raw);
 
-        _logger.LogInformation("TymeBank mandate created: id={MandateId} status={Status}",
+        Logger.LogInformation("TymeBank mandate created: id={MandateId} status={Status}",
             mandateResp?.MandateId, mandateResp?.Status);
 
         return MapMandate(mandateResp, fallbackCustomerId: request.CustomerId, fallbackCurrency: request.Currency.ToUpperInvariant(), fallbackAmountLimit: request.AmountLimit);
@@ -156,7 +156,7 @@ public sealed class TymeBankMandateProvider : IMandateProvider
             if (!string.IsNullOrWhiteSpace(raw) && raw.TrimStart().StartsWith('{'))
                 mandateResp = JsonSerializer.Deserialize<TymeBankMandateResponse>(raw);
 
-            _logger.LogInformation("TymeBank mandate cancelled: id={MandateId}", mandateReference);
+            Logger.LogInformation("TymeBank mandate cancelled: id={MandateId}", mandateReference);
 
             return new Mandate
             {
@@ -173,7 +173,7 @@ public sealed class TymeBankMandateProvider : IMandateProvider
                                                   (ex.ProviderErrorMessage?.Contains("already", StringComparison.OrdinalIgnoreCase) ?? false))
         {
             // Idempotency contract: cancelling an already-cancelled / missing mandate returns success.
-            _logger.LogInformation("TymeBank CancelMandate treated as idempotent for {Reference}: {Code}",
+            Logger.LogInformation("TymeBank CancelMandate treated as idempotent for {Reference}: {Code}",
                 mandateReference, ex.ProviderErrorCode);
             return new Mandate
             {
@@ -206,7 +206,7 @@ public sealed class TymeBankMandateProvider : IMandateProvider
             .ConfigureAwait(false);
         var debitResp = JsonSerializer.Deserialize<TymeBankDebitResponse>(raw);
 
-        _logger.LogInformation("TymeBank mandate debit: id={DebitId} status={Status} mandate={Mandate}",
+        Logger.LogInformation("TymeBank mandate debit: id={DebitId} status={Status} mandate={Mandate}",
             debitResp?.DebitId, debitResp?.Status, request.MandateReference);
 
         return new PaymentResponse
@@ -337,7 +337,7 @@ public sealed class TymeBankMandateProvider : IMandateProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("TymeBank {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("TymeBank {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

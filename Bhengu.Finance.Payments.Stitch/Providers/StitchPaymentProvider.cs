@@ -2,7 +2,6 @@
 
 using System.Globalization;
 using System.Net;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -11,8 +10,9 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.Stitch.Configuration;
-using Bhengu.Finance.Payments.Stitch.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -27,14 +27,13 @@ namespace Bhengu.Finance.Payments.Stitch.Providers;
 /// <c>POST /api/v1/payments/{id}/refund</c>. Webhook authenticity uses HMAC-SHA256 in
 /// <c>X-Stitch-Signature</c>.
 /// </summary>
-public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class StitchPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly StitchOptions _options;
-    private readonly ILogger<StitchPaymentProvider> _logger;
     private readonly Uri _graphqlUri;
 
-    public string ProviderName => ProviderNames.Stitch;
+    public override string ProviderName => ProviderNames.Stitch;
 
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
@@ -50,10 +49,10 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         HttpClient httpClient,
         IOptions<StitchOptions> options,
         ILogger<StitchPaymentProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ClientId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(StitchOptions.ClientId)} is required");
@@ -79,7 +78,7 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return StitchObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+        return RunChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct), ct);
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
@@ -133,7 +132,7 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         var graphqlResponse = JsonSerializer.Deserialize<StitchGraphqlResponse<StitchPaymentInitData>>(body);
 
         var pir = graphqlResponse?.Data?.ClientPaymentInitiationRequestCreate?.PaymentInitiationRequest;
-        _logger.LogInformation("Stitch payment-init created: id={Id} url={Url}", pir?.Id, pir?.Url);
+        Logger.LogInformation("Stitch payment-init created: id={Id} url={Url}", pir?.Id, pir?.Url);
 
         return new PaymentResponse
         {
@@ -151,7 +150,7 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return StitchObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+        return RunPayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct), ct);
     }
 
     private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
@@ -204,7 +203,7 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         var graphqlResponse = JsonSerializer.Deserialize<StitchGraphqlResponse<StitchPayoutInitData>>(body);
 
         var pir = graphqlResponse?.Data?.ClientPayoutInitiationRequestCreate?.PayoutInitiationRequest;
-        _logger.LogInformation("Stitch payout-init created: id={Id} status={Status}", pir?.Id, pir?.Status);
+        Logger.LogInformation("Stitch payout-init created: id={Id} status={Status}", pir?.Id, pir?.Status);
 
         return new PayoutResponse
         {
@@ -220,7 +219,7 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return StitchObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+        return RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct), ct);
     }
 
     private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
@@ -235,7 +234,7 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         var body = await SendRestAsync(HttpMethod.Post, path, requestBody, ct, "ProcessRefund").ConfigureAwait(false);
         var refundResponse = JsonSerializer.Deserialize<StitchRefundResponse>(body);
 
-        _logger.LogInformation("Stitch refund: refundId={RefundId} for payment {PaymentId}",
+        Logger.LogInformation("Stitch refund: refundId={RefundId} for payment {PaymentId}",
             refundResponse?.Id, request.GatewayReference);
 
         return new RefundResponse
@@ -256,37 +255,22 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
 
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
-            _logger.LogWarning("Stitch WebhookSecret not configured — signature verification cannot succeed.");
-            StitchObservability.RecordWebhookVerification(false);
-            return false;
+            Logger.LogWarning("Stitch WebhookSecret not configured — signature verification cannot succeed.");
+            return RunWebhookVerify(() => false);
         }
 
-        bool verified;
-        try
-        {
-            using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
-            var computed = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant();
-            var supplied = signature.StartsWith("sha256=", StringComparison.OrdinalIgnoreCase)
-                ? signature["sha256=".Length..]
-                : signature;
-            verified = CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(computed),
-                Encoding.UTF8.GetBytes(supplied.ToLowerInvariant()));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Stitch webhook signature verification raised");
-            verified = false;
-        }
-        StitchObservability.RecordWebhookVerification(verified);
-        return verified;
+        // Stitch headers may be prefixed "sha256=<hex>"; strip the prefix before hand-off.
+        var supplied = signature.StartsWith("sha256=", StringComparison.OrdinalIgnoreCase)
+            ? signature["sha256=".Length..]
+            : signature;
+        return RunWebhookVerify(() => SignatureHelpers.VerifyHmacSha256(payload, supplied, _options.WebhookSecret));
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        return StitchObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+        return RunOperationAsync("parse_webhook", () => ParseWebhookCoreAsync(payload, ct), ct);
     }
 
     private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
@@ -296,7 +280,7 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
             var webhookEvent = JsonSerializer.Deserialize<StitchWebhookEvent>(payload);
             if (webhookEvent is null) return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed Stitch webhook: type={Type} id={Id}",
+            Logger.LogInformation("Parsed Stitch webhook: type={Type} id={Id}",
                 webhookEvent.EventType, webhookEvent.Data?.Id);
 
             var typed = MapTypedEvent(webhookEvent);
@@ -304,7 +288,7 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse Stitch webhook event");
+            Logger.LogError(ex, "Failed to parse Stitch webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -491,16 +475,8 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
 
     private async Task<string> ExecuteAsync(HttpRequestMessage req, CancellationToken ct, string operation)
     {
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stitch failed", ex);
-        }
-
+        // HttpRequestException is auto-translated to ProviderUnavailableException by BhenguProviderBase.
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -511,7 +487,7 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Stitch {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Stitch {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

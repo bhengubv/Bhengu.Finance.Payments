@@ -11,6 +11,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Mandate;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Stitch.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -52,14 +53,13 @@ namespace Bhengu.Finance.Payments.Stitch.Providers;
 /// re-issue.
 /// </para>
 /// </remarks>
-public sealed class StitchMandateProvider : IMandateProvider
+public sealed class StitchMandateProvider : BhenguProviderBase, IMandateProvider
 {
     private const string DefaultTokenEndpoint = "https://secure.stitch.money/connect/token";
     private const string DefaultGraphqlEndpoint = "https://api.stitch.money/graphql";
 
     private readonly HttpClient _httpClient;
     private readonly StitchOptions _options;
-    private readonly ILogger<StitchMandateProvider> _logger;
     private readonly Uri _graphqlUri;
     private readonly Uri _tokenUri;
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
@@ -68,7 +68,7 @@ public sealed class StitchMandateProvider : IMandateProvider
     private DateTimeOffset _cachedTokenExpiresAt = DateTimeOffset.MinValue;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Stitch;
+    public override string ProviderName => ProviderNames.Stitch;
 
     /// <summary>
     /// Construct the provider. Throws <see cref="ProviderConfigurationException"/> when
@@ -80,10 +80,10 @@ public sealed class StitchMandateProvider : IMandateProvider
         HttpClient httpClient,
         IOptions<StitchOptions> options,
         ILogger<StitchMandateProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ClientId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(StitchOptions.ClientId)} is required");
@@ -150,7 +150,7 @@ public sealed class StitchMandateProvider : IMandateProvider
         var parsed = JsonSerializer.Deserialize<StitchGraphqlResponse<StitchCreateMandateData>>(body);
         var pi = parsed?.Data?.CreatePaymentInitiation?.PaymentInitiation;
 
-        _logger.LogInformation("Stitch DebiCheck mandate created: id={Id} authUrl={Url}",
+        Logger.LogInformation("Stitch DebiCheck mandate created: id={Id} authUrl={Url}",
             pi?.Id, pi?.AuthorizationUrl);
 
         return new Mandate
@@ -230,7 +230,7 @@ public sealed class StitchMandateProvider : IMandateProvider
             var parsed = JsonSerializer.Deserialize<StitchGraphqlResponse<StitchCancelMandateData>>(body);
             var pi = parsed?.Data?.CancelPaymentInitiation?.PaymentInitiation;
 
-            _logger.LogInformation("Stitch DebiCheck mandate cancelled: id={Id} status={Status}",
+            Logger.LogInformation("Stitch DebiCheck mandate cancelled: id={Id} status={Status}",
                 pi?.Id, pi?.Status);
 
             return new Mandate
@@ -247,7 +247,7 @@ public sealed class StitchMandateProvider : IMandateProvider
                                                   (ex.ProviderErrorMessage?.Contains("already", StringComparison.OrdinalIgnoreCase) ?? false))
         {
             // Idempotency contract: cancelling an already-cancelled / missing mandate returns success.
-            _logger.LogInformation("Stitch CancelMandate treated as idempotent for {Reference}: {Code}",
+            Logger.LogInformation("Stitch CancelMandate treated as idempotent for {Reference}: {Code}",
                 mandateReference, ex.ProviderErrorCode);
             return new Mandate
             {
@@ -298,7 +298,7 @@ public sealed class StitchMandateProvider : IMandateProvider
         var parsed = JsonSerializer.Deserialize<StitchGraphqlResponse<StitchDebitMandateData>>(body);
         var debit = parsed?.Data?.PaymentInitiationDebit?.Debit;
 
-        _logger.LogInformation("Stitch DebiCheck debit: id={Id} status={Status} mandate={Mandate}",
+        Logger.LogInformation("Stitch DebiCheck debit: id={Id} status={Status} mandate={Mandate}",
             debit?.Id, debit?.Status, request.MandateReference);
 
         return new PaymentResponse
@@ -371,7 +371,7 @@ public sealed class StitchMandateProvider : IMandateProvider
 
             _cachedToken = token.AccessToken;
             _cachedTokenExpiresAt = DateTimeOffset.UtcNow.AddSeconds(Math.Max(60, token.ExpiresIn - 60));
-            _logger.LogDebug("Stitch access token cached, expires={Expires}", _cachedTokenExpiresAt);
+            Logger.LogDebug("Stitch access token cached, expires={Expires}", _cachedTokenExpiresAt);
         }
         finally
         {
@@ -401,7 +401,7 @@ public sealed class StitchMandateProvider : IMandateProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Stitch {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Stitch {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

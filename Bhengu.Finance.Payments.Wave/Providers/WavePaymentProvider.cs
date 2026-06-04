@@ -2,7 +2,6 @@
 
 using System.Net;
 using System.Net.Http.Headers;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -10,8 +9,9 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.Wave.Configuration;
-using Bhengu.Finance.Payments.Wave.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -22,13 +22,12 @@ namespace Bhengu.Finance.Payments.Wave.Providers;
 /// REST API: Checkout Sessions for collections, Payouts for disbursements, and HMAC-signed
 /// webhooks via the <c>Wave-Signature</c> header (format <c>t=...,v1=...</c>).
 /// </summary>
-public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class WavePaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly WaveOptions _options;
-    private readonly ILogger<WavePaymentProvider> _logger;
 
-    public string ProviderName => ProviderNames.Wave;
+    public override string ProviderName => ProviderNames.Wave;
 
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
@@ -42,10 +41,10 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
         HttpClient httpClient,
         IOptions<WaveOptions> options,
         ILogger<WavePaymentProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(WaveOptions.ApiKey)} is required");
@@ -60,7 +59,7 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return WaveObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+        return RunChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct), ct);
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
@@ -77,7 +76,7 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
         var body = await SendAsync(HttpMethod.Post, "v1/checkout/sessions", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
         var waveResponse = JsonSerializer.Deserialize<WaveCheckoutResponse>(body);
 
-        _logger.LogInformation("Wave checkout session created: {Id} status={Status}", waveResponse?.Id, waveResponse?.CheckoutStatus);
+        Logger.LogInformation("Wave checkout session created: {Id} status={Status}", waveResponse?.Id, waveResponse?.CheckoutStatus);
 
         return new PaymentResponse
         {
@@ -95,7 +94,7 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return WaveObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+        return RunPayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct), ct);
     }
 
     private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
@@ -137,7 +136,7 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
         var body = await SendAsync(HttpMethod.Post, "v1/payout", requestBody, ct, "ProcessPayout").ConfigureAwait(false);
         var payoutResponse = JsonSerializer.Deserialize<WavePayoutResponse>(body);
 
-        _logger.LogInformation(
+        Logger.LogInformation(
             "Wave payout created: Id={Id} Status={Status} IdempotencyKey={IdempotencyKey}",
             payoutResponse?.Id, payoutResponse?.Status, idempotencyKey);
 
@@ -155,7 +154,7 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return WaveObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+        return RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct), ct);
     }
 
     private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
@@ -164,7 +163,7 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
         var body = await SendAsync(HttpMethod.Post, path, new { }, ct, "ProcessRefund").ConfigureAwait(false);
         var refundResponse = JsonSerializer.Deserialize<WaveCheckoutResponse>(body);
 
-        _logger.LogInformation("Wave refund issued for session {SessionId}", request.GatewayReference);
+        Logger.LogInformation("Wave refund issued for session {SessionId}", request.GatewayReference);
 
         return new RefundResponse
         {
@@ -184,15 +183,13 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
 
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
-            _logger.LogWarning("Wave WebhookSecret not configured — signature verification cannot succeed.");
-            WaveObservability.RecordWebhookVerification(false);
-            return false;
+            Logger.LogWarning("Wave WebhookSecret not configured — signature verification cannot succeed.");
+            return RunWebhookVerify(() => false);
         }
 
-        bool verified;
-        try
+        return RunWebhookVerify(() =>
         {
-            // Wave-Signature header: "t=<timestamp>,v1=<signature>"
+            // Wave-Signature header: "t=<timestamp>,v1=<signature>" — signedPayload = timestamp + "." + body.
             string? timestamp = null;
             string? sentSig = null;
             foreach (var part in signature.Split(','))
@@ -206,34 +203,18 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
             }
 
             if (string.IsNullOrEmpty(timestamp) || string.IsNullOrEmpty(sentSig))
-            {
-                WaveObservability.RecordWebhookVerification(false);
                 return false;
-            }
 
             var signedPayload = $"{timestamp}.{payload}";
-            using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
-            var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(signedPayload));
-            var computedSignature = Convert.ToHexString(computedHash).ToLowerInvariant();
-
-            verified = CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(sentSig.ToLowerInvariant()),
-                Encoding.UTF8.GetBytes(computedSignature));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Wave webhook signature verification raised");
-            verified = false;
-        }
-        WaveObservability.RecordWebhookVerification(verified);
-        return verified;
+            return SignatureHelpers.VerifyHmacSha256(signedPayload, sentSig, _options.WebhookSecret);
+        });
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        return WaveObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+        return RunOperationAsync("parse_webhook", () => ParseWebhookCoreAsync(payload, ct), ct);
     }
 
     private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
@@ -243,7 +224,7 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
             var webhookEvent = JsonSerializer.Deserialize<WaveWebhookEvent>(payload);
             if (webhookEvent is null) return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed Wave webhook event: {EventType}", webhookEvent.Type);
+            Logger.LogInformation("Parsed Wave webhook event: {EventType}", webhookEvent.Type);
 
             var lowerType = webhookEvent.Type?.ToLowerInvariant();
             var status = lowerType switch
@@ -310,7 +291,7 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse Wave webhook event");
+            Logger.LogError(ex, "Failed to parse Wave webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -323,16 +304,8 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
             Content = new StringContent(json, Encoding.UTF8, "application/json")
         };
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Wave failed", ex);
-        }
-
+        // HttpRequestException is auto-translated to ProviderUnavailableException by BhenguProviderBase.
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -343,7 +316,7 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Wave {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Wave {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

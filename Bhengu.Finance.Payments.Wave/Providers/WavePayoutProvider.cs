@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Wave.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -40,24 +41,23 @@ namespace Bhengu.Finance.Payments.Wave.Providers;
 /// under-payment; callers should round upstream.
 /// </para>
 /// </remarks>
-public sealed class WavePayoutProvider : IPayoutProvider
+public sealed class WavePayoutProvider : BhenguProviderBase, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly WaveOptions _options;
-    private readonly ILogger<WavePayoutProvider> _logger;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Wave;
+    public override string ProviderName => ProviderNames.Wave;
 
     /// <summary>Construct a standalone Wave payout provider. Designed to be registered via DI.</summary>
     public WavePayoutProvider(
         HttpClient httpClient,
         IOptions<WaveOptions> options,
         ILogger<WavePayoutProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(WaveOptions.ApiKey)} is required");
@@ -109,7 +109,7 @@ public sealed class WavePayoutProvider : IPayoutProvider
         var responseBody = await SendAsync(HttpMethod.Post, "v1/payout", body, ct, "ProcessPayout").ConfigureAwait(false);
         var payoutResponse = JsonSerializer.Deserialize<WavePayoutResponse>(responseBody);
 
-        _logger.LogInformation(
+        Logger.LogInformation(
             "Wave payout created: Id={Id} Status={Status} IdempotencyKey={IdempotencyKey}",
             payoutResponse?.Id, payoutResponse?.Status, idempotencyKey);
 
@@ -151,7 +151,7 @@ public sealed class WavePayoutProvider : IPayoutProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Wave {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Wave {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

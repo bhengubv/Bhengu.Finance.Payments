@@ -3,7 +3,6 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -12,8 +11,9 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.TymeBank.Configuration;
-using Bhengu.Finance.Payments.TymeBank.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -25,17 +25,16 @@ namespace Bhengu.Finance.Payments.TymeBank.Providers;
 /// (when <c>request.Metadata["mode"]="qr"</c> a QR is generated instead). Refund and payout (PayShap or EFT)
 /// are supported via dedicated endpoints. Webhook authenticity uses HMAC-SHA256 in <c>X-Tyme-Signature</c>.
 /// </summary>
-public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class TymeBankPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly TymeBankOptions _options;
-    private readonly ILogger<TymeBankPaymentProvider> _logger;
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
 
     private string? _cachedToken;
     private DateTimeOffset _cachedTokenExpiresAt = DateTimeOffset.MinValue;
 
-    public string ProviderName => ProviderNames.TymeBank;
+    public override string ProviderName => ProviderNames.TymeBank;
 
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
@@ -51,10 +50,10 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         HttpClient httpClient,
         IOptions<TymeBankOptions> options,
         ILogger<TymeBankPaymentProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ClientId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(TymeBankOptions.ClientId)} is required");
@@ -75,7 +74,7 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return TymeBankObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+        return RunChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct), ct);
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
@@ -106,7 +105,7 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
             .ConfigureAwait(false);
         var paymentResponse = JsonSerializer.Deserialize<TymeBankPaymentResponse>(body);
 
-        _logger.LogInformation("TymeBank instant payment: id={Id} status={Status}",
+        Logger.LogInformation("TymeBank instant payment: id={Id} status={Status}",
             paymentResponse?.PaymentId, paymentResponse?.Status);
 
         return new PaymentResponse
@@ -141,7 +140,7 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
             .ConfigureAwait(false);
         var qrResponse = JsonSerializer.Deserialize<TymeBankQrResponse>(body);
 
-        _logger.LogInformation("TymeBank QR generated: qrId={QrId}", qrResponse?.QrId);
+        Logger.LogInformation("TymeBank QR generated: qrId={QrId}", qrResponse?.QrId);
 
         return new PaymentResponse
         {
@@ -158,7 +157,7 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return TymeBankObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+        return RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct), ct);
     }
 
     private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
@@ -173,7 +172,7 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         var body = await SendAsync(HttpMethod.Post, path, requestBody, ct, "ProcessRefund").ConfigureAwait(false);
         var refundResponse = JsonSerializer.Deserialize<TymeBankRefundResponse>(body);
 
-        _logger.LogInformation("TymeBank refund: refundId={RefundId} for payment {PaymentId}",
+        Logger.LogInformation("TymeBank refund: refundId={RefundId} for payment {PaymentId}",
             refundResponse?.RefundId, request.GatewayReference);
 
         return new RefundResponse
@@ -190,7 +189,7 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return TymeBankObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+        return RunPayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct), ct);
     }
 
     private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
@@ -218,7 +217,7 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         var body = await SendAsync(HttpMethod.Post, "v1/payouts", requestBody, ct, "ProcessPayout").ConfigureAwait(false);
         var payoutResponse = JsonSerializer.Deserialize<TymeBankPayoutResponse>(body);
 
-        _logger.LogInformation("TymeBank payout queued: payoutId={PayoutId} status={Status}",
+        Logger.LogInformation("TymeBank payout queued: payoutId={PayoutId} status={Status}",
             payoutResponse?.PayoutId, payoutResponse?.Status);
 
         return new PayoutResponse
@@ -239,37 +238,22 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
 
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
-            _logger.LogWarning("TymeBank WebhookSecret not configured — signature verification cannot succeed.");
-            TymeBankObservability.RecordWebhookVerification(false);
-            return false;
+            Logger.LogWarning("TymeBank WebhookSecret not configured — signature verification cannot succeed.");
+            return RunWebhookVerify(() => false);
         }
 
-        bool verified;
-        try
-        {
-            using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
-            var computed = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant();
-            var supplied = signature.StartsWith("sha256=", StringComparison.OrdinalIgnoreCase)
-                ? signature["sha256=".Length..]
-                : signature;
-            verified = CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(computed),
-                Encoding.UTF8.GetBytes(supplied.ToLowerInvariant()));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "TymeBank webhook signature verification raised");
-            verified = false;
-        }
-        TymeBankObservability.RecordWebhookVerification(verified);
-        return verified;
+        // TymeBank headers may be prefixed "sha256=<hex>"; strip the prefix before hand-off.
+        var supplied = signature.StartsWith("sha256=", StringComparison.OrdinalIgnoreCase)
+            ? signature["sha256=".Length..]
+            : signature;
+        return RunWebhookVerify(() => SignatureHelpers.VerifyHmacSha256(payload, supplied, _options.WebhookSecret));
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        return TymeBankObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+        return RunOperationAsync("parse_webhook", () => ParseWebhookCoreAsync(payload, ct), ct);
     }
 
     private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
@@ -279,7 +263,7 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
             var webhookEvent = JsonSerializer.Deserialize<TymeBankWebhookEvent>(payload);
             if (webhookEvent is null) return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed TymeBank webhook: type={Type} paymentId={PaymentId}",
+            Logger.LogInformation("Parsed TymeBank webhook: type={Type} paymentId={PaymentId}",
                 webhookEvent.EventType, webhookEvent.Data?.PaymentId);
 
             var typed = MapTypedEvent(webhookEvent);
@@ -287,7 +271,7 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse TymeBank webhook event");
+            Logger.LogError(ex, "Failed to parse TymeBank webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -500,16 +484,8 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         if (!string.IsNullOrEmpty(_cachedToken))
             req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _cachedToken);
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to TymeBank failed", ex);
-        }
-
+        // HttpRequestException is auto-translated to ProviderUnavailableException by BhenguProviderBase.
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -520,7 +496,7 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("TymeBank {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("TymeBank {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
