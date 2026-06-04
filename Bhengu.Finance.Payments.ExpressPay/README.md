@@ -1,8 +1,6 @@
 # Bhengu.Finance.Payments.ExpressPay
 
-ExpressPay (Ghana, Gambia, Sierra Leone, Liberia, Nigeria) provider for the [Bhengu.Finance.Payments](https://github.com/bhengubv/Bhengu.Finance.Payments) SDK family.
-
-Hosted-page card and mobile-money checkout via the ExpressPay form-encoded `submit.php` / `query.php` API.
+ExpressPay adapter for the Bhengu.Finance.Payments family — hosted-page card and mobile-money checkout across Ghana, Gambia, Sierra Leone, Liberia and Nigeria. Charge, refund (where supported), webhook verification, payouts, and settlement reconciliation behind the Bhengu canonical contracts.
 
 ## Install
 
@@ -10,9 +8,23 @@ Hosted-page card and mobile-money checkout via the ExpressPay form-encoded `subm
 dotnet add package Bhengu.Finance.Payments.ExpressPay
 ```
 
-## Configuration
+## What this package gives you
 
-```json
+| Contract | Provider class | Notes |
+|---|---|---|
+| `IPaymentGatewayProvider` | `ExpressPayPaymentProvider` | Charge (redirect) / webhook verify; refunds not exposed by upstream API |
+| `IPayoutProvider` | `ExpressPayPaymentProvider` | Disbursements |
+| `ISettlementProvider` | `ExpressPaySettlementProvider` | Reconciliation feed |
+
+## Wiring
+
+```csharp
+builder.Services.AddExpressPayPayments(builder.Configuration);
+```
+
+Bind options from `Bhengu:Finance:Payments:ExpressPay`:
+
+```jsonc
 {
   "Bhengu": {
     "Finance": {
@@ -20,10 +32,12 @@ dotnet add package Bhengu.Finance.Payments.ExpressPay
         "ExpressPay": {
           "MerchantId": "...",
           "ApiKey": "...",
-          "RedirectUrl": "https://yoursite.example/expresspay/return",
-          "PostUrl": "https://yoursite.example/webhooks/expresspay",
+          "RedirectUrl": "https://example.com/expresspay/return",
+          "PostUrl": "https://example.com/webhooks/expresspay",
           "Currency": "GHS",
-          "UseSandbox": true
+          "UseSandbox": true,
+          "BaseUrl": null,           // optional override
+          "SandboxUrl": null         // optional override
         }
       }
     }
@@ -31,71 +45,31 @@ dotnet add package Bhengu.Finance.Payments.ExpressPay
 }
 ```
 
-Required: `MerchantId` and `ApiKey`. `PostUrl` is the server-to-server result callback.
-
-## Wire it up
+## Usage
 
 ```csharp
-builder.Services.AddExpressPayPayments(builder.Configuration);
-```
-
-Validates `MerchantId` and `ApiKey` at registration.
-
-## `PaymentMethodToken` semantics
-
-The merchant **order-id** sent verbatim on `submit.php` — your reference.
-
-## Metadata keys
-
-| Key | Required | Format | Example |
-| --- | --- | --- | --- |
-| `accountnumber` | Optional | Account number | `0241234567` |
-| `username` | Optional | Username | `thandi` |
-| `email` | Optional | E-mail | `buyer@example.com` |
-| `firstname` | Optional | Given name | `Thandi` |
-| `lastname` | Optional | Family name | `Bhengu` |
-
-## Settlement
-
-**Asynchronous.** `ProcessPaymentAsync` POSTs `submit.php` form-encoded and returns `Pending` plus the hosted-page `payment_url` as `RedirectUrl` (when `status == 1`). Final outcome arrives via callback to `PostUrl`.
-
-## Refunds
-
-`ProcessRefundAsync` throws `BhenguPaymentException` with `ProviderErrorCode = "not_supported"` — **ExpressPay has no refund API.** Issue refunds via the ExpressPay merchant portal.
-
-## Payouts
-
-**Not supported.** The provider does NOT implement `IPayoutProvider`.
-
-## Webhook
-
-**ExpressPay does NOT HMAC the post-url callback.** `VerifyWebhookSignature` does a constant-time comparison between the supplied signature and the configured `ApiKey` — callers must source the signature from a trusted reverse-proxy header. **Production callers SHOULD additionally call `QueryStatusAsync(token)`** to confirm authenticity:
-
-```csharp
-app.MapPost("/webhooks/expresspay", async (HttpContext ctx,
-    ExpressPayPaymentProvider provider) =>
+[ApiController]
+public class CheckoutController(
+    [FromKeyedServices(ProviderNames.ExpressPay)] IPaymentGatewayProvider gateway) : ControllerBase
 {
-    using var reader = new StreamReader(ctx.Request.Body);
-    var body = await reader.ReadToEndAsync();
-
-    // Parse either JSON or form-encoded body.
-    var evt = await provider.ParseWebhookAsync(body);
-    if (evt is null) return Results.Ok();
-
-    // Confirm authenticity by querying status server-to-server.
-    var status = await provider.QueryStatusAsync(evt.GatewayReference);
-    return Results.Ok();
-});
+    [HttpPost("charge")]
+    public async Task<PaymentResponse> Charge([FromBody] PaymentRequest request)
+        => await gateway.ProcessPaymentAsync(request);
+}
 ```
 
-Inject the concrete `ExpressPayPaymentProvider` (not just `IPaymentGatewayProvider`) to use `QueryStatusAsync`.
+## Capabilities at runtime
 
-Status values mapped: `1` → Completed, `2` → Pending, `3` → Failed, `4` → Cancelled.
+```csharp
+if (gateway.Capabilities.HasFlag(ProviderCapabilities.Webhook))
+    var evt = await gateway.ParseWebhookAsync(body);
+```
 
-## Capabilities
+## Status
 
-`Charge | Webhook | RedirectFlow | Cards | MobileMoney`.
+- Apache-2.0
+- Multi-target: net8.0 + net10.0
+- Source: https://github.com/bhengubv/Bhengu.Finance.Payments
 
-## License
-
-Apache 2.0. © 2026 The Other Bhengu (Pty) Ltd t/a The Geek.
+For full SDK docs, observability wiring, resilience configuration and the family map see
+the [main README](https://github.com/bhengubv/Bhengu.Finance.Payments).

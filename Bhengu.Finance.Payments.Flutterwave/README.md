@@ -1,8 +1,6 @@
 # Bhengu.Finance.Payments.Flutterwave
 
-Flutterwave provider for the [Bhengu.Finance.Payments](https://github.com/bhengubv/Bhengu.Finance.Payments) SDK family.
-
-Pan-African aggregator (34+ countries) covering cards, bank transfers, mobile money (M-Pesa, MoMo, Airtel), and USSD. Wraps the Flutterwave v3 REST API.
+Flutterwave adapter for the Bhengu.Finance.Payments family. Pan-African aggregator covering 34+ countries — cards, bank transfers, mobile money (M-Pesa, MoMo, Airtel), USSD, plus marketplace splits, disputes, subscriptions, settlement reconciliation, and tokenisation behind the Bhengu canonical contracts. Wraps the Flutterwave v3 REST API.
 
 ## Install
 
@@ -10,9 +8,27 @@ Pan-African aggregator (34+ countries) covering cards, bank transfers, mobile mo
 dotnet add package Bhengu.Finance.Payments.Flutterwave
 ```
 
-## Configuration
+## What this package gives you
 
-```json
+| Contract | Provider class | Notes |
+|---|---|---|
+| `IPaymentGatewayProvider` | `FlutterwavePaymentProvider` | Charge / refund / webhook verify |
+| `IPayoutProvider` | `FlutterwavePaymentProvider` | Transfers via `v3/transfers` |
+| `ITokenisationProvider` | `FlutterwaveTokenisationProvider` | Read vaulted payment methods |
+| `ISubscriptionProvider` | `FlutterwaveSubscriptionProvider` | Plans + subscriptions |
+| `IDisputeProvider` | `FlutterwaveDisputeProvider` | Chargeback lifecycle |
+| `IMarketplaceProvider` | `FlutterwaveMarketplaceProvider` | Split payments + sub-accounts |
+| `ISettlementProvider` | `FlutterwaveSettlementProvider` | Reconciliation feed |
+
+## Wiring
+
+```csharp
+builder.Services.AddFlutterwavePayments(builder.Configuration);
+```
+
+Bind options from `Bhengu:Finance:Payments:Flutterwave`:
+
+```jsonc
 {
   "Bhengu": {
     "Finance": {
@@ -22,7 +38,8 @@ dotnet add package Bhengu.Finance.Payments.Flutterwave
           "PublicKey": "FLWPUBK_TEST-...",
           "EncryptionKey": "...",
           "WebhookSecret": "...",
-          "RedirectUrl": "https://yoursite.example/flw/return"
+          "RedirectUrl": "https://example.com/flw/return",   // optional
+          "BaseUrl": null                                     // optional override
         }
       }
     }
@@ -30,74 +47,34 @@ dotnet add package Bhengu.Finance.Payments.Flutterwave
 }
 ```
 
-Required: `SecretKey` (Bearer token on every request). `PublicKey` and `EncryptionKey` are for client-side card-tokenisation flows; `WebhookSecret` is the verbatim string Flutterwave echoes in the `verif-hash` header.
-
-## Wire it up
+## Usage
 
 ```csharp
-builder.Services.AddFlutterwavePayments(builder.Configuration);
-```
-
-Validates `SecretKey` at registration.
-
-## `PaymentMethodToken` semantics
-
-The merchant **transaction reference** (`tx_ref`) — Flutterwave's primary correlator. Use your order id or a generated UUID.
-
-## Metadata keys
-
-| Key | Required | Format | Example |
-| --- | --- | --- | --- |
-| `email` | Required | E-mail | `buyer@example.com` |
-| `name` | Optional | Display name (defaults to `email`) | `Thandi Bhengu` |
-| `phonenumber` | Optional | E.164 | `+27821234567` |
-
-Missing `email` throws `PaymentDeclinedException` with `ProviderErrorCode = "missing_email"`.
-
-## `PayoutRequest.DestinationToken` format
-
-`"<bankCode>:<accountNumber>"` (e.g. `"044:0690000040"` for Access Bank Nigeria).
-
-Invalid format throws `PaymentDeclinedException` with `ProviderErrorCode = "invalid_destination"`.
-
-## Settlement
-
-**Asynchronous.** `ProcessPaymentAsync` initialises a hosted-payment session and returns `Pending` plus the checkout `RedirectUrl` (`data.link`). Real outcome arrives via webhook.
-
-## Refunds
-
-Yes — `ProcessRefundAsync` calls `POST v3/transactions/{transaction_id}/refund` with `amount`. The `GatewayReference` must be the **numeric Flutterwave transaction id** (not the `tx_ref`).
-
-## Payouts
-
-**Yes.** `IPayoutProvider.ProcessPayoutAsync` calls `POST v3/transfers`.
-
-## Webhook
-
-**Flutterwave does NOT HMAC** — it echoes the configured `WebhookSecret` verbatim in the `verif-hash` header. The provider does a constant-time compare.
-
-```csharp
-app.MapPost("/webhooks/flutterwave", async (HttpContext ctx,
-    [FromKeyedServices(ProviderNames.Flutterwave)] IPaymentGatewayProvider provider) =>
+[ApiController]
+public class CheckoutController(
+    [FromKeyedServices(ProviderNames.Flutterwave)] IPaymentGatewayProvider gateway) : ControllerBase
 {
-    using var reader = new StreamReader(ctx.Request.Body);
-    var body = await reader.ReadToEndAsync();
-    var signature = ctx.Request.Headers["verif-hash"].ToString();
-
-    if (!provider.VerifyWebhookSignature(body, signature))
-        return Results.Unauthorized();
-
-    var evt = await provider.ParseWebhookAsync(body);
-    return Results.Ok();
-});
+    [HttpPost("charge")]
+    public async Task<PaymentResponse> Charge([FromBody] PaymentRequest request)
+        => await gateway.ProcessPaymentAsync(request);
+}
 ```
 
-Recognised event types: `charge.completed`, `charge.complete`, `transfer.completed`, `charge.failed`, `transfer.failed`, `refund.completed`, `refund.created`.
+## Capabilities at runtime
 
-## Capabilities
+```csharp
+if (gateway.Capabilities.HasFlag(ProviderCapabilities.Refund))
+    await gateway.ProcessRefundAsync(refundRequest);
 
-`Charge | Refund | Payout | Webhook | RedirectFlow | Cards | MobileMoney | BankTransfer | CrossBorder`.
+if (gateway is IMarketplaceProvider marketplace)
+    var split = await marketplace.CreateSplitAsync(splitRequest);
+```
 
-## License
+## Status
 
-Apache 2.0. © 2026 The Other Bhengu (Pty) Ltd t/a The Geek.
+- Apache-2.0
+- Multi-target: net8.0 + net10.0
+- Source: https://github.com/bhengubv/Bhengu.Finance.Payments
+
+For full SDK docs, observability wiring, resilience configuration and the family map see
+the [main README](https://github.com/bhengubv/Bhengu.Finance.Payments).

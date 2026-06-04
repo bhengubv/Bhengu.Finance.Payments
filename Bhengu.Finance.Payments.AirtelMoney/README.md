@@ -1,8 +1,6 @@
 # Bhengu.Finance.Payments.AirtelMoney
 
-Airtel Money provider for the [Bhengu.Finance.Payments](https://github.com/bhengubv/Bhengu.Finance.Payments) SDK family.
-
-Countries: Kenya · Uganda · Tanzania · Zambia · Malawi · Madagascar · DRC · Nigeria · Niger · Chad · Rwanda · Republic of Congo · Gabon · Seychelles. Collect (charge), Disbursement (payout), and Refund via the Airtel Africa Open API.
+Airtel Money mobile-money adapter for the Bhengu.Finance.Payments family. Covers Airtel's pan-African footprint (Kenya, Uganda, Tanzania, Zambia, Malawi, DRC, Niger, Gabon, Madagascar and more) with charge, refund, webhook verification, and B2C disbursement payouts behind the Bhengu canonical contracts.
 
 ## Install
 
@@ -10,9 +8,23 @@ Countries: Kenya · Uganda · Tanzania · Zambia · Malawi · Madagascar · DRC 
 dotnet add package Bhengu.Finance.Payments.AirtelMoney
 ```
 
-## Configuration
+## What this package gives you
 
-```json
+| Contract | Provider class | Notes |
+|---|---|---|
+| `IPaymentGatewayProvider` | `AirtelMoneyPaymentProvider` | Charge / refund / webhook verify |
+| `IPayoutProvider` | `AirtelMoneyPaymentProvider` | Wallet-to-wallet disbursement |
+| `IPayoutProvider` | `AirtelMoneyPayoutProvider` | Standalone payout adapter (B2C transfers) |
+
+## Wiring
+
+```csharp
+builder.Services.AddAirtelMoneyPayments(builder.Configuration);
+```
+
+Bind options from `Bhengu:Finance:Payments:AirtelMoney`:
+
+```jsonc
 {
   "Bhengu": {
     "Finance": {
@@ -22,9 +34,11 @@ dotnet add package Bhengu.Finance.Payments.AirtelMoney
           "ClientSecret": "...",
           "Country": "KE",
           "Currency": "KES",
-          "CallbackUrl": "https://yoursite.example/airtel/callback",
+          "CallbackUrl": "https://example.com/webhooks/airtelmoney",
           "WebhookSecret": "...",
-          "UseSandbox": true
+          "EncryptedDisbursementPin": "...",   // optional, required for payouts
+          "UseSandbox": true,
+          "BaseUrl": null                       // optional override
         }
       }
     }
@@ -32,69 +46,34 @@ dotnet add package Bhengu.Finance.Payments.AirtelMoney
 }
 ```
 
-Required: `ClientId`, `ClientSecret` (OAuth2 against `auth/oauth2/token`), `Country` (ISO-3166 alpha-2, sent as `X-Country`), and `Currency` (ISO-4217, sent as `X-Currency`).
-
-## Wire it up
+## Usage
 
 ```csharp
-builder.Services.AddAirtelMoneyPayments(builder.Configuration);
-```
-
-Validates all four required options at registration. Access tokens cached until 60s before expiry.
-
-## `PaymentMethodToken` semantics
-
-**The payer's MSISDN** (international format, e.g. `254712345678` for Kenya). Missing MSISDN throws `PaymentDeclinedException` with `ProviderErrorCode = "missing_msisdn"`.
-
-## Metadata keys
-
-| Key | Required | Format | Example |
-| --- | --- | --- | --- |
-| `transaction_id` | Optional | 16-char merchant txn id (defaults to GUID-derived) | `order-12345678` |
-| `reference` | Optional | Free-text reference (defaults to `Description`) | `order-123` |
-
-## `PayoutRequest.DestinationToken` format
-
-Just the recipient's MSISDN (e.g. `254712345678`).
-
-## Settlement
-
-**Asynchronous.** Collect / Disbursement / Refund all return immediately with a status code (`TIP`/`TS`/`TF`/`TA`). The final outcome arrives via webhook callback.
-
-## Refunds
-
-Yes — `ProcessRefundAsync` calls `POST standard/v1/payments/refund` with the `airtel_money_id` from the original collection.
-
-## Payouts
-
-**Yes.** `IPayoutProvider.ProcessPayoutAsync` calls `POST standard/v1/disbursements/`.
-
-## Webhook
-
-HMAC-SHA256 of the body, base64-encoded, in the `X-Auth-Signature` header (`WebhookSecret`-keyed).
-
-```csharp
-app.MapPost("/airtel/callback", async (HttpContext ctx,
-    [FromKeyedServices(ProviderNames.AirtelMoney)] IPaymentGatewayProvider provider) =>
+[ApiController]
+public class CheckoutController(
+    [FromKeyedServices(ProviderNames.AirtelMoney)] IPaymentGatewayProvider gateway) : ControllerBase
 {
-    using var reader = new StreamReader(ctx.Request.Body);
-    var body = await reader.ReadToEndAsync();
-    var signature = ctx.Request.Headers["X-Auth-Signature"].ToString();
-
-    if (!provider.VerifyWebhookSignature(body, signature))
-        return Results.Unauthorized();
-
-    var evt = await provider.ParseWebhookAsync(body);
-    return Results.Ok();
-});
+    [HttpPost("charge")]
+    public async Task<PaymentResponse> Charge([FromBody] PaymentRequest request)
+        => await gateway.ProcessPaymentAsync(request);
+}
 ```
 
-Status codes mapped: `TS` (success) → Completed, `TIP` (in progress) → Pending, `TF` (failed) → Failed, `TA` (cancelled/aborted) → Cancelled.
+`PaymentRequest.PaymentMethodToken` is the payer's MSISDN in international format
+(e.g. `254712345678` for Kenya).
 
-## Capabilities
+## Capabilities at runtime
 
-`Charge | Refund | Payout | Webhook | MobileMoney`.
+```csharp
+if (gateway.Capabilities.HasFlag(ProviderCapabilities.Refund))
+    await gateway.ProcessRefundAsync(refundRequest);
+```
 
-## License
+## Status
 
-Apache 2.0. © 2026 The Other Bhengu (Pty) Ltd t/a The Geek.
+- Apache-2.0
+- Multi-target: net8.0 + net10.0
+- Source: https://github.com/bhengubv/Bhengu.Finance.Payments
+
+For full SDK docs, observability wiring, resilience configuration and the family map see
+the [main README](https://github.com/bhengubv/Bhengu.Finance.Payments).

@@ -1,8 +1,6 @@
 # Bhengu.Finance.Payments.Cellulant
 
-Cellulant (Tingg / Mula) provider for the [Bhengu.Finance.Payments](https://github.com/bhengubv/Bhengu.Finance.Payments) SDK family.
-
-Pan-African aggregator (Tingg Checkout for collections, Mula for disbursements) covering 35+ countries. Single integration for cards, mobile money, and bank transfers.
+Cellulant (Tingg / Mula) adapter for the Bhengu.Finance.Payments family. Pan-African aggregator covering 35+ countries — single integration for cards, mobile money, and bank transfers, plus marketplace splits and settlement reconciliation, behind the Bhengu canonical contracts.
 
 ## Install
 
@@ -10,9 +8,24 @@ Pan-African aggregator (Tingg Checkout for collections, Mula for disbursements) 
 dotnet add package Bhengu.Finance.Payments.Cellulant
 ```
 
-## Configuration
+## What this package gives you
 
-```json
+| Contract | Provider class | Notes |
+|---|---|---|
+| `IPaymentGatewayProvider` | `CellulantPaymentProvider` | Charge / refund / webhook verify via Tingg Checkout |
+| `IPayoutProvider` | `CellulantPaymentProvider` | Disbursements via Mula |
+| `IMarketplaceProvider` | `CellulantMarketplaceProvider` | Split payments + sub-accounts |
+| `ISettlementProvider` | `CellulantSettlementProvider` | Reconciliation feed |
+
+## Wiring
+
+```csharp
+builder.Services.AddCellulantPayments(builder.Configuration);
+```
+
+Bind options from `Bhengu:Finance:Payments:Cellulant`:
+
+```jsonc
 {
   "Bhengu": {
     "Finance": {
@@ -21,11 +34,12 @@ dotnet add package Bhengu.Finance.Payments.Cellulant
           "ServiceCode": "BIL-...",
           "ClientId": "...",
           "ClientSecret": "...",
-          "MerchantTransactionId": "tgn",
-          "CallbackUrl": "https://yoursite.example/webhooks/tingg",
+          "MerchantTransactionId": "tgn",                     // optional prefix
+          "CallbackUrl": "https://example.com/webhooks/tingg",
           "WebhookSecret": "...",
           "CountryCode": "KE",
-          "UseSandbox": true
+          "UseSandbox": true,
+          "BaseUrl": null                                       // optional override
         }
       }
     }
@@ -33,69 +47,31 @@ dotnet add package Bhengu.Finance.Payments.Cellulant
 }
 ```
 
-Required: `ServiceCode` (Tingg merchant service identifier), `ClientId` and `ClientSecret` (OAuth2 client_credentials against `v1/oauth/token/request`).
-
-## Wire it up
+## Usage
 
 ```csharp
-builder.Services.AddCellulantPayments(builder.Configuration);
-```
-
-Validates the three required options at registration. Access tokens cached until 60s before expiry.
-
-## `PaymentMethodToken` semantics
-
-**The payer's MSISDN** (international format). The provider uses it for both `msisdn` and `accountNumber` / `payerClientCode` in the Tingg Express body.
-
-## Metadata keys
-
-| Key | Required | Format | Example |
-| --- | --- | --- | --- |
-| `email` | Optional | E-mail (defaults to `noreply@example.com`) | `buyer@example.com` |
-| `name` | Optional | Display name (defaults to `Customer`) | `Thandi Bhengu` |
-
-## `PayoutRequest.DestinationToken` format
-
-Just the recipient's MSISDN (e.g. `254712345678`) — used directly as `destinationMSISDN`.
-
-## Settlement
-
-**Asynchronous.** `ProcessPaymentAsync` returns `Pending` plus a Tingg hosted-checkout `RedirectUrl`. The payer completes payment via mobile-money STK, card, or bank — final outcome arrives via webhook.
-
-## Refunds
-
-Yes — `ProcessRefundAsync` calls `POST refunds` with `transactionId`, `amount`, and `reason`.
-
-## Payouts
-
-**Yes.** `IPayoutProvider.ProcessPayoutAsync` calls `POST disbursement/v1/initiate` (Mula).
-
-## Webhook
-
-HMAC-SHA256 of the body, hex-encoded lowercase, in the `x-tingg-signature` header.
-
-```csharp
-app.MapPost("/webhooks/tingg", async (HttpContext ctx,
-    [FromKeyedServices(ProviderNames.Cellulant)] IPaymentGatewayProvider provider) =>
+[ApiController]
+public class CheckoutController(
+    [FromKeyedServices(ProviderNames.Cellulant)] IPaymentGatewayProvider gateway) : ControllerBase
 {
-    using var reader = new StreamReader(ctx.Request.Body);
-    var body = await reader.ReadToEndAsync();
-    var signature = ctx.Request.Headers["x-tingg-signature"].ToString();
-
-    if (!provider.VerifyWebhookSignature(body, signature))
-        return Results.Unauthorized();
-
-    var evt = await provider.ParseWebhookAsync(body);
-    return Results.Ok();
-});
+    [HttpPost("charge")]
+    public async Task<PaymentResponse> Charge([FromBody] PaymentRequest request)
+        => await gateway.ProcessPaymentAsync(request);
+}
 ```
 
-Recognised event types: `payment.success`, `checkout.success`, `payment.failed`, `checkout.failed`, `refund.success`, `refund.processed`, `disbursement.success`, `disbursement.failed`.
+## Capabilities at runtime
 
-## Capabilities
+```csharp
+if (gateway.Capabilities.HasFlag(ProviderCapabilities.Refund))
+    await gateway.ProcessRefundAsync(refundRequest);
+```
 
-`Charge | Refund | Payout | Webhook | RedirectFlow | MobileMoney | CrossBorder`.
+## Status
 
-## License
+- Apache-2.0
+- Multi-target: net8.0 + net10.0
+- Source: https://github.com/bhengubv/Bhengu.Finance.Payments
 
-Apache 2.0. © 2026 The Other Bhengu (Pty) Ltd t/a The Geek.
+For full SDK docs, observability wiring, resilience configuration and the family map see
+the [main README](https://github.com/bhengubv/Bhengu.Finance.Payments).

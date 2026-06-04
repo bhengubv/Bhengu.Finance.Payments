@@ -1,6 +1,6 @@
 # Bhengu.Finance.Payments.Stripe
 
-Stripe provider for the [Bhengu.Finance.Payments](https://github.com/bhengubv/Bhengu.Finance.Payments) SDK family. Wraps the official `Stripe.net` SDK with the unified `IPaymentGatewayProvider` contract.
+Stripe payment-gateway adapter for the Bhengu.Finance.Payments family. Global card payments, payouts via Stripe Connect, subscriptions (with pause/resume), 3-D Secure step-up, dispute lifecycle, settlement reconciliation, SEPA/BACS mandates, and Connect-based marketplace splits — all behind the Bhengu canonical contracts.
 
 ## Install
 
@@ -8,16 +8,38 @@ Stripe provider for the [Bhengu.Finance.Payments](https://github.com/bhengubv/Bh
 dotnet add package Bhengu.Finance.Payments.Stripe
 ```
 
-## Configuration
+## What this package gives you
 
-```json
+| Contract | Provider class | Notes |
+|---|---|---|
+| `IPaymentGatewayProvider` | `StripePaymentProvider` | Charge / refund / webhook verify via PaymentIntents |
+| `IPayoutProvider` | `StripePaymentProvider` | Payouts via `PayoutService` (Connect / platform balance) |
+| `ITokenisationProvider` | `StripeTokenisationProvider` | Read vaulted PaymentMethods (`pm_xxx`) |
+| `ISubscriptionProvider` | `StripeSubscriptionProvider` | Plans (Prices) + subscriptions |
+| `ISubscriptionPauseSupport` | `StripeSubscriptionProvider` | Pause / resume via `pause_collection` |
+| `IThreeDSecureProvider` | `StripeThreeDSecureProvider` | SCA step-up flow |
+| `IDisputeProvider` | `StripeDisputeProvider` | Chargeback lifecycle |
+| `ISettlementProvider` | `StripeSettlementProvider` | Reconciliation feed via balance transactions |
+| `IMandateProvider` | `StripeMandateProvider` | Debit-order / pull-payment (SEPA, BACS, ACH) |
+| `IMarketplaceProvider` | `StripeMarketplaceProvider` | Stripe Connect: split payments + sub-accounts |
+
+## Wiring
+
+```csharp
+builder.Services.AddStripePayments(builder.Configuration);
+```
+
+Bind options from `Bhengu:Finance:Payments:Stripe`:
+
+```jsonc
 {
   "Bhengu": {
     "Finance": {
       "Payments": {
         "Stripe": {
           "SecretKey": "sk_test_...",
-          "WebhookSecret": "whsec_..."
+          "WebhookSecret": "whsec_...",
+          "ConnectClientId": "ca_..."   // optional, required for Standard Connect OAuth links
         }
       }
     }
@@ -25,68 +47,34 @@ dotnet add package Bhengu.Finance.Payments.Stripe
 }
 ```
 
-## Wire it up
+## Usage
 
 ```csharp
-builder.Services.AddStripePayments(builder.Configuration);
-```
-
-The provider routes Stripe.net through the injected `HttpClient` (via `StripeClient` + `SystemNetHttpClient`) — so consumer-side `HttpMessageHandler` policies (retries, observability, custom DNS) apply.
-
-## `PaymentMethodToken` semantics
-
-A **Stripe PaymentMethod ID** (`pm_xxx`) from a prior client-side tokenisation (Stripe.js / mobile SDK). Pass it directly:
-
-```csharp
-var response = await provider.ProcessPaymentAsync(new PaymentRequest
+[ApiController]
+public class CheckoutController(
+    [FromKeyedServices(ProviderNames.Stripe)] IPaymentGatewayProvider gateway) : ControllerBase
 {
-    PaymentMethodToken = "pm_card_visa",
-    Amount = 99.99m,
-    Currency = "USD",
-    Description = "Order #123"
-});
+    [HttpPost("charge")]
+    public async Task<PaymentResponse> Charge([FromBody] PaymentRequest request)
+        => await gateway.ProcessPaymentAsync(request);
+}
 ```
 
-The provider creates a PaymentIntent with `confirm: true` and `confirmation_method: automatic`, so it settles in one call for non-3DS payments. 3DS challenges fall back to Stripe's standard `requires_action` flow (handled at the client).
-
-## Metadata
-
-All keys in `PaymentRequest.Metadata` are forwarded to Stripe's `metadata` field on the PaymentIntent — visible in the Stripe dashboard and queryable.
-
-## Settlement
-
-**Synchronous** for most cards. `ProcessPaymentAsync` returns `Completed` or `Pending` (3DS / async banks like SEPA) directly. The webhook is still your source of truth for async methods.
-
-## Refunds
-
-Yes — `ProcessRefundAsync` calls `RefundService.Create` with reason mapping (`duplicate` / `fraudulent` / `requested_by_customer`).
-
-## Payouts
-
-Yes — `IPayoutProvider` calls `PayoutService.Create` for Stripe Connect / platform-balance disbursements.
-
-## Webhook
+## Capabilities at runtime
 
 ```csharp
-app.MapPost("/webhooks/stripe", async (HttpContext ctx,
-    [FromKeyedServices(ProviderNames.Stripe)] IPaymentGatewayProvider provider) =>
-{
-    using var reader = new StreamReader(ctx.Request.Body);
-    var body = await reader.ReadToEndAsync();
-    var signature = ctx.Request.Headers["Stripe-Signature"].ToString();
+if (gateway.Capabilities.HasFlag(ProviderCapabilities.Refund))
+    await gateway.ProcessRefundAsync(refundRequest);
 
-    if (!provider.VerifyWebhookSignature(body, signature))
-        return Results.Unauthorized();
-
-    var evt = await provider.ParseWebhookAsync(body);
-    // evt.EventType is the Stripe event type (e.g. payment_intent.succeeded).
-    // evt.GatewayReference is the PaymentIntent ID.
-    return Results.Ok();
-});
+if (gateway is IThreeDSecureProvider tds)
+    var challenge = await tds.StartAuthenticationAsync(intent);
 ```
 
-The provider recognises these event types: `payment_intent.succeeded`, `payment_intent.payment_failed`, `payment_intent.canceled`, `charge.refunded`. Other event types return `null` from `ParseWebhookAsync`.
+## Status
 
-## License
+- Apache-2.0
+- Multi-target: net8.0 + net10.0
+- Source: https://github.com/bhengubv/Bhengu.Finance.Payments
 
-Apache 2.0. © 2026 The Other Bhengu (Pty) Ltd t/a The Geek.
+For full SDK docs, observability wiring, resilience configuration and the family map see
+the [main README](https://github.com/bhengubv/Bhengu.Finance.Payments).
