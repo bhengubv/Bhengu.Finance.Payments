@@ -2,7 +2,6 @@
 
 using System.Net;
 using System.Net.Http.Headers;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -11,8 +10,9 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.MercadoPago.Configuration;
-using Bhengu.Finance.Payments.MercadoPago.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -23,13 +23,12 @@ namespace Bhengu.Finance.Payments.MercadoPago.Providers;
 /// (<c>https://api.mercadopago.com</c>) for card, PIX, boleto and wallet payments, refunds and money-out payouts.
 /// PIX charges return the QR code + copy-paste string under <c>point_of_interaction.transaction_data</c>.
 /// </summary>
-public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class MercadoPagoPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly MercadoPagoOptions _options;
-    private readonly ILogger<MercadoPagoPaymentProvider> _logger;
 
-    public string ProviderName => ProviderNames.MercadoPago;
+    public override string ProviderName => ProviderNames.MercadoPago;
 
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
@@ -50,10 +49,10 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
         HttpClient httpClient,
         IOptions<MercadoPagoOptions> options,
         ILogger<MercadoPagoPaymentProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.AccessToken))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(MercadoPagoOptions.AccessToken)} is required");
@@ -68,7 +67,7 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return MercadoPagoObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+        return RunChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct), ct);
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
@@ -111,7 +110,7 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
         var (body, _) = await SendAsync(HttpMethod.Post, "/v1/payments", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
         var mpResponse = JsonSerializer.Deserialize<MercadoPagoPaymentResponse>(body);
 
-        _logger.LogInformation("Mercado Pago payment created: {PaymentId} status={Status} method={Method}",
+        Logger.LogInformation("Mercado Pago payment created: {PaymentId} status={Status} method={Method}",
             mpResponse?.Id, mpResponse?.Status, paymentMethodId);
 
         return new PaymentResponse
@@ -129,7 +128,7 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return MercadoPagoObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+        return RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct), ct);
     }
 
     private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
@@ -146,7 +145,7 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
 
         var refundResponse = JsonSerializer.Deserialize<MercadoPagoRefundResponse>(body);
 
-        _logger.LogInformation("Mercado Pago refund created: {RefundId} for payment {PaymentId}",
+        Logger.LogInformation("Mercado Pago refund created: {RefundId} for payment {PaymentId}",
             refundResponse?.Id, request.GatewayReference);
 
         return new RefundResponse
@@ -163,7 +162,7 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return MercadoPagoObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+        return RunPayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct), ct);
     }
 
     private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
@@ -185,7 +184,7 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
         var (body, _) = await SendAsync(HttpMethod.Post, "/v1/money_requests", requestBody, ct, "ProcessPayout").ConfigureAwait(false);
         var payoutResponse = JsonSerializer.Deserialize<MercadoPagoPayoutResponse>(body);
 
-        _logger.LogInformation("Mercado Pago payout created: {PayoutId} status={Status}",
+        Logger.LogInformation("Mercado Pago payout created: {PayoutId} status={Status}",
             payoutResponse?.Id, payoutResponse?.Status);
 
         return new PayoutResponse
@@ -213,47 +212,28 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
 
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
-            _logger.LogWarning("Mercado Pago WebhookSecret not configured — signature verification cannot succeed.");
-            MercadoPagoObservability.RecordWebhookVerification(false);
-            return false;
+            Logger.LogWarning("Mercado Pago WebhookSecret not configured — signature verification cannot succeed.");
+            return RunWebhookVerify(() => false);
         }
 
-        bool verified;
-        try
+        return RunWebhookVerify(() =>
         {
             var v1Part = signature.Split(',')
                 .Select(p => p.Trim())
                 .FirstOrDefault(p => p.StartsWith("v1=", StringComparison.OrdinalIgnoreCase));
 
-            if (v1Part is null)
-            {
-                MercadoPagoObservability.RecordWebhookVerification(false);
-                return false;
-            }
+            if (v1Part is null) return false;
             var providedHash = v1Part["v1=".Length..];
 
-            using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
-            var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
-            var computedSignature = Convert.ToHexString(computedHash).ToLowerInvariant();
-
-            verified = CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(providedHash.ToLowerInvariant()),
-                Encoding.UTF8.GetBytes(computedSignature));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Mercado Pago webhook signature verification raised");
-            verified = false;
-        }
-        MercadoPagoObservability.RecordWebhookVerification(verified);
-        return verified;
+            return SignatureHelpers.VerifyHmacSha256(payload, providedHash, _options.WebhookSecret);
+        });
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        return MercadoPagoObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+        return RunOperationAsync("parse_webhook", () => ParseWebhookCoreAsync(payload, ct), ct);
     }
 
     private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
@@ -263,7 +243,7 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
             var webhookEvent = JsonSerializer.Deserialize<MercadoPagoWebhookEvent>(payload);
             if (webhookEvent is null) return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed Mercado Pago webhook event: {Type} action={Action}",
+            Logger.LogInformation("Parsed Mercado Pago webhook event: {Type} action={Action}",
                 webhookEvent.Type, webhookEvent.Action);
 
             var typed = MapTypedEvent(webhookEvent);
@@ -271,7 +251,7 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse Mercado Pago webhook event");
+            Logger.LogError(ex, "Failed to parse Mercado Pago webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -452,16 +432,8 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
         if (method == HttpMethod.Post)
             req.Headers.Add("X-Idempotency-Key", Guid.NewGuid().ToString("N"));
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Mercado Pago failed", ex);
-        }
-
+        // HttpRequestException is auto-translated to ProviderUnavailableException by BhenguProviderBase.
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -472,7 +444,7 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Mercado Pago {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Mercado Pago {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

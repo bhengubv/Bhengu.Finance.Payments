@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Vault;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.MercadoPago.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -30,7 +31,7 @@ namespace Bhengu.Finance.Payments.MercadoPago.Providers;
 /// to that customer via <c>/v1/customers/{id}/cards</c>, which yields a long-lived card id.
 /// </para>
 /// </remarks>
-public sealed class MercadoPagoTokenisationProvider : ITokenisationProvider
+public sealed class MercadoPagoTokenisationProvider : BhenguProviderBase, ITokenisationProvider
 {
     internal static readonly JsonSerializerOptions WriteOptions = new()
     {
@@ -39,20 +40,19 @@ public sealed class MercadoPagoTokenisationProvider : ITokenisationProvider
 
     private readonly HttpClient _httpClient;
     private readonly MercadoPagoOptions _options;
-    private readonly ILogger<MercadoPagoTokenisationProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.MercadoPago;
+    public override string ProviderName => ProviderNames.MercadoPago;
 
     /// <summary>Create a new Mercado Pago tokenisation provider bound to the supplied HTTP client and options.</summary>
     public MercadoPagoTokenisationProvider(
         HttpClient httpClient,
         IOptions<MercadoPagoOptions> options,
         ILogger<MercadoPagoTokenisationProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.AccessToken))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(MercadoPagoOptions.AccessToken)} is required");
@@ -73,7 +73,7 @@ public sealed class MercadoPagoTokenisationProvider : ITokenisationProvider
         // entry point, but the search endpoint accepts a card id directly.
         try
         {
-            var raw = await MercadoPagoHttp.SendAsync(_httpClient, _logger, ProviderName, HttpMethod.Get, $"/v1/customers/cards/{Uri.EscapeDataString(token)}", body: null, ct, "GetCard", idempotencyKey: null).ConfigureAwait(false);
+            var raw = await MercadoPagoHttp.SendAsync(_httpClient, Logger, ProviderName, HttpMethod.Get, $"/v1/customers/cards/{Uri.EscapeDataString(token)}", body: null, ct, "GetCard", idempotencyKey: null).ConfigureAwait(false);
             var card = DeserialiseOrThrow<MercadoPagoCard>(raw, "GetCard");
             return MapCard(card, card.CustomerId, displayName: null, isDefault: false);
         }
@@ -88,7 +88,7 @@ public sealed class MercadoPagoTokenisationProvider : ITokenisationProvider
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(customerId);
 
-        var raw = await MercadoPagoHttp.SendAsync(_httpClient, _logger, ProviderName, HttpMethod.Get, $"/v1/customers/{Uri.EscapeDataString(customerId)}/cards", body: null, ct, "ListCards", idempotencyKey: null).ConfigureAwait(false);
+        var raw = await MercadoPagoHttp.SendAsync(_httpClient, Logger, ProviderName, HttpMethod.Get, $"/v1/customers/{Uri.EscapeDataString(customerId)}/cards", body: null, ct, "ListCards", idempotencyKey: null).ConfigureAwait(false);
 
         MercadoPagoCard[] cards;
         try
@@ -119,7 +119,7 @@ public sealed class MercadoPagoTokenisationProvider : ITokenisationProvider
 
         try
         {
-            await MercadoPagoHttp.SendAsync(_httpClient, _logger, ProviderName, HttpMethod.Delete, $"/v1/customers/{Uri.EscapeDataString(method.CustomerId)}/cards/{Uri.EscapeDataString(token)}", body: null, ct, "DeleteCard", idempotencyKey: null).ConfigureAwait(false);
+            await MercadoPagoHttp.SendAsync(_httpClient, Logger, ProviderName, HttpMethod.Delete, $"/v1/customers/{Uri.EscapeDataString(method.CustomerId)}/cards/{Uri.EscapeDataString(token)}", body: null, ct, "DeleteCard", idempotencyKey: null).ConfigureAwait(false);
             return true;
         }
         catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
@@ -259,24 +259,23 @@ internal static class MercadoPagoHttp
 /// attaches the resulting card to a vault customer for long-lived re-use. Strongly prefer Mercado
 /// Pago Checkout Bricks (client-side) — only use this where the merchant is PCI-DSS SAQ-D.
 /// </summary>
-public sealed class MercadoPagoRawCardTokenisationProvider : IRawCardTokenisationProvider
+public sealed class MercadoPagoRawCardTokenisationProvider : BhenguProviderBase, IRawCardTokenisationProvider
 {
     private readonly HttpClient _httpClient;
     private readonly MercadoPagoOptions _options;
-    private readonly ILogger<MercadoPagoRawCardTokenisationProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.MercadoPago;
+    public override string ProviderName => ProviderNames.MercadoPago;
 
     /// <summary>Create a new Mercado Pago raw-card tokenisation provider.</summary>
     public MercadoPagoRawCardTokenisationProvider(
         HttpClient httpClient,
         IOptions<MercadoPagoOptions> options,
         ILogger<MercadoPagoRawCardTokenisationProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.AccessToken))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(MercadoPagoOptions.AccessToken)} is required");
@@ -306,7 +305,7 @@ public sealed class MercadoPagoRawCardTokenisationProvider : IRawCardTokenisatio
             }
         };
 
-        var tokenRaw = await MercadoPagoHttp.SendAsync(_httpClient, _logger, ProviderName, HttpMethod.Post, "/v1/card_tokens", tokenBody, ct, "CreateCardToken", request.IdempotencyKey).ConfigureAwait(false);
+        var tokenRaw = await MercadoPagoHttp.SendAsync(_httpClient, Logger, ProviderName, HttpMethod.Post, "/v1/card_tokens", tokenBody, ct, "CreateCardToken", request.IdempotencyKey).ConfigureAwait(false);
         var token = MercadoPagoTokenisationProvider.DeserialiseOrThrow<MercadoPagoTokenisationProvider.MercadoPagoCardToken>(tokenRaw, "CreateCardToken");
 
         // 2) Ensure a vault customer exists.
@@ -318,17 +317,17 @@ public sealed class MercadoPagoRawCardTokenisationProvider : IRawCardTokenisatio
                 email = request.DisplayName is { Length: > 0 } d ? d : $"vault-{Guid.NewGuid():N}@mercadopago.bhengu",
                 first_name = request.Card.CardholderName
             };
-            var customerRaw = await MercadoPagoHttp.SendAsync(_httpClient, _logger, ProviderName, HttpMethod.Post, "/v1/customers", customerBody, ct, "CreateCustomer", request.IdempotencyKey).ConfigureAwait(false);
+            var customerRaw = await MercadoPagoHttp.SendAsync(_httpClient, Logger, ProviderName, HttpMethod.Post, "/v1/customers", customerBody, ct, "CreateCustomer", request.IdempotencyKey).ConfigureAwait(false);
             var customer = MercadoPagoTokenisationProvider.DeserialiseOrThrow<MercadoPagoTokenisationProvider.MercadoPagoCustomer>(customerRaw, "CreateCustomer");
             customerId = customer.Id;
         }
 
         // 3) Persist the card against the customer for a long-lived card id.
         var cardBody = new { token = token.Id };
-        var cardRaw = await MercadoPagoHttp.SendAsync(_httpClient, _logger, ProviderName, HttpMethod.Post, $"/v1/customers/{Uri.EscapeDataString(customerId ?? string.Empty)}/cards", cardBody, ct, "AttachCard", request.IdempotencyKey).ConfigureAwait(false);
+        var cardRaw = await MercadoPagoHttp.SendAsync(_httpClient, Logger, ProviderName, HttpMethod.Post, $"/v1/customers/{Uri.EscapeDataString(customerId ?? string.Empty)}/cards", cardBody, ct, "AttachCard", request.IdempotencyKey).ConfigureAwait(false);
         var card = MercadoPagoTokenisationProvider.DeserialiseOrThrow<MercadoPagoTokenisationProvider.MercadoPagoCard>(cardRaw, "AttachCard");
 
-        _logger.LogInformation("Mercado Pago card vaulted: cardId={CardId} customerId={CustomerId}", card.Id, customerId);
+        Logger.LogInformation("Mercado Pago card vaulted: cardId={CardId} customerId={CustomerId}", card.Id, customerId);
 
         return MercadoPagoTokenisationProvider.MapCard(card, customerId, request.DisplayName, request.SetAsDefault);
     }

@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.QrCode;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.MercadoPago.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -29,7 +30,7 @@ namespace Bhengu.Finance.Payments.MercadoPago.Providers;
 /// (e.g. via QRCoder), or request <see cref="QrFormat.Png"/> to get Mercado Pago's pre-rendered
 /// PNG bytes.
 /// </remarks>
-public sealed class MercadoPagoQrCodeProvider : IQrCodeProvider
+public sealed class MercadoPagoQrCodeProvider : BhenguProviderBase, IQrCodeProvider
 {
     private static readonly JsonSerializerOptions WriteOptions = new()
     {
@@ -38,20 +39,19 @@ public sealed class MercadoPagoQrCodeProvider : IQrCodeProvider
 
     private readonly HttpClient _httpClient;
     private readonly MercadoPagoOptions _options;
-    private readonly ILogger<MercadoPagoQrCodeProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.MercadoPago;
+    public override string ProviderName => ProviderNames.MercadoPago;
 
     /// <summary>Create a new Mercado Pago PIX QR provider bound to the supplied HTTP client and options.</summary>
     public MercadoPagoQrCodeProvider(
         HttpClient httpClient,
         IOptions<MercadoPagoOptions> options,
         ILogger<MercadoPagoQrCodeProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.AccessToken))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(MercadoPagoOptions.AccessToken)} is required");
@@ -98,7 +98,7 @@ public sealed class MercadoPagoQrCodeProvider : IQrCodeProvider
         if (string.IsNullOrEmpty(qrText))
             throw new BhenguPaymentException(ProviderName, "Mercado Pago PIX response did not contain a QR payload");
 
-        _logger.LogInformation(
+        Logger.LogInformation(
             "Mercado Pago PIX QR generated: paymentId={Id} reference={Ref} amount={Amount}",
             payment.Id,
             request.MerchantReference,
@@ -188,7 +188,7 @@ public sealed class MercadoPagoQrCodeProvider : IQrCodeProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Mercado Pago {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Mercado Pago {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(System.Globalization.CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

@@ -10,8 +10,8 @@ using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Subscription;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.MercadoPago.Configuration;
-using Bhengu.Finance.Payments.MercadoPago.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -32,7 +32,7 @@ namespace Bhengu.Finance.Payments.MercadoPago.Providers;
 /// <c>paused</c> (which stops collections) and back to <c>authorized</c>. Cancel is one-way.
 /// </para>
 /// </remarks>
-public sealed class MercadoPagoSubscriptionProvider : ISubscriptionProvider
+public sealed class MercadoPagoSubscriptionProvider : BhenguProviderBase, ISubscriptionProvider
 {
     private const string PlanKeyPrefix = "mercadopago:plan:";
     private static readonly TimeSpan PlanTtl = TimeSpan.FromDays(365);
@@ -44,11 +44,10 @@ public sealed class MercadoPagoSubscriptionProvider : ISubscriptionProvider
 
     private readonly HttpClient _httpClient;
     private readonly MercadoPagoOptions _options;
-    private readonly ILogger<MercadoPagoSubscriptionProvider> _logger;
     private readonly IBhenguDistributedCache _cache;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.MercadoPago;
+    public override string ProviderName => ProviderNames.MercadoPago;
 
     /// <summary>Create a new Mercado Pago subscription provider bound to the supplied HTTP client, options, and distributed cache for plan templates.</summary>
     public MercadoPagoSubscriptionProvider(
@@ -56,10 +55,10 @@ public sealed class MercadoPagoSubscriptionProvider : ISubscriptionProvider
         IOptions<MercadoPagoOptions> options,
         ILogger<MercadoPagoSubscriptionProvider> logger,
         IBhenguDistributedCache cache)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _cache = cache ?? throw new ArgumentNullException(nameof(cache));
 
         if (string.IsNullOrWhiteSpace(_options.AccessToken))
@@ -85,7 +84,7 @@ public sealed class MercadoPagoSubscriptionProvider : ISubscriptionProvider
     public Task<Plan> CreatePlanAsync(PlanRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return MercadoPagoObservability.ObserveAsync("create_plan", () => CreatePlanCoreAsync(request, ct));
+        return RunOperationAsync("create_plan", () => CreatePlanCoreAsync(request, ct), ct);
     }
 
     private async Task<Plan> CreatePlanCoreAsync(PlanRequest request, CancellationToken ct)
@@ -103,7 +102,7 @@ public sealed class MercadoPagoSubscriptionProvider : ISubscriptionProvider
         };
 
         await _cache.SetAsync(PlanKeyPrefix + reference, plan, PlanTtl, ct).ConfigureAwait(false);
-        _logger.LogInformation("Mercado Pago plan cached: {Reference} name={Name}", reference, request.Name);
+        Logger.LogInformation("Mercado Pago plan cached: {Reference} name={Name}", reference, request.Name);
 
         return plan;
     }
@@ -112,15 +111,16 @@ public sealed class MercadoPagoSubscriptionProvider : ISubscriptionProvider
     public Task<Plan?> GetPlanAsync(string planReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(planReference);
-        return MercadoPagoObservability.ObserveAsync("get_plan", () =>
-            _cache.GetAsync<Plan>(PlanKeyPrefix + planReference, ct));
+        return RunOperationAsync("get_plan",
+            () => _cache.GetAsync<Plan>(PlanKeyPrefix + planReference, ct),
+            ct);
     }
 
     /// <inheritdoc />
     public Task<Subscription> CreateSubscriptionAsync(SubscriptionRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return MercadoPagoObservability.ObserveAsync("create_subscription", () => CreateSubscriptionCoreAsync(request, ct));
+        return RunOperationAsync("create_subscription", () => CreateSubscriptionCoreAsync(request, ct), ct);
     }
 
     private async Task<Subscription> CreateSubscriptionCoreAsync(SubscriptionRequest request, CancellationToken ct)
@@ -159,7 +159,7 @@ public sealed class MercadoPagoSubscriptionProvider : ISubscriptionProvider
         var raw = await SendAsync(HttpMethod.Post, "/preapproval", body, ct, "CreateSubscription").ConfigureAwait(false);
         var pre = DeserialiseOrThrow<MercadoPagoPreapproval>(raw, "CreateSubscription");
 
-        _logger.LogInformation("Mercado Pago preapproval created: {Id} status={Status}", pre.Id, pre.Status);
+        Logger.LogInformation("Mercado Pago preapproval created: {Id} status={Status}", pre.Id, pre.Status);
         return MapSubscription(pre, request.CustomerId, request.PlanReference);
     }
 
@@ -167,7 +167,7 @@ public sealed class MercadoPagoSubscriptionProvider : ISubscriptionProvider
     public Task<Subscription?> GetSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(subscriptionReference);
-        return MercadoPagoObservability.ObserveAsync("get_subscription", () => GetSubscriptionCoreAsync(subscriptionReference, ct));
+        return RunOperationAsync("get_subscription", () => GetSubscriptionCoreAsync(subscriptionReference, ct), ct);
     }
 
     private async Task<Subscription?> GetSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
@@ -188,7 +188,7 @@ public sealed class MercadoPagoSubscriptionProvider : ISubscriptionProvider
     public Task<Subscription> CancelSubscriptionAsync(string subscriptionReference, bool immediately = false, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(subscriptionReference);
-        return MercadoPagoObservability.ObserveAsync("cancel_subscription", () => CancelSubscriptionCoreAsync(subscriptionReference, immediately, ct));
+        return RunOperationAsync("cancel_subscription", () => CancelSubscriptionCoreAsync(subscriptionReference, immediately, ct), ct);
     }
 
     private async Task<Subscription> CancelSubscriptionCoreAsync(string subscriptionReference, bool immediately, CancellationToken ct)
@@ -215,7 +215,7 @@ public sealed class MercadoPagoSubscriptionProvider : ISubscriptionProvider
     public Task<Subscription> PauseSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(subscriptionReference);
-        return MercadoPagoObservability.ObserveAsync("pause_subscription", () => PauseSubscriptionCoreAsync(subscriptionReference, ct));
+        return RunOperationAsync("pause_subscription", () => PauseSubscriptionCoreAsync(subscriptionReference, ct), ct);
     }
 
     private async Task<Subscription> PauseSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
@@ -230,7 +230,7 @@ public sealed class MercadoPagoSubscriptionProvider : ISubscriptionProvider
     public Task<Subscription> ResumeSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(subscriptionReference);
-        return MercadoPagoObservability.ObserveAsync("resume_subscription", () => ResumeSubscriptionCoreAsync(subscriptionReference, ct));
+        return RunOperationAsync("resume_subscription", () => ResumeSubscriptionCoreAsync(subscriptionReference, ct), ct);
     }
 
     private async Task<Subscription> ResumeSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
@@ -333,7 +333,7 @@ public sealed class MercadoPagoSubscriptionProvider : ISubscriptionProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Mercado Pago {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Mercado Pago {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(System.Globalization.CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

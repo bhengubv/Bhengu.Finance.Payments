@@ -12,6 +12,7 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Marketplace;
 using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.MercadoPago.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -31,7 +32,7 @@ namespace Bhengu.Finance.Payments.MercadoPago.Providers;
 /// To preserve the SDK's <see cref="IMarketplaceProvider"/> shape we cache split definitions
 /// locally and inline them at charge time.
 /// </remarks>
-public sealed class MercadoPagoMarketplaceProvider : IMarketplaceProvider
+public sealed class MercadoPagoMarketplaceProvider : BhenguProviderBase, IMarketplaceProvider
 {
     private static readonly JsonSerializerOptions DeserializeOptions = new() { PropertyNameCaseInsensitive = true };
     private static readonly JsonSerializerOptions SerializeOptions = new() { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
@@ -39,20 +40,19 @@ public sealed class MercadoPagoMarketplaceProvider : IMarketplaceProvider
 
     private readonly HttpClient _httpClient;
     private readonly MercadoPagoOptions _options;
-    private readonly ILogger<MercadoPagoMarketplaceProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.MercadoPago;
+    public override string ProviderName => ProviderNames.MercadoPago;
 
     /// <summary>Create a new Mercado Pago Marketplace provider.</summary>
     public MercadoPagoMarketplaceProvider(
         HttpClient httpClient,
         IOptions<MercadoPagoOptions> options,
         ILogger<MercadoPagoMarketplaceProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.AccessToken))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(MercadoPagoOptions.AccessToken)} is required");
@@ -93,7 +93,7 @@ public sealed class MercadoPagoMarketplaceProvider : IMarketplaceProvider
             var raw = await SendAsync(HttpMethod.Post, "v1/accounts", body, ct, "CreateSubAccount", request.IdempotencyKey).ConfigureAwait(false);
             var account = JsonSerializer.Deserialize<MercadoPagoAccountResponse>(raw, DeserializeOptions);
 
-            _logger.LogInformation("Mercado Pago marketplace account created: {AccountId}", account?.Id);
+            Logger.LogInformation("Mercado Pago marketplace account created: {AccountId}", account?.Id);
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
 
             return new SubAccount
@@ -153,7 +153,7 @@ public sealed class MercadoPagoMarketplaceProvider : IMarketplaceProvider
 #pragma warning disable CS1998 // intentionally async with no awaits — Mercado Pago has no list endpoint, but the contract demands IAsyncEnumerable.
     public async IAsyncEnumerable<SubAccount> ListSubAccountsAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
-        _logger.LogDebug("Mercado Pago does not expose a marketplace account-list endpoint; callers mirror their roster client-side");
+        Logger.LogDebug("Mercado Pago does not expose a marketplace account-list endpoint; callers mirror their roster client-side");
         yield break;
     }
 #pragma warning restore CS1998
@@ -174,7 +174,7 @@ public sealed class MercadoPagoMarketplaceProvider : IMarketplaceProvider
         };
         SplitCache[reference] = split;
 
-        _logger.LogInformation("Mercado Pago split cached locally as {SplitId} ({Count} beneficiaries)",
+        Logger.LogInformation("Mercado Pago split cached locally as {SplitId} ({Count} beneficiaries)",
             reference, request.Rules.Count);
         activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
         return Task.FromResult(split);
@@ -247,7 +247,7 @@ public sealed class MercadoPagoMarketplaceProvider : IMarketplaceProvider
             var raw = await SendAsync(HttpMethod.Post, "v1/payments", body, ct, "ChargeWithSplit", payment.IdempotencyKey).ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<MercadoPagoPaymentResponse>(raw, DeserializeOptions);
 
-            _logger.LogInformation("Mercado Pago split charge: paymentId={Id} status={Status} fee={Fee} collector={Collector}",
+            Logger.LogInformation("Mercado Pago split charge: paymentId={Id} status={Status} fee={Fee} collector={Collector}",
                 response?.Id, response?.Status, applicationFee, seller.SubAccountReference);
 
             var status = response?.Status?.ToLowerInvariant() switch
@@ -326,7 +326,7 @@ public sealed class MercadoPagoMarketplaceProvider : IMarketplaceProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Mercado Pago {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Mercado Pago {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
