@@ -88,12 +88,10 @@ public sealed class PaytmTokenisationProvider : BhenguProviderBase, ITokenisatio
 #pragma warning restore CS1998
 
     /// <inheritdoc />
-    public async Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
+    public Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(token);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise.delete");
-        try
+        return RunOperationAsync("delete_payment_method", async () =>
         {
             var bodyPayload = new { mid = _options.MerchantId, cardToken = token };
             var serializedBody = JsonSerializer.Serialize(bodyPayload, SerializeOptions);
@@ -109,14 +107,8 @@ public sealed class PaytmTokenisationProvider : BhenguProviderBase, ITokenisatio
                 return false;
             }
 
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             return TokenCache.TryRemove(token, out _);
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+        }, ct);
     }
 
     internal string ComputeChecksum(string payload)
@@ -223,12 +215,10 @@ public sealed class PaytmRawCardTokenisationProvider : BhenguProviderBase, IRawC
     }
 
     /// <inheritdoc />
-    public async Task<PaymentMethod> TokeniseAsync(TokeniseRequest request, CancellationToken ct = default)
+    public Task<PaymentMethod> TokeniseAsync(TokeniseRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise");
-        try
+        return RunOperationAsync("tokenise_card", async () =>
         {
             var custId = request.CustomerId ?? $"cust-{Guid.NewGuid():N}";
             var bodyPayload = new
@@ -272,14 +262,8 @@ public sealed class PaytmRawCardTokenisationProvider : BhenguProviderBase, IRawC
             };
 
             PaytmTokenisationProvider.TokenCache[method.Token] = method;
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             return method;
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+        }, ct);
     }
 
     private string ComputeChecksum(string payload)

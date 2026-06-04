@@ -64,12 +64,10 @@ public sealed class PaytmQrCodeProvider : BhenguProviderBase, IQrCodeProvider
     }
 
     /// <inheritdoc />
-    public async Task<QrCode> GenerateQrAsync(QrCodeRequest request, CancellationToken ct = default)
+    public Task<QrCode> GenerateQrAsync(QrCodeRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "qr.generate");
-        try
+        return RunOperationAsync("generate_qr_code", async () =>
         {
             var posId = $"POS_{Guid.NewGuid():N}"[..16];
             var bodyPayload = new
@@ -95,8 +93,6 @@ public sealed class PaytmQrCodeProvider : BhenguProviderBase, IQrCodeProvider
                 throw new BhenguPaymentException(ProviderName, response.Body.ResultInfo.ResultMsg ?? "Paytm QR creation failed",
                     providerErrorCode: response.Body.ResultInfo.ResultCode);
 
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-
             return new QrCode
             {
                 Reference = response?.Body?.QrCodeId ?? request.MerchantReference,
@@ -106,20 +102,14 @@ public sealed class PaytmQrCodeProvider : BhenguProviderBase, IQrCodeProvider
                 Currency = request.Currency.ToUpperInvariant(),
                 ExpiresAt = request.ExpiresAt
             };
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+        }, ct);
     }
 
     /// <inheritdoc />
-    public async Task<PaymentStatus> GetQrStatusAsync(string qrReference, CancellationToken ct = default)
+    public Task<PaymentStatus> GetQrStatusAsync(string qrReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(qrReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "qr.status");
-        try
+        return RunOperationAsync("get_qr_status", async () =>
         {
             var bodyPayload = new { mid = _options.MerchantId, qrCodeId = qrReference };
             var serializedBody = JsonSerializer.Serialize(bodyPayload, SerializeOptions);
@@ -129,17 +119,10 @@ public sealed class PaytmQrCodeProvider : BhenguProviderBase, IQrCodeProvider
             var raw = await SendAsync(HttpMethod.Post, "paymentservices/qr/getStatus", envelope, ct, "GetQrStatus").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<PaytmQrEnvelope<PaytmQrStatusBody>>(raw, DeserializeOptions);
 
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-
             // Prefer the actual transaction status (PENDING/TXN_SUCCESS/TXN_FAILURE) over the
             // API resultStatus (S/F — which only tells us the API call succeeded).
             return MapStatus(response?.Body?.TxnStatus ?? response?.Body?.ResultInfo?.ResultStatus);
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+        }, ct);
     }
 
     private static PaymentStatus MapStatus(string? raw) => raw?.ToLowerInvariant() switch

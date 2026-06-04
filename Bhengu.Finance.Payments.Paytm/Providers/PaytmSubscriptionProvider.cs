@@ -68,26 +68,26 @@ public sealed class PaytmSubscriptionProvider : BhenguProviderBase, ISubscriptio
     public Task<Plan> CreatePlanAsync(PlanRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "subscription.create_plan");
-
-        var reference = $"paytm_plan_{Guid.NewGuid():N}";
-        var plan = new Plan
+        return RunOperationAsync("create_plan", () =>
         {
-            Reference = reference,
-            Name = request.Name,
-            Amount = request.Amount,
-            Currency = request.Currency.ToUpperInvariant(),
-            Interval = request.Interval,
-            TotalCycles = request.TotalCycles,
-            Description = request.Description
-        };
+            var reference = $"paytm_plan_{Guid.NewGuid():N}";
+            var plan = new Plan
+            {
+                Reference = reference,
+                Name = request.Name,
+                Amount = request.Amount,
+                Currency = request.Currency.ToUpperInvariant(),
+                Interval = request.Interval,
+                TotalCycles = request.TotalCycles,
+                Description = request.Description
+            };
 
-        PlanCache[reference] = plan;
-        Logger.LogInformation("Paytm plan cached as {Ref} ({Amount} {Currency}/{Interval})",
-            reference, plan.Amount, plan.Currency, plan.Interval);
-        activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+            PlanCache[reference] = plan;
+            Logger.LogInformation("Paytm plan cached as {Ref} ({Amount} {Currency}/{Interval})",
+                reference, plan.Amount, plan.Currency, plan.Interval);
 
-        return Task.FromResult(plan);
+            return Task.FromResult(plan);
+        }, ct);
     }
 
     /// <inheritdoc />
@@ -98,11 +98,10 @@ public sealed class PaytmSubscriptionProvider : BhenguProviderBase, ISubscriptio
     }
 
     /// <inheritdoc />
-    public async Task<Subscription> CreateSubscriptionAsync(SubscriptionRequest request, CancellationToken ct = default)
+    public Task<Subscription> CreateSubscriptionAsync(SubscriptionRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "subscription.create");
-        try
+        return RunOperationAsync("create_subscription", async () =>
         {
             if (!PlanCache.TryGetValue(request.PlanReference, out var plan))
                 throw new BhenguPaymentException(ProviderName, $"Plan {request.PlanReference} not found in local cache");
@@ -141,8 +140,6 @@ public sealed class PaytmSubscriptionProvider : BhenguProviderBase, ISubscriptio
             Logger.LogInformation("Paytm subscription created: {Id} status={Status}",
                 subscriptionId, response?.Body?.ResultInfo?.ResultStatus);
 
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-
             return new Subscription
             {
                 Reference = response?.Body?.SubscriptionId ?? subscriptionId,
@@ -153,62 +150,51 @@ public sealed class PaytmSubscriptionProvider : BhenguProviderBase, ISubscriptio
                 NextBillingAt = ComputeNext(request.StartAt ?? DateTime.UtcNow, plan.Interval),
                 CyclesCompleted = 0
             };
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+        }, ct);
     }
 
     /// <inheritdoc />
-    public async Task<Subscription?> GetSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
+    public Task<Subscription?> GetSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(subscriptionReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "subscription.get");
-        try
+        return RunOperationAsync<Subscription?>("get_subscription", async () =>
         {
-            var bodyPayload = new { mid = _options.MerchantId, subscriptionId = subscriptionReference };
-            var serializedBody = JsonSerializer.Serialize(bodyPayload, SerializeOptions);
-            var signature = ComputeChecksum(serializedBody);
-            var envelope = new { body = bodyPayload, head = new { signature } };
-
-            var raw = await SendAsync(HttpMethod.Post, "subscription/fetchSubscription", envelope, ct, "FetchSubscription").ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<PaytmSubscriptionEnvelope<PaytmSubscriptionBody>>(raw, DeserializeOptions);
-
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-
-            if (response?.Body?.SubscriptionId is null)
-                return null;
-
-            return new Subscription
+            try
             {
-                Reference = response.Body.SubscriptionId,
-                PlanReference = response.Body.PlanId ?? string.Empty,
-                CustomerId = response.Body.CustomerId ?? string.Empty,
-                Status = MapStatus(response.Body.Status),
-                StartedAt = response.Body.StartDate ?? DateTime.UtcNow,
-                NextBillingAt = response.Body.NextBillingDate,
-                CyclesCompleted = response.Body.CyclesCompleted ?? 0
-            };
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            return null;
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+                var bodyPayload = new { mid = _options.MerchantId, subscriptionId = subscriptionReference };
+                var serializedBody = JsonSerializer.Serialize(bodyPayload, SerializeOptions);
+                var signature = ComputeChecksum(serializedBody);
+                var envelope = new { body = bodyPayload, head = new { signature } };
+
+                var raw = await SendAsync(HttpMethod.Post, "subscription/fetchSubscription", envelope, ct, "FetchSubscription").ConfigureAwait(false);
+                var response = JsonSerializer.Deserialize<PaytmSubscriptionEnvelope<PaytmSubscriptionBody>>(raw, DeserializeOptions);
+
+                if (response?.Body?.SubscriptionId is null)
+                    return null;
+
+                return new Subscription
+                {
+                    Reference = response.Body.SubscriptionId,
+                    PlanReference = response.Body.PlanId ?? string.Empty,
+                    CustomerId = response.Body.CustomerId ?? string.Empty,
+                    Status = MapStatus(response.Body.Status),
+                    StartedAt = response.Body.StartDate ?? DateTime.UtcNow,
+                    NextBillingAt = response.Body.NextBillingDate,
+                    CyclesCompleted = response.Body.CyclesCompleted ?? 0
+                };
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return null;
+            }
+        }, ct);
     }
 
     /// <inheritdoc />
-    public async Task<Subscription> CancelSubscriptionAsync(string subscriptionReference, bool immediately = false, CancellationToken ct = default)
+    public Task<Subscription> CancelSubscriptionAsync(string subscriptionReference, bool immediately = false, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(subscriptionReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "subscription.cancel");
-        try
+        return RunOperationAsync("cancel_subscription", async () =>
         {
             var bodyPayload = new
             {
@@ -223,7 +209,6 @@ public sealed class PaytmSubscriptionProvider : BhenguProviderBase, ISubscriptio
             await SendAsync(HttpMethod.Post, "subscription/cancelSubscription", envelope, ct, "CancelSubscription").ConfigureAwait(false);
 
             Logger.LogInformation("Paytm subscription cancelled: {Id} immediately={Immediately}", subscriptionReference, immediately);
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
 
             return new Subscription
             {
@@ -234,12 +219,7 @@ public sealed class PaytmSubscriptionProvider : BhenguProviderBase, ISubscriptio
                 StartedAt = DateTime.UtcNow,
                 CancelledAt = DateTime.UtcNow
             };
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+        }, ct);
     }
 
     /// <inheritdoc />

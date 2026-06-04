@@ -98,32 +98,27 @@ public sealed class PaytmSettlementProvider : BhenguProviderBase, ISettlementPro
     }
 
     /// <inheritdoc />
-    public async Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
+    public Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(settlementReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.get");
-        try
+        return RunOperationAsync<Settlement?>("get_settlement", async () =>
         {
-            var body = new { mid = _options.MerchantId, settlementId = settlementReference };
-            var signature = ComputeChecksum(JsonSerializer.Serialize(body, SerializeOptions));
-            var envelope = new { body, head = new { signature } };
+            try
+            {
+                var body = new { mid = _options.MerchantId, settlementId = settlementReference };
+                var signature = ComputeChecksum(JsonSerializer.Serialize(body, SerializeOptions));
+                var envelope = new { body, head = new { signature } };
 
-            var raw = await SendAsync(HttpMethod.Post, "settlement/getSettlement", envelope, ct, "GetSettlement").ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<PaytmSettlementEnvelope>(raw, DeserializeOptions);
+                var raw = await SendAsync(HttpMethod.Post, "settlement/getSettlement", envelope, ct, "GetSettlement").ConfigureAwait(false);
+                var response = JsonSerializer.Deserialize<PaytmSettlementEnvelope>(raw, DeserializeOptions);
 
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-
-            return response?.Body?.SettlementId is null ? null : MapSettlement(response.Body);
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            return null;
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+                return response?.Body?.SettlementId is null ? null : MapSettlement(response.Body);
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return null;
+            }
+        }, ct);
     }
 
     /// <inheritdoc />
