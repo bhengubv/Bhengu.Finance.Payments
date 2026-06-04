@@ -12,6 +12,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Dispute;
 using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Flutterwave.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -30,27 +31,26 @@ namespace Bhengu.Finance.Payments.Flutterwave.Providers;
 /// proxy — pass file references via <see cref="DisputeEvidence.FileReferences"/> after uploading
 /// them out-of-band through the Flutterwave dashboard.
 /// </remarks>
-public sealed class FlutterwaveDisputeProvider : IDisputeProvider
+public sealed class FlutterwaveDisputeProvider : BhenguProviderBase, IDisputeProvider
 {
     private static readonly JsonSerializerOptions DeserializeOptions = new() { PropertyNameCaseInsensitive = true };
     private static readonly JsonSerializerOptions SerializeOptions = new() { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
 
     private readonly HttpClient _httpClient;
     private readonly FlutterwaveOptions _options;
-    private readonly ILogger<FlutterwaveDisputeProvider> _logger;
 
     /// <inheritdoc />
-    public string ProviderName => ProviderNames.Flutterwave;
+    public override string ProviderName => ProviderNames.Flutterwave;
 
     /// <summary>Create a new Flutterwave dispute provider.</summary>
     public FlutterwaveDisputeProvider(
         HttpClient httpClient,
         IOptions<FlutterwaveOptions> options,
         ILogger<FlutterwaveDisputeProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(FlutterwaveOptions.SecretKey)} is required");
@@ -110,7 +110,7 @@ public sealed class FlutterwaveDisputeProvider : IDisputeProvider
                 var raw = await SendAsync(HttpMethod.Get, path, body: null, ct, "ListDisputes").ConfigureAwait(false);
                 var response = JsonSerializer.Deserialize<FlutterwaveDisputeEnvelope<List<FlutterwaveDisputeBody>>>(raw, DeserializeOptions);
 
-                _logger.LogInformation("Flutterwave listed {Count} disputes between {From:o} and {To:o}",
+                Logger.LogInformation("Flutterwave listed {Count} disputes between {From:o} and {To:o}",
                     response?.Data?.Count ?? 0, fromUtc, toUtc);
 
                 activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
@@ -156,7 +156,7 @@ public sealed class FlutterwaveDisputeProvider : IDisputeProvider
             var raw = await SendAsync(HttpMethod.Post, $"v3/chargebacks/{Uri.EscapeDataString(disputeReference)}/contest", body, ct, "ContestDispute").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<FlutterwaveDisputeEnvelope<FlutterwaveDisputeBody>>(raw, DeserializeOptions);
 
-            _logger.LogInformation("Flutterwave dispute contested: {DisputeId}", response?.Data?.Id);
+            Logger.LogInformation("Flutterwave dispute contested: {DisputeId}", response?.Data?.Id);
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
 
             return response?.Data is null
@@ -189,7 +189,7 @@ public sealed class FlutterwaveDisputeProvider : IDisputeProvider
             var raw = await SendAsync(HttpMethod.Post, $"v3/chargebacks/{Uri.EscapeDataString(disputeReference)}/accept", body: new { }, ct, "AcceptDispute").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<FlutterwaveDisputeEnvelope<FlutterwaveDisputeBody>>(raw, DeserializeOptions);
 
-            _logger.LogInformation("Flutterwave dispute accepted: {DisputeId}", response?.Data?.Id);
+            Logger.LogInformation("Flutterwave dispute accepted: {DisputeId}", response?.Data?.Id);
             activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
 
             return response?.Data is null
@@ -269,7 +269,7 @@ public sealed class FlutterwaveDisputeProvider : IDisputeProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Flutterwave {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Flutterwave {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

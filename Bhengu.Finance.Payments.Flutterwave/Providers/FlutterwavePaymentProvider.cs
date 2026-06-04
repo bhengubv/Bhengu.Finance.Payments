@@ -2,7 +2,6 @@
 
 using System.Net;
 using System.Net.Http.Headers;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -11,6 +10,8 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.Flutterwave.Configuration;
 using Bhengu.Finance.Payments.Flutterwave.Internals;
 using Microsoft.Extensions.Logging;
@@ -24,15 +25,14 @@ namespace Bhengu.Finance.Payments.Flutterwave.Providers;
 /// and refunds. Webhook authenticity is checked via constant-time comparison of the
 /// <c>verif-hash</c> header against the configured WebhookSecret (Flutterwave does not HMAC).
 /// </summary>
-public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class FlutterwavePaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly FlutterwaveOptions _options;
-    private readonly ILogger<FlutterwavePaymentProvider> _logger;
     private readonly FlutterwaveIdempotencyCache _idempotencyCache;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Flutterwave;
+    public override string ProviderName => ProviderNames.Flutterwave;
 
     /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
@@ -63,10 +63,10 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
         HttpClient httpClient,
         IOptions<FlutterwaveOptions> options,
         ILogger<FlutterwavePaymentProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotencyCache = new FlutterwaveIdempotencyCache();
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
@@ -82,8 +82,9 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return FlutterwaveObservability.ObserveChargeAsync(request.Currency, () =>
-            _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, () => ProcessPaymentCoreAsync(request, ct)));
+        return RunChargeAsync(request.Currency,
+            () => _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, () => ProcessPaymentCoreAsync(request, ct)),
+            ct);
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
@@ -122,7 +123,7 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
         var body = await SendAsync(HttpMethod.Post, "v3/payments", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
         var fwResponse = JsonSerializer.Deserialize<FlutterwavePaymentResponse>(body);
 
-        _logger.LogInformation("Flutterwave payment initialised: {TxRef} status={Status}",
+        Logger.LogInformation("Flutterwave payment initialised: {TxRef} status={Status}",
             request.PaymentMethodToken, fwResponse?.Status);
 
         return new PaymentResponse
@@ -141,8 +142,9 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return FlutterwaveObservability.ObservePayoutAsync(request.Currency, () =>
-            _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, () => ProcessPayoutCoreAsync(request, ct)));
+        return RunPayoutAsync(request.Currency,
+            () => _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, () => ProcessPayoutCoreAsync(request, ct)),
+            ct);
     }
 
     private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
@@ -171,7 +173,7 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
         var body = await SendAsync(HttpMethod.Post, "v3/transfers", requestBody, ct, "ProcessPayout").ConfigureAwait(false);
         var transferResponse = JsonSerializer.Deserialize<FlutterwaveTransferResponse>(body);
 
-        _logger.LogInformation("Flutterwave transfer initialised: {Reference} status={Status}",
+        Logger.LogInformation("Flutterwave transfer initialised: {Reference} status={Status}",
             transferResponse?.Data?.Reference ?? reference, transferResponse?.Data?.Status);
 
         return new PayoutResponse
@@ -188,8 +190,9 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return FlutterwaveObservability.ObserveRefundAsync(request.GatewayReference, () =>
-            _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, () => ProcessRefundCoreAsync(request, ct)));
+        return RunRefundAsync(request.GatewayReference,
+            () => _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, () => ProcessRefundCoreAsync(request, ct)),
+            ct);
     }
 
     private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
@@ -204,7 +207,7 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
         var body = await SendAsync(HttpMethod.Post, path, requestBody, ct, "ProcessRefund").ConfigureAwait(false);
         var refundResponse = JsonSerializer.Deserialize<FlutterwaveRefundResponse>(body);
 
-        _logger.LogInformation("Flutterwave refund created: {RefundId} for transaction {TransactionId}",
+        Logger.LogInformation("Flutterwave refund created: {RefundId} for transaction {TransactionId}",
             refundResponse?.Data?.Id, request.GatewayReference);
 
         return new RefundResponse
@@ -225,27 +228,13 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
 
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
-            _logger.LogWarning("Flutterwave WebhookSecret not configured — signature verification cannot succeed.");
-            FlutterwaveObservability.RecordWebhookVerification(false);
-            return false;
+            Logger.LogWarning("Flutterwave WebhookSecret not configured — signature verification cannot succeed.");
+            return RunWebhookVerify(() => false);
         }
 
-        bool verified;
-        try
-        {
-            // Flutterwave does NOT HMAC the body; it sends the configured secret verbatim in the
-            // verif-hash header. Constant-time compare to defeat timing-based equality leaks.
-            verified = CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(signature),
-                Encoding.UTF8.GetBytes(_options.WebhookSecret));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Flutterwave webhook signature verification raised");
-            verified = false;
-        }
-        FlutterwaveObservability.RecordWebhookVerification(verified);
-        return verified;
+        // Flutterwave does NOT HMAC the body; it sends the configured secret verbatim in the
+        // verif-hash header. SignatureHelpers.ConstantTimeEquals defeats timing-based equality leaks.
+        return RunWebhookVerify(() => SignatureHelpers.ConstantTimeEquals(signature, _options.WebhookSecret));
     }
 
     /// <inheritdoc/>
@@ -265,7 +254,7 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        return FlutterwaveObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+        return RunOperationAsync("parse_webhook", () => ParseWebhookCoreAsync(payload, ct), ct);
     }
 
     private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
@@ -275,7 +264,7 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
             var webhookEvent = JsonSerializer.Deserialize<FlutterwaveWebhookEvent>(payload);
             if (webhookEvent is null) return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed Flutterwave webhook event: {EventType}", webhookEvent.Event);
+            Logger.LogInformation("Parsed Flutterwave webhook event: {EventType}", webhookEvent.Event);
 
             var reference = webhookEvent.Data?.TxRef ?? webhookEvent.Data?.Reference;
             if (string.IsNullOrEmpty(reference))
@@ -378,7 +367,7 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse Flutterwave webhook event");
+            Logger.LogError(ex, "Failed to parse Flutterwave webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -391,16 +380,8 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
             Content = new StringContent(json, Encoding.UTF8, "application/json")
         };
 
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Flutterwave failed", ex);
-        }
-
+        // HttpRequestException is auto-translated to ProviderUnavailableException by BhenguProviderBase.
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -411,7 +392,7 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Flutterwave {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Flutterwave {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

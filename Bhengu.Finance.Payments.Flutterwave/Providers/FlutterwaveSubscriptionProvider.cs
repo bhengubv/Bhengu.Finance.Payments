@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Subscription;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Flutterwave.Configuration;
 using Bhengu.Finance.Payments.Flutterwave.Internals;
 using Microsoft.Extensions.Logging;
@@ -31,25 +32,24 @@ namespace Bhengu.Finance.Payments.Flutterwave.Providers;
 /// <see cref="BhenguPaymentException"/>. The contract documents this caveat.
 /// </para>
 /// </summary>
-public sealed class FlutterwaveSubscriptionProvider : ISubscriptionProvider
+public sealed class FlutterwaveSubscriptionProvider : BhenguProviderBase, ISubscriptionProvider
 {
     private readonly HttpClient _httpClient;
     private readonly FlutterwaveOptions _options;
-    private readonly ILogger<FlutterwaveSubscriptionProvider> _logger;
     private readonly FlutterwaveIdempotencyCache _idempotencyCache;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Flutterwave;
+    public override string ProviderName => ProviderNames.Flutterwave;
 
     /// <summary>Construct the provider; configures Bearer auth on the injected <paramref name="httpClient"/>.</summary>
     public FlutterwaveSubscriptionProvider(
         HttpClient httpClient,
         IOptions<FlutterwaveOptions> options,
         ILogger<FlutterwaveSubscriptionProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotencyCache = new FlutterwaveIdempotencyCache();
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
@@ -85,7 +85,7 @@ public sealed class FlutterwaveSubscriptionProvider : ISubscriptionProvider
         if (fw?.Data is null)
             throw new BhenguPaymentException(ProviderName, "Flutterwave CreatePlan returned no data");
 
-        _logger.LogInformation("Flutterwave payment plan created: {Id} name={Name}", fw.Data.Id, fw.Data.Name);
+        Logger.LogInformation("Flutterwave payment plan created: {Id} name={Name}", fw.Data.Id, fw.Data.Name);
 
         return ToPlan(fw.Data, request.Interval);
     }
@@ -135,7 +135,7 @@ public sealed class FlutterwaveSubscriptionProvider : ISubscriptionProvider
 
         await SendAsync(HttpMethod.Post, "v3/payments", body, ct, "CreateSubscription").ConfigureAwait(false);
 
-        _logger.LogInformation("Flutterwave subscription initialised: {Reference} plan={Plan} customer={Customer}",
+        Logger.LogInformation("Flutterwave subscription initialised: {Reference} plan={Plan} customer={Customer}",
             txRef, request.PlanReference, request.CustomerId);
 
         return new Subscription
@@ -184,7 +184,7 @@ public sealed class FlutterwaveSubscriptionProvider : ISubscriptionProvider
         {
             var responseBody = await SendAsync(HttpMethod.Put, path, body: new { }, ct, "CancelSubscription").ConfigureAwait(false);
             var fw = JsonSerializer.Deserialize<FlutterwaveSubscriptionResponse>(responseBody);
-            _logger.LogInformation("Flutterwave subscription {Reference} cancelled (immediately={Immediately})", subscriptionReference, immediately);
+            Logger.LogInformation("Flutterwave subscription {Reference} cancelled (immediately={Immediately})", subscriptionReference, immediately);
 
             return fw?.Data is null
                 ? CancelledStub(subscriptionReference)
@@ -311,7 +311,7 @@ public sealed class FlutterwaveSubscriptionProvider : ISubscriptionProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Flutterwave {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Flutterwave {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

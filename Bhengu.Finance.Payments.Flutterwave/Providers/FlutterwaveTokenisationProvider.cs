@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Vault;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Flutterwave.Configuration;
 using Bhengu.Finance.Payments.Flutterwave.Internals;
 using Microsoft.Extensions.Logging;
@@ -31,24 +32,23 @@ namespace Bhengu.Finance.Payments.Flutterwave.Providers;
 /// up the customer's other tokens via the saved-cards endpoint.
 /// </para>
 /// </summary>
-public sealed class FlutterwaveTokenisationProvider : ITokenisationProvider
+public sealed class FlutterwaveTokenisationProvider : BhenguProviderBase, ITokenisationProvider
 {
     private readonly HttpClient _httpClient;
     private readonly FlutterwaveOptions _options;
-    private readonly ILogger<FlutterwaveTokenisationProvider> _logger;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Flutterwave;
+    public override string ProviderName => ProviderNames.Flutterwave;
 
     /// <summary>Construct the provider; configures Bearer auth on the injected <paramref name="httpClient"/>.</summary>
     public FlutterwaveTokenisationProvider(
         HttpClient httpClient,
         IOptions<FlutterwaveOptions> options,
         ILogger<FlutterwaveTokenisationProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(FlutterwaveOptions.SecretKey)} is required");
@@ -101,7 +101,7 @@ public sealed class FlutterwaveTokenisationProvider : ITokenisationProvider
     public Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(token);
-        _logger.LogInformation("Flutterwave has no delete-token API; caller should evict {Token} from their own vault.", token);
+        Logger.LogInformation("Flutterwave has no delete-token API; caller should evict {Token} from their own vault.", token);
         return Task.FromResult(true);
     }
 }
@@ -112,25 +112,24 @@ public sealed class FlutterwaveTokenisationProvider : ITokenisationProvider
 /// card token. Strongly prefer Flutterwave's hosted checkout / Inline SDK on the client where
 /// possible — only use this where the merchant is already PCI-DSS Level-1 SAQ-D.
 /// </summary>
-public sealed class FlutterwaveRawCardTokenisationProvider : IRawCardTokenisationProvider
+public sealed class FlutterwaveRawCardTokenisationProvider : BhenguProviderBase, IRawCardTokenisationProvider
 {
     private readonly HttpClient _httpClient;
     private readonly FlutterwaveOptions _options;
-    private readonly ILogger<FlutterwaveRawCardTokenisationProvider> _logger;
     private readonly FlutterwaveIdempotencyCache _idempotencyCache;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Flutterwave;
+    public override string ProviderName => ProviderNames.Flutterwave;
 
     /// <summary>Construct the provider; configures Bearer auth on the injected <paramref name="httpClient"/>.</summary>
     public FlutterwaveRawCardTokenisationProvider(
         HttpClient httpClient,
         IOptions<FlutterwaveOptions> options,
         ILogger<FlutterwaveRawCardTokenisationProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotencyCache = new FlutterwaveIdempotencyCache();
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
@@ -182,7 +181,7 @@ public sealed class FlutterwaveRawCardTokenisationProvider : IRawCardTokenisatio
         var token = fw?.Data?.Card?.Token
             ?? throw new BhenguPaymentException(ProviderName, "Flutterwave tokenisation did not return a card.token");
 
-        _logger.LogInformation("Flutterwave card vaulted for {Email}: token={Token} brand={Brand} last4={Last4}",
+        Logger.LogInformation("Flutterwave card vaulted for {Email}: token={Token} brand={Brand} last4={Last4}",
             email, token, fw?.Data?.Card?.Type, fw?.Data?.Card?.Last4Digits);
 
         return new PaymentMethod
@@ -230,7 +229,7 @@ public sealed class FlutterwaveRawCardTokenisationProvider : IRawCardTokenisatio
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Flutterwave {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Flutterwave {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

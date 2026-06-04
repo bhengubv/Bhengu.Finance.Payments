@@ -11,6 +11,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Settlement;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Flutterwave.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -25,24 +26,23 @@ namespace Bhengu.Finance.Payments.Flutterwave.Providers;
 /// reachable via the <c>?settlement_id=</c> filter on <c>/v3/transactions</c>.
 /// </para>
 /// </summary>
-public sealed class FlutterwaveSettlementProvider : ISettlementProvider
+public sealed class FlutterwaveSettlementProvider : BhenguProviderBase, ISettlementProvider
 {
     private readonly HttpClient _httpClient;
     private readonly FlutterwaveOptions _options;
-    private readonly ILogger<FlutterwaveSettlementProvider> _logger;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Flutterwave;
+    public override string ProviderName => ProviderNames.Flutterwave;
 
     /// <summary>Construct the provider; configures Bearer auth on the injected <paramref name="httpClient"/>.</summary>
     public FlutterwaveSettlementProvider(
         HttpClient httpClient,
         IOptions<FlutterwaveOptions> options,
         ILogger<FlutterwaveSettlementProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(FlutterwaveOptions.SecretKey)} is required");
@@ -61,7 +61,7 @@ public sealed class FlutterwaveSettlementProvider : ISettlementProvider
         var fw = JsonSerializer.Deserialize<FlutterwaveSettlementListResponse>(responseBody);
         if (fw?.Data is null) yield break;
 
-        _logger.LogInformation("Flutterwave settlements listed: {Count} between {From:O} and {To:O}", fw.Data.Count, fromUtc, toUtc);
+        Logger.LogInformation("Flutterwave settlements listed: {Count} between {From:O} and {To:O}", fw.Data.Count, fromUtc, toUtc);
         foreach (var d in fw.Data)
         {
             ct.ThrowIfCancellationRequested();
@@ -163,7 +163,7 @@ public sealed class FlutterwaveSettlementProvider : ISettlementProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Flutterwave {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Flutterwave {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
