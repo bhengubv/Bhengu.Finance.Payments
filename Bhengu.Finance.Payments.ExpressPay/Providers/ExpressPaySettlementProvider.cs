@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
@@ -57,39 +58,40 @@ public sealed class ExpressPaySettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+    public async IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list");
-        try
+        List<ExpressPaySettlementData>? items;
+        using (var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list"))
         {
-            var form = new Dictionary<string, string>
+            try
             {
-                ["merchant-id"] = _options.MerchantId,
-                ["api-key"] = _options.ApiKey,
-                ["from"] = fromUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
-                ["to"] = toUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
-            };
+                var form = new Dictionary<string, string>
+                {
+                    ["merchant-id"] = _options.MerchantId,
+                    ["api-key"] = _options.ApiKey,
+                    ["from"] = fromUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+                    ["to"] = toUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
+                };
 
-            var responseBody = await ExpressPayHttpClient.SendFormAsync(_httpClient, _logger, HttpMethod.Post, "settlements.php", form, ct, "ListSettlements").ConfigureAwait(false);
-            var envelope = JsonSerializer.Deserialize<ExpressPaySettlementListResponse>(responseBody);
-            if (envelope?.Settlements is null)
-            {
+                var responseBody = await ExpressPayHttpClient.SendFormAsync(_httpClient, _logger, HttpMethod.Post, "settlements.php", form, ct, "ListSettlements").ConfigureAwait(false);
+                var envelope = JsonSerializer.Deserialize<ExpressPaySettlementListResponse>(responseBody);
+                items = envelope?.Settlements;
+
+                _logger.LogInformation("ExpressPay settlements listed: {Count} between {From:O} and {To:O}", items?.Count ?? 0, fromUtc, toUtc);
                 activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-                return Array.Empty<Settlement>();
             }
-
-            var settlements = new List<Settlement>(envelope.Settlements.Count);
-            foreach (var d in envelope.Settlements)
-                settlements.Add(ToSettlement(d));
-
-            _logger.LogInformation("ExpressPay settlements listed: {Count} between {From:O} and {To:O}", settlements.Count, fromUtc, toUtc);
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return settlements;
+            catch (Exception ex)
+            {
+                activity.SetOutcome(ClassifyOutcome(ex));
+                throw;
+            }
         }
-        catch (Exception ex)
+
+        if (items is null) yield break;
+        foreach (var d in items)
         {
-            activity.SetOutcome(ClassifyOutcome(ex));
-            throw;
+            ct.ThrowIfCancellationRequested();
+            yield return ToSettlement(d);
         }
     }
 
@@ -126,39 +128,39 @@ public sealed class ExpressPaySettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
+    public async IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(string settlementReference, [EnumeratorCancellation] CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
 
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list_transactions");
-        try
+        List<ExpressPayTransactionData>? items;
+        using (var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list_transactions"))
         {
-            var form = new Dictionary<string, string>
+            try
             {
-                ["merchant-id"] = _options.MerchantId,
-                ["api-key"] = _options.ApiKey,
-                ["settlement-id"] = settlementReference
-            };
+                var form = new Dictionary<string, string>
+                {
+                    ["merchant-id"] = _options.MerchantId,
+                    ["api-key"] = _options.ApiKey,
+                    ["settlement-id"] = settlementReference
+                };
 
-            var responseBody = await ExpressPayHttpClient.SendFormAsync(_httpClient, _logger, HttpMethod.Post, "settlement_transactions.php", form, ct, "ListSettlementTransactions").ConfigureAwait(false);
-            var envelope = JsonSerializer.Deserialize<ExpressPayTransactionListResponse>(responseBody);
-            if (envelope?.Transactions is null)
-            {
+                var responseBody = await ExpressPayHttpClient.SendFormAsync(_httpClient, _logger, HttpMethod.Post, "settlement_transactions.php", form, ct, "ListSettlementTransactions").ConfigureAwait(false);
+                var envelope = JsonSerializer.Deserialize<ExpressPayTransactionListResponse>(responseBody);
+                items = envelope?.Transactions;
                 activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-                return Array.Empty<SettlementTransaction>();
             }
-
-            var txns = new List<SettlementTransaction>(envelope.Transactions.Count);
-            foreach (var d in envelope.Transactions)
-                txns.Add(ToTransaction(d));
-
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return txns;
+            catch (Exception ex)
+            {
+                activity.SetOutcome(ClassifyOutcome(ex));
+                throw;
+            }
         }
-        catch (Exception ex)
+
+        if (items is null) yield break;
+        foreach (var d in items)
         {
-            activity.SetOutcome(ClassifyOutcome(ex));
-            throw;
+            ct.ThrowIfCancellationRequested();
+            yield return ToTransaction(d);
         }
     }
 

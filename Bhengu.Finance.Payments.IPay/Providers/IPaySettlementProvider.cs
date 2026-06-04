@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
@@ -57,33 +58,34 @@ public sealed class IPaySettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+    public async IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list");
-        try
+        List<IPaySettlementData>? items;
+        using (var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list"))
         {
-            var hash = IPayCrypto.ComputeHmacHex($"{_options.VendorId}{fromUtc:yyyy-MM-dd}{toUtc:yyyy-MM-dd}", _options.HashKey);
-            var path = $"api/v3/settlements?vid={Uri.EscapeDataString(_options.VendorId)}&from={fromUtc:yyyy-MM-dd}&to={toUtc:yyyy-MM-dd}&hash={hash}";
-            var responseBody = await IPayHttpClient.SendGetAsync(_httpClient, _logger, path, ct, "ListSettlements").ConfigureAwait(false);
-            var envelope = JsonSerializer.Deserialize<IPaySettlementListResponse>(responseBody);
-            if (envelope?.Data is null)
+            try
             {
+                var hash = IPayCrypto.ComputeHmacHex($"{_options.VendorId}{fromUtc:yyyy-MM-dd}{toUtc:yyyy-MM-dd}", _options.HashKey);
+                var path = $"api/v3/settlements?vid={Uri.EscapeDataString(_options.VendorId)}&from={fromUtc:yyyy-MM-dd}&to={toUtc:yyyy-MM-dd}&hash={hash}";
+                var responseBody = await IPayHttpClient.SendGetAsync(_httpClient, _logger, path, ct, "ListSettlements").ConfigureAwait(false);
+                var envelope = JsonSerializer.Deserialize<IPaySettlementListResponse>(responseBody);
+                items = envelope?.Data;
+
+                _logger.LogInformation("iPay settlements listed: {Count} between {From:O} and {To:O}", items?.Count ?? 0, fromUtc, toUtc);
                 activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-                return Array.Empty<Settlement>();
             }
-
-            var settlements = new List<Settlement>(envelope.Data.Count);
-            foreach (var d in envelope.Data)
-                settlements.Add(ToSettlement(d));
-
-            _logger.LogInformation("iPay settlements listed: {Count} between {From:O} and {To:O}", settlements.Count, fromUtc, toUtc);
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return settlements;
+            catch (Exception ex)
+            {
+                activity.SetOutcome(ClassifyOutcome(ex));
+                throw;
+            }
         }
-        catch (Exception ex)
+
+        if (items is null) yield break;
+        foreach (var d in items)
         {
-            activity.SetOutcome(ClassifyOutcome(ex));
-            throw;
+            ct.ThrowIfCancellationRequested();
+            yield return ToSettlement(d);
         }
     }
 
@@ -115,34 +117,34 @@ public sealed class IPaySettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
+    public async IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(string settlementReference, [EnumeratorCancellation] CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
 
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list_transactions");
-        try
+        List<IPayTransactionData>? items;
+        using (var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list_transactions"))
         {
-            var hash = IPayCrypto.ComputeHmacHex($"{_options.VendorId}{settlementReference}", _options.HashKey);
-            var path = $"api/v3/settlements/{Uri.EscapeDataString(settlementReference)}/transactions?vid={Uri.EscapeDataString(_options.VendorId)}&hash={hash}";
-            var responseBody = await IPayHttpClient.SendGetAsync(_httpClient, _logger, path, ct, "ListSettlementTransactions").ConfigureAwait(false);
-            var envelope = JsonSerializer.Deserialize<IPayTransactionListResponse>(responseBody);
-            if (envelope?.Data is null)
+            try
             {
+                var hash = IPayCrypto.ComputeHmacHex($"{_options.VendorId}{settlementReference}", _options.HashKey);
+                var path = $"api/v3/settlements/{Uri.EscapeDataString(settlementReference)}/transactions?vid={Uri.EscapeDataString(_options.VendorId)}&hash={hash}";
+                var responseBody = await IPayHttpClient.SendGetAsync(_httpClient, _logger, path, ct, "ListSettlementTransactions").ConfigureAwait(false);
+                var envelope = JsonSerializer.Deserialize<IPayTransactionListResponse>(responseBody);
+                items = envelope?.Data;
                 activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-                return Array.Empty<SettlementTransaction>();
             }
-
-            var txns = new List<SettlementTransaction>(envelope.Data.Count);
-            foreach (var d in envelope.Data)
-                txns.Add(ToTransaction(d));
-
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return txns;
+            catch (Exception ex)
+            {
+                activity.SetOutcome(ClassifyOutcome(ex));
+                throw;
+            }
         }
-        catch (Exception ex)
+
+        if (items is null) yield break;
+        foreach (var d in items)
         {
-            activity.SetOutcome(ClassifyOutcome(ex));
-            throw;
+            ct.ThrowIfCancellationRequested();
+            yield return ToTransaction(d);
         }
     }
 

@@ -2,6 +2,7 @@
 
 using System.Globalization;
 using System.Net.Http.Headers;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -65,28 +66,33 @@ public sealed class HubtelSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+    public async IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list");
-        try
+        List<HubtelStatementData>? items;
+        using (var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list"))
         {
-            var path = $"merchantaccount/merchants/{Uri.EscapeDataString(_options.MerchantAccountNumber)}/statement?from={fromUtc:yyyy-MM-dd}&to={toUtc:yyyy-MM-dd}";
-            var responseBody = await HubtelHttpClient.SendAsync(_httpClient, _logger, HttpMethod.Get, path, body: null, ct, "ListSettlements").ConfigureAwait(false);
-            var envelope = JsonSerializer.Deserialize<HubtelStatementResponse>(responseBody);
-            if (envelope?.Data is null) return Array.Empty<Settlement>();
+            try
+            {
+                var path = $"merchantaccount/merchants/{Uri.EscapeDataString(_options.MerchantAccountNumber)}/statement?from={fromUtc:yyyy-MM-dd}&to={toUtc:yyyy-MM-dd}";
+                var responseBody = await HubtelHttpClient.SendAsync(_httpClient, _logger, HttpMethod.Get, path, body: null, ct, "ListSettlements").ConfigureAwait(false);
+                var envelope = JsonSerializer.Deserialize<HubtelStatementResponse>(responseBody);
+                items = envelope?.Data;
 
-            var settlements = new List<Settlement>(envelope.Data.Count);
-            foreach (var d in envelope.Data)
-                settlements.Add(ToSettlement(d));
-
-            _logger.LogInformation("Hubtel settlements listed: {Count} between {From:O} and {To:O}", settlements.Count, fromUtc, toUtc);
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return settlements;
+                _logger.LogInformation("Hubtel settlements listed: {Count} between {From:O} and {To:O}", items?.Count ?? 0, fromUtc, toUtc);
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+            }
+            catch (Exception ex)
+            {
+                activity.SetOutcome(ClassifyOutcome(ex));
+                throw;
+            }
         }
-        catch (Exception ex)
+
+        if (items is null) yield break;
+        foreach (var d in items)
         {
-            activity.SetOutcome(ClassifyOutcome(ex));
-            throw;
+            ct.ThrowIfCancellationRequested();
+            yield return ToSettlement(d);
         }
     }
 
@@ -117,33 +123,33 @@ public sealed class HubtelSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
+    public async IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(string settlementReference, [EnumeratorCancellation] CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
 
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list_transactions");
-        try
+        List<HubtelTransactionData>? items;
+        using (var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list_transactions"))
         {
-            var path = $"transactions/{Uri.EscapeDataString(_options.MerchantAccountNumber)}/history?statementId={Uri.EscapeDataString(settlementReference)}";
-            var responseBody = await HubtelHttpClient.SendAsync(_httpClient, _logger, HttpMethod.Get, path, body: null, ct, "ListSettlementTransactions").ConfigureAwait(false);
-            var envelope = JsonSerializer.Deserialize<HubtelTransactionListResponse>(responseBody);
-            if (envelope?.Data is null)
+            try
             {
+                var path = $"transactions/{Uri.EscapeDataString(_options.MerchantAccountNumber)}/history?statementId={Uri.EscapeDataString(settlementReference)}";
+                var responseBody = await HubtelHttpClient.SendAsync(_httpClient, _logger, HttpMethod.Get, path, body: null, ct, "ListSettlementTransactions").ConfigureAwait(false);
+                var envelope = JsonSerializer.Deserialize<HubtelTransactionListResponse>(responseBody);
+                items = envelope?.Data;
                 activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-                return Array.Empty<SettlementTransaction>();
             }
-
-            var txns = new List<SettlementTransaction>(envelope.Data.Count);
-            foreach (var d in envelope.Data)
-                txns.Add(ToTransaction(d));
-
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return txns;
+            catch (Exception ex)
+            {
+                activity.SetOutcome(ClassifyOutcome(ex));
+                throw;
+            }
         }
-        catch (Exception ex)
+
+        if (items is null) yield break;
+        foreach (var d in items)
         {
-            activity.SetOutcome(ClassifyOutcome(ex));
-            throw;
+            ct.ThrowIfCancellationRequested();
+            yield return ToTransaction(d);
         }
     }
 

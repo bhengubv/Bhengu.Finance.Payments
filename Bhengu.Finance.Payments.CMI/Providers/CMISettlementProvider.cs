@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Xml.Linq;
 using Bhengu.Finance.Payments.CMI.Configuration;
@@ -51,20 +52,22 @@ public sealed class CMISettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+    public async IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list");
-        var xml = BuildSettlementsReportXml(fromUtc, toUtc);
-        var body = await CMIHttpClient.SendFormAsync(_httpClient, _logger, "fim/api",
-            new Dictionary<string, string> { ["DATA"] = xml }, "ListSettlements", ct).ConfigureAwait(false);
+        XDocument? doc;
+        using (BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.list"))
+        {
+            var xml = BuildSettlementsReportXml(fromUtc, toUtc);
+            var body = await CMIHttpClient.SendFormAsync(_httpClient, _logger, "fim/api",
+                new Dictionary<string, string> { ["DATA"] = xml }, "ListSettlements", ct).ConfigureAwait(false);
+            doc = TryParseXml(body);
+        }
 
-        var doc = TryParseXml(body);
-        if (doc?.Root is null) return Array.Empty<Settlement>();
-
-        var list = new List<Settlement>();
+        if (doc?.Root is null) yield break;
         foreach (var s in doc.Root.Elements("Settlement"))
         {
-            list.Add(new Settlement
+            ct.ThrowIfCancellationRequested();
+            yield return new Settlement
             {
                 Reference = s.Element("Id")?.Value ?? string.Empty,
                 NetAmount = ParseDecimal(s.Element("NetAmount")?.Value),
@@ -74,9 +77,8 @@ public sealed class CMISettlementProvider : ISettlementProvider
                 SettledAt = ParseDate(s.Element("SettledAt")?.Value),
                 BankAccountReference = s.Element("BankAccount")?.Value,
                 TransactionCount = int.TryParse(s.Element("Count")?.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var c) ? c : 0
-            });
+            };
         }
-        return list;
     }
 
     /// <inheritdoc/>
@@ -113,21 +115,23 @@ public sealed class CMISettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
+    public async IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(string settlementReference, [EnumeratorCancellation] CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.transactions");
-        var xml = BuildSettlementTransactionsXml(settlementReference);
-        var body = await CMIHttpClient.SendFormAsync(_httpClient, _logger, "fim/api",
-            new Dictionary<string, string> { ["DATA"] = xml }, "SettlementTransactions", ct).ConfigureAwait(false);
+        XDocument? doc;
+        using (BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.transactions"))
+        {
+            var xml = BuildSettlementTransactionsXml(settlementReference);
+            var body = await CMIHttpClient.SendFormAsync(_httpClient, _logger, "fim/api",
+                new Dictionary<string, string> { ["DATA"] = xml }, "SettlementTransactions", ct).ConfigureAwait(false);
+            doc = TryParseXml(body);
+        }
 
-        var doc = TryParseXml(body);
-        if (doc?.Root is null) return Array.Empty<SettlementTransaction>();
-
-        var list = new List<SettlementTransaction>();
+        if (doc?.Root is null) yield break;
         foreach (var t in doc.Root.Elements("Transaction"))
         {
-            list.Add(new SettlementTransaction
+            ct.ThrowIfCancellationRequested();
+            yield return new SettlementTransaction
             {
                 GatewayReference = t.Element("OrderId")?.Value ?? string.Empty,
                 Kind = MapKind(t.Element("Type")?.Value),
@@ -136,9 +140,8 @@ public sealed class CMISettlementProvider : ISettlementProvider
                 Fee = TryParseNullableDecimal(t.Element("Fee")?.Value),
                 Currency = t.Element("Currency")?.Value ?? _options.Currency,
                 CreatedAt = ParseDate(t.Element("Date")?.Value)
-            });
+            };
         }
-        return list;
     }
 
     private string BuildSettlementsReportXml(DateTime fromUtc, DateTime toUtc) =>

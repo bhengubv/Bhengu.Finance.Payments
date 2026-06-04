@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -50,23 +51,29 @@ public sealed class FawrySettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+    public async IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "list_settlements");
-        var qs = new StringBuilder("reports/settlements?pageSize=100");
-        qs.Append("&merchantCode=").Append(Uri.EscapeDataString(_options.MerchantCode));
-        qs.Append("&fromDate=").Append(Uri.EscapeDataString(fromUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)));
-        qs.Append("&toDate=").Append(Uri.EscapeDataString(toUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)));
-        qs.Append("&signature=").Append(ComputeSignature(_options.MerchantCode, fromUtc, toUtc, _options.SecurityKey));
+        List<FawrySettlementData>? items;
+        using (var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "list_settlements"))
+        {
+            var qs = new StringBuilder("reports/settlements?pageSize=100");
+            qs.Append("&merchantCode=").Append(Uri.EscapeDataString(_options.MerchantCode));
+            qs.Append("&fromDate=").Append(Uri.EscapeDataString(fromUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)));
+            qs.Append("&toDate=").Append(Uri.EscapeDataString(toUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)));
+            qs.Append("&signature=").Append(ComputeSignature(_options.MerchantCode, fromUtc, toUtc, _options.SecurityKey));
 
-        var body = await _http.SendAsync(HttpMethod.Get, qs.ToString(), null, "ListSettlements", ct).ConfigureAwait(false);
-        var resp = JsonSerializer.Deserialize<FawrySettlementListResponse>(body, FawryHttpClient.Json);
-        activity?.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+            var body = await _http.SendAsync(HttpMethod.Get, qs.ToString(), null, "ListSettlements", ct).ConfigureAwait(false);
+            var resp = JsonSerializer.Deserialize<FawrySettlementListResponse>(body, FawryHttpClient.Json);
+            activity?.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+            items = resp?.Settlements;
+        }
 
-        if (resp?.Settlements is null || resp.Settlements.Count == 0) return Array.Empty<Settlement>();
-        var result = new List<Settlement>(resp.Settlements.Count);
-        foreach (var s in resp.Settlements) result.Add(MapSettlement(s));
-        return result;
+        if (items is null) yield break;
+        foreach (var s in items)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return MapSettlement(s);
+        }
     }
 
     /// <inheritdoc />
@@ -90,20 +97,26 @@ public sealed class FawrySettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
+    public async IAsyncEnumerable<SettlementTransaction> ListTransactionsAsync(string settlementReference, [EnumeratorCancellation] CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "list_settlement_transactions");
-        var path = $"reports/settlements/{Uri.EscapeDataString(settlementReference)}/transactions" +
-                   $"?merchantCode={Uri.EscapeDataString(_options.MerchantCode)}&pageSize=100";
-        var body = await _http.SendAsync(HttpMethod.Get, path, null, "ListSettlementTransactions", ct).ConfigureAwait(false);
-        var resp = JsonSerializer.Deserialize<FawrySettlementTransactionListResponse>(body, FawryHttpClient.Json);
-        activity?.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+        List<FawrySettlementTransactionData>? items;
+        using (var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "list_settlement_transactions"))
+        {
+            var path = $"reports/settlements/{Uri.EscapeDataString(settlementReference)}/transactions" +
+                       $"?merchantCode={Uri.EscapeDataString(_options.MerchantCode)}&pageSize=100";
+            var body = await _http.SendAsync(HttpMethod.Get, path, null, "ListSettlementTransactions", ct).ConfigureAwait(false);
+            var resp = JsonSerializer.Deserialize<FawrySettlementTransactionListResponse>(body, FawryHttpClient.Json);
+            activity?.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+            items = resp?.Transactions;
+        }
 
-        if (resp?.Transactions is null || resp.Transactions.Count == 0) return Array.Empty<SettlementTransaction>();
-        var result = new List<SettlementTransaction>(resp.Transactions.Count);
-        foreach (var t in resp.Transactions) result.Add(MapTransaction(t));
-        return result;
+        if (items is null) yield break;
+        foreach (var t in items)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return MapTransaction(t);
+        }
     }
 
     private static string ComputeSignature(string merchantCode, DateTime fromUtc, DateTime toUtc, string securityKey)
