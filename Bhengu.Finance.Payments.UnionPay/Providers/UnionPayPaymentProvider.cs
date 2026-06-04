@@ -13,7 +13,6 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
-using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.UnionPay.Configuration;
 using Bhengu.Finance.Payments.UnionPay.Internals;
 using Microsoft.Extensions.Logging;
@@ -89,10 +88,8 @@ public sealed class UnionPayPaymentProvider : BhenguProviderBase, IPaymentGatewa
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        return _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, async () =>
-        {
-            using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, _options.Currency);
-            try
+        return _idempotencyCache.GetOrAddAsync(request.IdempotencyKey,
+            () => RunChargeAsync(_options.Currency, () =>
             {
                 var orderId = request.PaymentMethodToken;
                 var txnAmt = ((long)Math.Round(request.Amount * 100m, MidpointRounding.AwayFromZero)).ToString(CultureInfo.InvariantCulture);
@@ -125,12 +122,7 @@ public sealed class UnionPayPaymentProvider : BhenguProviderBase, IPaymentGatewa
 
                 Logger.LogInformation("UnionPay frontTransReq prepared: orderId={OrderId} txnAmt={TxnAmt}", orderId, txnAmt);
 
-                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Pending);
-                BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                    new KeyValuePair<string, object?>("provider", ProviderName),
-                    new KeyValuePair<string, object?>("outcome", BhenguPaymentDiagnostics.Outcomes.Pending));
-
-                return await Task.FromResult(new PaymentResponse
+                return Task.FromResult(new PaymentResponse
                 {
                     GatewayReference = orderId,
                     Status = PaymentStatus.Pending,
@@ -138,14 +130,8 @@ public sealed class UnionPayPaymentProvider : BhenguProviderBase, IPaymentGatewa
                     Currency = _options.Currency,
                     ProcessedAt = DateTime.UtcNow,
                     RedirectUrl = $"{actionUrl}?{body}"
-                }).ConfigureAwait(false);
-            }
-            catch
-            {
-                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-                throw;
-            }
-        });
+                });
+            }, ct));
     }
 
     /// <inheritdoc />
@@ -153,10 +139,8 @@ public sealed class UnionPayPaymentProvider : BhenguProviderBase, IPaymentGatewa
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        return _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, async () =>
-        {
-            using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
-            try
+        return _idempotencyCache.GetOrAddAsync(request.IdempotencyKey,
+            () => RunRefundAsync(request.GatewayReference, async () =>
             {
                 var orderId = $"RF{DateTime.UtcNow:yyyyMMddHHmmssfff}"[..Math.Min(32, 17)];
                 var txnAmt = ((long)Math.Round(request.Amount * 100m, MidpointRounding.AwayFromZero)).ToString(CultureInfo.InvariantCulture);
@@ -190,10 +174,6 @@ public sealed class UnionPayPaymentProvider : BhenguProviderBase, IPaymentGatewa
                 Logger.LogInformation("UnionPay refund response: respCode={RespCode} queryId={QueryId}", respCode, queryId);
 
                 var status = MapRespCode(respCode, refundContext: true);
-                activity.SetOutcome(status == PaymentStatus.Refunded ? BhenguPaymentDiagnostics.Outcomes.Success : BhenguPaymentDiagnostics.Outcomes.Pending);
-                BhenguPaymentDiagnostics.RefundsTotal.Add(1,
-                    new KeyValuePair<string, object?>("provider", ProviderName),
-                    new KeyValuePair<string, object?>("outcome", status == PaymentStatus.Refunded ? "success" : "pending"));
 
                 return new RefundResponse
                 {
@@ -203,13 +183,7 @@ public sealed class UnionPayPaymentProvider : BhenguProviderBase, IPaymentGatewa
                     ProcessedAt = DateTime.UtcNow,
                     Message = responseFields.GetValueOrDefault("respMsg")
                 };
-            }
-            catch
-            {
-                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-                throw;
-            }
-        });
+            }, ct));
     }
 
     /// <inheritdoc />
@@ -218,39 +192,35 @@ public sealed class UnionPayPaymentProvider : BhenguProviderBase, IPaymentGatewa
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        if (string.IsNullOrWhiteSpace(_options.VerifyCertPublicKey))
+        return RunWebhookVerify(() =>
         {
-            Logger.LogWarning("UnionPay VerifyCertPublicKey not configured — webhook signature verification cannot succeed.");
-            BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("valid", false));
-            return false;
-        }
+            if (string.IsNullOrWhiteSpace(_options.VerifyCertPublicKey))
+            {
+                Logger.LogWarning("UnionPay VerifyCertPublicKey not configured — webhook signature verification cannot succeed.");
+                return false;
+            }
 
-        try
-        {
-            // UnionPay back-notify posts URL-encoded form fields including a `signature` field.
-            // The signature is RSA-SHA256 over SHA-256(canonical_sorted_form_excluding_signature).
-            var fields = ParseFormBody(payload);
-            fields.Remove("signature");
-            var canonical = BuildCanonical(fields);
-            var digest = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));
-            var digestHex = Convert.ToHexString(digest).ToLowerInvariant();
-            var digestBytes = Encoding.UTF8.GetBytes(digestHex);
-            var sigBytes = Convert.FromBase64String(signature);
+            try
+            {
+                // UnionPay back-notify posts URL-encoded form fields including a `signature` field.
+                // The signature is RSA-SHA256 over SHA-256(canonical_sorted_form_excluding_signature).
+                var fields = ParseFormBody(payload);
+                fields.Remove("signature");
+                var canonical = BuildCanonical(fields);
+                var digest = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));
+                var digestHex = Convert.ToHexString(digest).ToLowerInvariant();
+                var digestBytes = Encoding.UTF8.GetBytes(digestHex);
+                var sigBytes = Convert.FromBase64String(signature);
 
-            using var rsa = LoadPublicKey(_options.VerifyCertPublicKey);
-            var valid = rsa.VerifyData(digestBytes, sigBytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-            BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("valid", valid));
-            return valid;
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "UnionPay webhook signature verification raised");
-            return false;
-        }
+                using var rsa = LoadPublicKey(_options.VerifyCertPublicKey);
+                return rsa.VerifyData(digestBytes, sigBytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "UnionPay webhook signature verification raised");
+                return false;
+            }
+        });
     }
 
     /// <summary>
@@ -267,107 +237,107 @@ public sealed class UnionPayPaymentProvider : BhenguProviderBase, IPaymentGatewa
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-
-        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
-        try
+        return RunOperationAsync("parse_webhook", () =>
         {
-            var fields = ParseFormBody(payload);
-            if (fields.Count == 0)
-                return Task.FromResult<WebhookEvent?>(null);
-
-            var queryId = fields.GetValueOrDefault("queryId");
-            var orderId = fields.GetValueOrDefault("orderId");
-            var reference = !string.IsNullOrEmpty(queryId) ? queryId : orderId;
-            var respCode = fields.GetValueOrDefault("respCode");
-            var respMsg = fields.GetValueOrDefault("respMsg");
-            var txnType = fields.GetValueOrDefault("txnType");
-            var txnAmt = fields.GetValueOrDefault("txnAmt");
-            var currencyCode = fields.GetValueOrDefault("currencyCode") ?? _options.Currency;
-
-            if (string.IsNullOrEmpty(reference) || string.IsNullOrEmpty(respCode))
-                return Task.FromResult<WebhookEvent?>(null);
-
-            Logger.LogInformation("Parsed UnionPay back-notify: txnType={TxnType} respCode={RespCode}", txnType, respCode);
-
-            var amount = long.TryParse(txnAmt, NumberStyles.Integer, CultureInfo.InvariantCulture, out var minor)
-                ? minor / 100m
-                : 0m;
-            var status = txnType switch
+            try
             {
-                "04" => MapRespCode(respCode, refundContext: true),
-                _ => MapRespCode(respCode)
-            };
+                var fields = ParseFormBody(payload);
+                if (fields.Count == 0)
+                    return Task.FromResult<WebhookEvent?>(null);
 
-            WebhookEvent? typed = (txnType, respCode) switch
+                var queryId = fields.GetValueOrDefault("queryId");
+                var orderId = fields.GetValueOrDefault("orderId");
+                var reference = !string.IsNullOrEmpty(queryId) ? queryId : orderId;
+                var respCode = fields.GetValueOrDefault("respCode");
+                var respMsg = fields.GetValueOrDefault("respMsg");
+                var txnType = fields.GetValueOrDefault("txnType");
+                var txnAmt = fields.GetValueOrDefault("txnAmt");
+                var currencyCode = fields.GetValueOrDefault("currencyCode") ?? _options.Currency;
+
+                if (string.IsNullOrEmpty(reference) || string.IsNullOrEmpty(respCode))
+                    return Task.FromResult<WebhookEvent?>(null);
+
+                Logger.LogInformation("Parsed UnionPay back-notify: txnType={TxnType} respCode={RespCode}", txnType, respCode);
+
+                var amount = long.TryParse(txnAmt, NumberStyles.Integer, CultureInfo.InvariantCulture, out var minor)
+                    ? minor / 100m
+                    : 0m;
+                var status = txnType switch
+                {
+                    "04" => MapRespCode(respCode, refundContext: true),
+                    _ => MapRespCode(respCode)
+                };
+
+                WebhookEvent? typed = (txnType, respCode) switch
+                {
+                    ("04", "00") => new RefundSucceededEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Refunded,
+                        EventType = txnType,
+                        Category = WebhookEventCategory.RefundSucceeded,
+                        RefundReference = reference,
+                        Amount = amount,
+                        Currency = currencyCode,
+                        IsPartial = false
+                    },
+                    ("04", _) => new RefundFailedEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Failed,
+                        EventType = txnType,
+                        Category = WebhookEventCategory.RefundFailed,
+                        Amount = amount,
+                        Currency = currencyCode,
+                        FailureCode = respCode,
+                        FailureMessage = respMsg
+                    },
+                    ("01", "00") => new ChargeSucceededEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Completed,
+                        EventType = txnType,
+                        Category = WebhookEventCategory.ChargeSucceeded,
+                        Amount = amount,
+                        Currency = currencyCode
+                    },
+                    ("01", "03" or "04" or "05") => new ChargePendingEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Pending,
+                        EventType = txnType,
+                        Category = WebhookEventCategory.ChargePending,
+                        Amount = amount,
+                        Currency = currencyCode
+                    },
+                    ("01", _) => new ChargeFailedEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Failed,
+                        EventType = txnType,
+                        Category = WebhookEventCategory.ChargeFailed,
+                        Amount = amount,
+                        Currency = currencyCode,
+                        FailureCode = respCode,
+                        FailureMessage = respMsg
+                    },
+                    _ => new WebhookEvent
+                    {
+                        GatewayReference = reference,
+                        Status = status,
+                        EventType = txnType,
+                        Category = WebhookEventCategory.Unknown
+                    }
+                };
+
+                return Task.FromResult<WebhookEvent?>(typed);
+            }
+            catch (Exception ex)
             {
-                ("04", "00") => new RefundSucceededEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Refunded,
-                    EventType = txnType,
-                    Category = WebhookEventCategory.RefundSucceeded,
-                    RefundReference = reference,
-                    Amount = amount,
-                    Currency = currencyCode,
-                    IsPartial = false
-                },
-                ("04", _) => new RefundFailedEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Failed,
-                    EventType = txnType,
-                    Category = WebhookEventCategory.RefundFailed,
-                    Amount = amount,
-                    Currency = currencyCode,
-                    FailureCode = respCode,
-                    FailureMessage = respMsg
-                },
-                ("01", "00") => new ChargeSucceededEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Completed,
-                    EventType = txnType,
-                    Category = WebhookEventCategory.ChargeSucceeded,
-                    Amount = amount,
-                    Currency = currencyCode
-                },
-                ("01", "03" or "04" or "05") => new ChargePendingEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Pending,
-                    EventType = txnType,
-                    Category = WebhookEventCategory.ChargePending,
-                    Amount = amount,
-                    Currency = currencyCode
-                },
-                ("01", _) => new ChargeFailedEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Failed,
-                    EventType = txnType,
-                    Category = WebhookEventCategory.ChargeFailed,
-                    Amount = amount,
-                    Currency = currencyCode,
-                    FailureCode = respCode,
-                    FailureMessage = respMsg
-                },
-                _ => new WebhookEvent
-                {
-                    GatewayReference = reference,
-                    Status = status,
-                    EventType = txnType,
-                    Category = WebhookEventCategory.Unknown
-                }
-            };
-
-            activity?.SetTag("payment.gateway_reference", reference);
-            return Task.FromResult<WebhookEvent?>(typed);
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Failed to parse UnionPay back-notify");
-            return Task.FromResult<WebhookEvent?>(null);
-        }
+                Logger.LogError(ex, "Failed to parse UnionPay back-notify");
+                return Task.FromResult<WebhookEvent?>(null);
+            }
+        }, ct);
     }
 
     // === Internal helpers ===

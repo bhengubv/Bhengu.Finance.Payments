@@ -64,12 +64,10 @@ public sealed class UnionPayQrCodeProvider : BhenguProviderBase, IQrCodeProvider
     }
 
     /// <inheritdoc />
-    public async Task<QrCode> GenerateQrAsync(QrCodeRequest request, CancellationToken ct = default)
+    public Task<QrCode> GenerateQrAsync(QrCodeRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "qr.generate");
-        try
+        return RunOperationAsync("generate_qr_code", async () =>
         {
             var orderId = request.MerchantReference;
             var txnAmt = ((long)Math.Round((request.Amount ?? 0m) * 100m, MidpointRounding.AwayFromZero)).ToString(CultureInfo.InvariantCulture);
@@ -108,8 +106,6 @@ public sealed class UnionPayQrCodeProvider : BhenguProviderBase, IQrCodeProvider
                     responseFields.GetValueOrDefault("respMsg") ?? $"UnionPay QR creation failed (respCode={respCode})",
                     providerErrorCode: respCode);
 
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-
             return new QrCode
             {
                 Reference = orderId,
@@ -119,25 +115,14 @@ public sealed class UnionPayQrCodeProvider : BhenguProviderBase, IQrCodeProvider
                 Currency = request.Currency.ToUpperInvariant(),
                 ExpiresAt = request.ExpiresAt
             };
-        }
-        catch (BhenguPaymentException)
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Declined);
-            throw;
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+        }, ct);
     }
 
     /// <inheritdoc />
-    public async Task<PaymentStatus> GetQrStatusAsync(string qrReference, CancellationToken ct = default)
+    public Task<PaymentStatus> GetQrStatusAsync(string qrReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(qrReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "qr.status");
-        try
+        return RunOperationAsync("get_qr_status", async () =>
         {
             var txnTime = DateTime.UtcNow.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture);
             var fields = new Dictionary<string, string>
@@ -160,15 +145,8 @@ public sealed class UnionPayQrCodeProvider : BhenguProviderBase, IQrCodeProvider
             var responseFields = await PostFormAsync(QueryPath, fields, ct, "GetQrStatus").ConfigureAwait(false);
 
             var origRespCode = responseFields.GetValueOrDefault("origRespCode", string.Empty);
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-
             return MapRespCode(origRespCode);
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+        }, ct);
     }
 
     private static PaymentStatus MapRespCode(string? respCode) => respCode switch

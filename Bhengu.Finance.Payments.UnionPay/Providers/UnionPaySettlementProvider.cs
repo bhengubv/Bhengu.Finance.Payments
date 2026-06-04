@@ -143,11 +143,10 @@ public sealed class UnionPaySettlementProvider : BhenguProviderBase, ISettlement
     }
 
     /// <inheritdoc />
-    public async Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
+    public Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(settlementReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.get");
-        try
+        return RunOperationAsync<Settlement?>("get_settlement", async () =>
         {
             // UnionPay's settlement reference is the batch number; treat it as a YYYYMMDD-derived id
             // for the trailing 8 digits (other formats fall back to today).
@@ -155,19 +154,10 @@ public sealed class UnionPaySettlementProvider : BhenguProviderBase, ISettlement
             await foreach (var s in ListSettlementsAsync(date, date, ct).ConfigureAwait(false))
             {
                 if (s.Reference.Equals(settlementReference, StringComparison.Ordinal))
-                {
-                    activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
                     return s;
-                }
             }
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             return null;
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+        }, ct);
     }
 
     /// <inheritdoc />

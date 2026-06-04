@@ -71,9 +71,7 @@ public sealed class UnionPayThreeDSecureProvider : BhenguProviderBase, IThreeDSe
     public Task<ThreeDSecureChallenge> StartAuthenticationAsync(PaymentRequest chargeIntent, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(chargeIntent);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "three_d_secure.start");
-        try
+        return RunOperationAsync("start_3ds_authentication", () =>
         {
             var orderId = chargeIntent.PaymentMethodToken;
             var txnAmt = ((long)Math.Round(chargeIntent.Amount * 100m, MidpointRounding.AwayFromZero)).ToString(CultureInfo.InvariantCulture);
@@ -108,8 +106,6 @@ public sealed class UnionPayThreeDSecureProvider : BhenguProviderBase, IThreeDSe
 
             Logger.LogInformation("UnionPay UPOP 3DS challenge prepared: orderId={OrderId}", orderId);
 
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-
             return Task.FromResult(new ThreeDSecureChallenge
             {
                 Status = ThreeDSecureStatus.ChallengeRequired,
@@ -117,21 +113,14 @@ public sealed class UnionPayThreeDSecureProvider : BhenguProviderBase, IThreeDSe
                 RedirectUrl = $"{actionUrl}?{body}",
                 ProtocolVersion = "2.2.0"
             });
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+        }, ct);
     }
 
     /// <inheritdoc />
-    public async Task<ThreeDSecureChallenge> GetChallengeAsync(string challengeReference, CancellationToken ct = default)
+    public Task<ThreeDSecureChallenge> GetChallengeAsync(string challengeReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(challengeReference);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "three_d_secure.get");
-        try
+        return RunOperationAsync("get_3ds_challenge", async () =>
         {
             var txnTime = DateTime.UtcNow.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture);
             var fields = new Dictionary<string, string>
@@ -162,8 +151,6 @@ public sealed class UnionPayThreeDSecureProvider : BhenguProviderBase, IThreeDSe
             Logger.LogInformation("UnionPay 3DS challenge query: respCode={RespCode} origRespCode={OrigRespCode} eci={Eci}",
                 respCode, origRespCode, eci);
 
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-
             var status = (respCode, origRespCode) switch
             {
                 ("00", "00") => ThreeDSecureStatus.Authenticated,
@@ -180,12 +167,7 @@ public sealed class UnionPayThreeDSecureProvider : BhenguProviderBase, IThreeDSe
                 ProtocolVersion = "2.2.0",
                 DsTransactionId = dsTransactionId
             };
-        }
-        catch
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+        }, ct);
     }
 
     private async Task<Dictionary<string, string>> PostFormAsync(string path, Dictionary<string, string> fields, CancellationToken ct, string operation)
