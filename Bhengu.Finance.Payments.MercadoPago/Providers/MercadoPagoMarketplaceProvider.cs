@@ -150,11 +150,13 @@ public sealed class MercadoPagoMarketplaceProvider : IMarketplaceProvider
     }
 
     /// <inheritdoc />
-    public Task<IReadOnlyList<SubAccount>> ListSubAccountsAsync(CancellationToken ct = default)
+#pragma warning disable CS1998 // intentionally async with no awaits — Mercado Pago has no list endpoint, but the contract demands IAsyncEnumerable.
+    public async IAsyncEnumerable<SubAccount> ListSubAccountsAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         _logger.LogDebug("Mercado Pago does not expose a marketplace account-list endpoint; callers mirror their roster client-side");
-        return Task.FromResult<IReadOnlyList<SubAccount>>(Array.Empty<SubAccount>());
+        yield break;
     }
+#pragma warning restore CS1998
 
     /// <inheritdoc />
     public Task<SplitDefinition> CreateSplitAsync(SplitDefinitionRequest request, CancellationToken ct = default)

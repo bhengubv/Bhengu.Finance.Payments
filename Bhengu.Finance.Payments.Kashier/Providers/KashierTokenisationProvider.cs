@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
@@ -24,7 +25,6 @@ public sealed class KashierTokenisationProvider : ITokenisationProvider
     private readonly HttpClient _httpClient;
     private readonly KashierOptions _options;
     private readonly ILogger<KashierTokenisationProvider> _logger;
-    private readonly KashierIdempotencyCache _idempotency;
 
     /// <inheritdoc/>
     public string ProviderName => ProviderNames.Kashier;
@@ -33,7 +33,139 @@ public sealed class KashierTokenisationProvider : ITokenisationProvider
     public KashierTokenisationProvider(
         HttpClient httpClient,
         IOptions<KashierOptions> options,
-        ILogger<KashierTokenisationProvider> logger,
+        ILogger<KashierTokenisationProvider> logger)
+    {
+        _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
+        _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
+        if (string.IsNullOrWhiteSpace(_options.ApiKey))
+            throw new ProviderConfigurationException(ProviderName, $"{nameof(KashierOptions.ApiKey)} is required");
+        if (string.IsNullOrWhiteSpace(_options.MerchantId))
+            throw new ProviderConfigurationException(ProviderName, $"{nameof(KashierOptions.MerchantId)} is required");
+
+        KashierHttpClient.ConfigureClient(_httpClient, _options);
+    }
+
+    /// <inheritdoc/>
+    public async Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(token);
+        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise.get");
+        try
+        {
+            var responseBody = await KashierHttpClient.SendAsync(
+                _httpClient, _logger, HttpMethod.Get, $"cards/{Uri.EscapeDataString(token)}", null, "GetPaymentMethod", ct).ConfigureAwait(false);
+            var card = JsonSerializer.Deserialize<KashierCardResponse>(responseBody, KashierHttpClient.Json)?.Response;
+            return card is null || string.IsNullOrEmpty(card.CardToken) ? null : Map(card, null);
+        }
+        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+        {
+            return null;
+        }
+    }
+
+    /// <inheritdoc/>
+    public async IAsyncEnumerable<PaymentMethod> ListPaymentMethodsAsync(string customerId, [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(customerId);
+        List<KashierCardData>? items;
+        using (BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise.list"))
+        {
+            var responseBody = await KashierHttpClient.SendAsync(
+                _httpClient, _logger, HttpMethod.Get, $"cards?shopperReference={Uri.EscapeDataString(customerId)}", null, "ListPaymentMethods", ct).ConfigureAwait(false);
+            var response = JsonSerializer.Deserialize<KashierCardListResponse>(responseBody, KashierHttpClient.Json);
+            items = response?.Response;
+        }
+
+        if (items is null) yield break;
+        foreach (var c in items)
+        {
+            if (string.IsNullOrEmpty(c.CardToken)) continue;
+            ct.ThrowIfCancellationRequested();
+            yield return Map(c, null);
+        }
+    }
+
+    /// <inheritdoc/>
+    public async Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(token);
+        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise.delete");
+        try
+        {
+            await KashierHttpClient.SendAsync(
+                _httpClient, _logger, HttpMethod.Delete, $"cards/{Uri.EscapeDataString(token)}", null, "DeletePaymentMethod", ct).ConfigureAwait(false);
+            return true;
+        }
+        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+        {
+            return false;
+        }
+    }
+
+    internal static PaymentMethod Map(KashierCardData card, TokeniseRequest? request) => new()
+    {
+        Token = card.CardToken ?? string.Empty,
+        CustomerId = card.ShopperReference ?? request?.CustomerId,
+        Kind = PaymentMethodKind.Card,
+        Brand = card.Brand,
+        Last4 = card.Last4 ?? LastFour(card.MaskedPan),
+        ExpiryMonth = int.TryParse(card.ExpiryMonth, NumberStyles.Integer, CultureInfo.InvariantCulture, out var em) ? em : request?.Card.ExpiryMonth,
+        ExpiryYear = int.TryParse(card.ExpiryYear, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ey) ? ey : request?.Card.ExpiryYear,
+        DisplayName = card.DisplayName ?? request?.DisplayName,
+        IsDefault = card.IsDefault ?? request?.SetAsDefault ?? false,
+        CreatedAt = card.CreatedAt ?? DateTime.UtcNow
+    };
+
+    private static string? LastFour(string? value) => value is { Length: >= 4 } v ? v[^4..] : value;
+
+    internal sealed class KashierCardResponse
+    {
+        [JsonPropertyName("status")] public string? Status { get; set; }
+        [JsonPropertyName("response")] public KashierCardData? Response { get; set; }
+    }
+
+    internal sealed class KashierCardListResponse
+    {
+        [JsonPropertyName("status")] public string? Status { get; set; }
+        [JsonPropertyName("response")] public List<KashierCardData>? Response { get; set; }
+    }
+
+    internal sealed class KashierCardData
+    {
+        [JsonPropertyName("cardToken")] public string? CardToken { get; set; }
+        [JsonPropertyName("shopperReference")] public string? ShopperReference { get; set; }
+        [JsonPropertyName("brand")] public string? Brand { get; set; }
+        [JsonPropertyName("last4")] public string? Last4 { get; set; }
+        [JsonPropertyName("maskedPan")] public string? MaskedPan { get; set; }
+        [JsonPropertyName("expiryMonth")] public string? ExpiryMonth { get; set; }
+        [JsonPropertyName("expiryYear")] public string? ExpiryYear { get; set; }
+        [JsonPropertyName("displayName")] public string? DisplayName { get; set; }
+        [JsonPropertyName("isDefault")] public bool? IsDefault { get; set; }
+        [JsonPropertyName("createdAt")] public DateTime? CreatedAt { get; set; }
+    }
+}
+
+/// <summary>
+/// PCI-DSS SAQ-D-scope Kashier tokenisation. Sends raw PAN to Kashier's <c>/cards</c> endpoint to
+/// vault the card against a shopper. Prefer Kashier hosted checkout on the client where possible.
+/// </summary>
+public sealed class KashierRawCardTokenisationProvider : IRawCardTokenisationProvider
+{
+    private readonly HttpClient _httpClient;
+    private readonly KashierOptions _options;
+    private readonly ILogger<KashierRawCardTokenisationProvider> _logger;
+    private readonly KashierIdempotencyCache _idempotency;
+
+    /// <inheritdoc/>
+    public string ProviderName => ProviderNames.Kashier;
+
+    /// <summary>Construct a raw-card tokenisation provider. Designed to be registered via DI.</summary>
+    public KashierRawCardTokenisationProvider(
+        HttpClient httpClient,
+        IOptions<KashierOptions> options,
+        ILogger<KashierRawCardTokenisationProvider> logger,
         KashierIdempotencyCache idempotency)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
@@ -75,7 +207,7 @@ public sealed class KashierTokenisationProvider : ITokenisationProvider
 
         var responseBody = await KashierHttpClient.SendAsync(
             _httpClient, _logger, HttpMethod.Post, "cards", body, "Tokenise", ct, request.IdempotencyKey).ConfigureAwait(false);
-        var response = JsonSerializer.Deserialize<KashierCardResponse>(responseBody, KashierHttpClient.Json)?.Response
+        var response = JsonSerializer.Deserialize<KashierTokenisationProvider.KashierCardResponse>(responseBody, KashierHttpClient.Json)?.Response
             ?? throw new BhenguPaymentException(ProviderName, "Kashier tokenisation returned no payload", "no_data");
 
         if (string.IsNullOrWhiteSpace(response.CardToken))
@@ -85,102 +217,6 @@ public sealed class KashierTokenisationProvider : ITokenisationProvider
         _logger.LogInformation("Kashier tokenised card for shopper {Shopper} → token={Token}",
             request.CustomerId, response.CardToken);
 
-        return Map(response, request);
-    }
-
-    /// <inheritdoc/>
-    public async Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(token);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise.get");
-        try
-        {
-            var responseBody = await KashierHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get, $"cards/{Uri.EscapeDataString(token)}", null, "GetPaymentMethod", ct).ConfigureAwait(false);
-            var card = JsonSerializer.Deserialize<KashierCardResponse>(responseBody, KashierHttpClient.Json)?.Response;
-            return card is null || string.IsNullOrEmpty(card.CardToken) ? null : Map(card, null);
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            return null;
-        }
-    }
-
-    /// <inheritdoc/>
-    public async Task<IReadOnlyList<PaymentMethod>> ListPaymentMethodsAsync(string customerId, CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(customerId);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise.list");
-        var responseBody = await KashierHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Get, $"cards?shopperReference={Uri.EscapeDataString(customerId)}", null, "ListPaymentMethods", ct).ConfigureAwait(false);
-        var response = JsonSerializer.Deserialize<KashierCardListResponse>(responseBody, KashierHttpClient.Json);
-        if (response?.Response is null) return Array.Empty<PaymentMethod>();
-
-        var list = new List<PaymentMethod>(response.Response.Count);
-        foreach (var c in response.Response)
-        {
-            if (string.IsNullOrEmpty(c.CardToken)) continue;
-            list.Add(Map(c, null));
-        }
-        return list;
-    }
-
-    /// <inheritdoc/>
-    public async Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(token);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise.delete");
-        try
-        {
-            await KashierHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Delete, $"cards/{Uri.EscapeDataString(token)}", null, "DeletePaymentMethod", ct).ConfigureAwait(false);
-            return true;
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            return false;
-        }
-    }
-
-    private static PaymentMethod Map(KashierCardData card, TokeniseRequest? request) => new()
-    {
-        Token = card.CardToken ?? string.Empty,
-        CustomerId = card.ShopperReference ?? request?.CustomerId,
-        Kind = PaymentMethodKind.Card,
-        Brand = card.Brand,
-        Last4 = card.Last4 ?? LastFour(card.MaskedPan),
-        ExpiryMonth = int.TryParse(card.ExpiryMonth, NumberStyles.Integer, CultureInfo.InvariantCulture, out var em) ? em : request?.Card.ExpiryMonth,
-        ExpiryYear = int.TryParse(card.ExpiryYear, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ey) ? ey : request?.Card.ExpiryYear,
-        DisplayName = card.DisplayName ?? request?.DisplayName,
-        IsDefault = card.IsDefault ?? request?.SetAsDefault ?? false,
-        CreatedAt = card.CreatedAt ?? DateTime.UtcNow
-    };
-
-    private static string? LastFour(string? value) => value is { Length: >= 4 } v ? v[^4..] : value;
-
-    private sealed class KashierCardResponse
-    {
-        [JsonPropertyName("status")] public string? Status { get; set; }
-        [JsonPropertyName("response")] public KashierCardData? Response { get; set; }
-    }
-
-    private sealed class KashierCardListResponse
-    {
-        [JsonPropertyName("status")] public string? Status { get; set; }
-        [JsonPropertyName("response")] public List<KashierCardData>? Response { get; set; }
-    }
-
-    private sealed class KashierCardData
-    {
-        [JsonPropertyName("cardToken")] public string? CardToken { get; set; }
-        [JsonPropertyName("shopperReference")] public string? ShopperReference { get; set; }
-        [JsonPropertyName("brand")] public string? Brand { get; set; }
-        [JsonPropertyName("last4")] public string? Last4 { get; set; }
-        [JsonPropertyName("maskedPan")] public string? MaskedPan { get; set; }
-        [JsonPropertyName("expiryMonth")] public string? ExpiryMonth { get; set; }
-        [JsonPropertyName("expiryYear")] public string? ExpiryYear { get; set; }
-        [JsonPropertyName("displayName")] public string? DisplayName { get; set; }
-        [JsonPropertyName("isDefault")] public bool? IsDefault { get; set; }
-        [JsonPropertyName("createdAt")] public DateTime? CreatedAt { get; set; }
+        return KashierTokenisationProvider.Map(response, request);
     }
 }

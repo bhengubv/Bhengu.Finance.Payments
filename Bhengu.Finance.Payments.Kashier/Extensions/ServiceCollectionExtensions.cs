@@ -42,6 +42,7 @@ public static class ServiceCollectionExtensions
 
         services.AddHttpClient<KashierPaymentProvider>();
         services.AddHttpClient<KashierTokenisationProvider>();
+        services.AddHttpClient<KashierRawCardTokenisationProvider>();
         services.AddHttpClient<KashierThreeDSecureProvider>();
 
         services.AddTransient<IPaymentGatewayProvider, KashierPaymentProvider>(sp =>
@@ -50,6 +51,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<KashierPaymentProvider>());
         services.AddTransient<ITokenisationProvider, KashierTokenisationProvider>(sp =>
             sp.GetRequiredService<KashierTokenisationProvider>());
+        services.AddTransient<IRawCardTokenisationProvider, KashierRawCardTokenisationProvider>(sp =>
+            sp.GetRequiredService<KashierRawCardTokenisationProvider>());
         services.AddTransient<IThreeDSecureProvider, KashierThreeDSecureProvider>(sp =>
             sp.GetRequiredService<KashierThreeDSecureProvider>());
 
@@ -59,6 +62,8 @@ public static class ServiceCollectionExtensions
             (sp, _) => sp.GetRequiredService<KashierPaymentProvider>());
         services.AddKeyedTransient<ITokenisationProvider>(ProviderNames.Kashier,
             (sp, _) => sp.GetRequiredService<KashierTokenisationProvider>());
+        services.AddKeyedTransient<IRawCardTokenisationProvider>(ProviderNames.Kashier,
+            (sp, _) => sp.GetRequiredService<KashierRawCardTokenisationProvider>());
         services.AddKeyedTransient<IThreeDSecureProvider>(ProviderNames.Kashier,
             (sp, _) => sp.GetRequiredService<KashierThreeDSecureProvider>());
 

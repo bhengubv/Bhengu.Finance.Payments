@@ -51,8 +51,11 @@ public static class ServiceCollectionExtensions
 
         // Server-side card tokenisation (SAQ-D).
         services.AddHttpClient<MercadoPagoTokenisationProvider>();
+        services.AddHttpClient<MercadoPagoRawCardTokenisationProvider>();
         services.AddTransient<ITokenisationProvider, MercadoPagoTokenisationProvider>(sp => sp.GetRequiredService<MercadoPagoTokenisationProvider>());
+        services.AddTransient<IRawCardTokenisationProvider, MercadoPagoRawCardTokenisationProvider>(sp => sp.GetRequiredService<MercadoPagoRawCardTokenisationProvider>());
         services.AddKeyedTransient<ITokenisationProvider>(ProviderNames.MercadoPago, (sp, _) => sp.GetRequiredService<MercadoPagoTokenisationProvider>());
+        services.AddKeyedTransient<IRawCardTokenisationProvider>(ProviderNames.MercadoPago, (sp, _) => sp.GetRequiredService<MercadoPagoRawCardTokenisationProvider>());
 
         // Marketplace (collector_id + application_fee splits).
         services.AddHttpClient<MercadoPagoMarketplaceProvider>();

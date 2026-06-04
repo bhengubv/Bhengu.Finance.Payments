@@ -51,8 +51,11 @@ public static class ServiceCollectionExtensions
 
         // Server-side card tokenisation (SAQ-D).
         services.AddHttpClient<PagSeguroTokenisationProvider>();
+        services.AddHttpClient<PagSeguroRawCardTokenisationProvider>();
         services.AddTransient<ITokenisationProvider, PagSeguroTokenisationProvider>(sp => sp.GetRequiredService<PagSeguroTokenisationProvider>());
+        services.AddTransient<IRawCardTokenisationProvider, PagSeguroRawCardTokenisationProvider>(sp => sp.GetRequiredService<PagSeguroRawCardTokenisationProvider>());
         services.AddKeyedTransient<ITokenisationProvider>(ProviderNames.PagSeguro, (sp, _) => sp.GetRequiredService<PagSeguroTokenisationProvider>());
+        services.AddKeyedTransient<IRawCardTokenisationProvider>(ProviderNames.PagSeguro, (sp, _) => sp.GetRequiredService<PagSeguroRawCardTokenisationProvider>());
 
         services.AddBhenguPaymentStartupValidation();
 
