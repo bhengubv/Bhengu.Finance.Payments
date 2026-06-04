@@ -10,6 +10,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Core.Observability;
@@ -26,17 +27,16 @@ namespace Bhengu.Finance.Payments.Ozow.Providers;
 /// is intentionally not implemented; merchants requiring disbursements should use Ozow's
 /// separate Disbursement API.
 /// </summary>
-public sealed class OzowPaymentProvider : IPaymentGatewayProvider
+public sealed class OzowPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider
 {
     private static readonly JsonSerializerOptions DeserializeOptions = new() { PropertyNameCaseInsensitive = true };
 
     private readonly HttpClient _httpClient;
     private readonly OzowOptions _options;
-    private readonly ILogger<OzowPaymentProvider> _logger;
     private readonly OzowIdempotencyCache _idempotency;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Ozow;
+    public override string ProviderName => ProviderNames.Ozow;
 
     /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
@@ -55,10 +55,10 @@ public sealed class OzowPaymentProvider : IPaymentGatewayProvider
         IOptions<OzowOptions> options,
         ILogger<OzowPaymentProvider> logger,
         OzowIdempotencyCache idempotency)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotency = idempotency ?? throw new ArgumentNullException(nameof(idempotency));
 
         if (string.IsNullOrWhiteSpace(_options.SiteCode))
@@ -124,14 +124,14 @@ public sealed class OzowPaymentProvider : IPaymentGatewayProvider
         };
 
         if (!string.IsNullOrEmpty(request.PaymentMethodToken))
-            _logger.LogDebug("Ozow ProcessPayment called with PaymentMethodToken={Token} (not used by redirect flow)", request.PaymentMethodToken);
+            Logger.LogDebug("Ozow ProcessPayment called with PaymentMethodToken={Token} (not used by redirect flow)", request.PaymentMethodToken);
 
         try
         {
             var body = await SendAsync(HttpMethod.Post, "postpaymentrequest", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
             var ozowResponse = JsonSerializer.Deserialize<OzowPaymentApiResponse>(body, DeserializeOptions);
 
-            _logger.LogInformation("Ozow payment request created: {TransactionId} status={Status}",
+            Logger.LogInformation("Ozow payment request created: {TransactionId} status={Status}",
                 ozowResponse?.TransactionId, ozowResponse?.Status);
 
             var status = MapStatus(ozowResponse?.Status ?? "pending");
@@ -185,7 +185,7 @@ public sealed class OzowPaymentProvider : IPaymentGatewayProvider
         var body = await SendAsync(HttpMethod.Post, "refund", requestBody, ct, "ProcessRefund").ConfigureAwait(false);
         var refundResponse = JsonSerializer.Deserialize<OzowRefundResponse>(body, DeserializeOptions);
 
-        _logger.LogInformation("Ozow refund created: {RefundId} for transaction {TransactionId}",
+        Logger.LogInformation("Ozow refund created: {RefundId} for transaction {TransactionId}",
             refundResponse?.RefundId, request.GatewayReference);
 
         var status = MapStatus(refundResponse?.Status ?? "pending");
@@ -212,7 +212,7 @@ public sealed class OzowPaymentProvider : IPaymentGatewayProvider
         bool valid;
         if (string.IsNullOrWhiteSpace(_options.PrivateKey))
         {
-            _logger.LogWarning("Ozow PrivateKey not configured — signature verification cannot succeed.");
+            Logger.LogWarning("Ozow PrivateKey not configured — signature verification cannot succeed.");
             valid = false;
         }
         else
@@ -228,7 +228,7 @@ public sealed class OzowPaymentProvider : IPaymentGatewayProvider
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Ozow webhook signature verification raised");
+                Logger.LogError(ex, "Ozow webhook signature verification raised");
                 valid = false;
             }
         }
@@ -250,7 +250,7 @@ public sealed class OzowPaymentProvider : IPaymentGatewayProvider
             var webhookEvent = JsonSerializer.Deserialize<OzowWebhookNotification>(payload, DeserializeOptions);
             if (webhookEvent is null) return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed Ozow webhook event: TransactionId={TransactionId} status={Status}",
+            Logger.LogInformation("Parsed Ozow webhook event: TransactionId={TransactionId} status={Status}",
                 webhookEvent.TransactionId, webhookEvent.Status);
 
             var reference = !string.IsNullOrEmpty(webhookEvent.TransactionReference)
@@ -316,7 +316,7 @@ public sealed class OzowPaymentProvider : IPaymentGatewayProvider
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse Ozow webhook event");
+            Logger.LogError(ex, "Failed to parse Ozow webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -353,7 +353,7 @@ public sealed class OzowPaymentProvider : IPaymentGatewayProvider
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Ozow {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Ozow {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

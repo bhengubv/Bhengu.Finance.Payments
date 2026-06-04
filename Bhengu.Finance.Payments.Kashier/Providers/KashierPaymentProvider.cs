@@ -9,6 +9,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Core.Observability;
@@ -29,15 +30,14 @@ namespace Bhengu.Finance.Payments.Kashier.Providers;
 /// auto-sets that flag based on the metadata switch <c>request_3d_secure</c>; the explicit
 /// step-up flow is in <see cref="KashierThreeDSecureProvider"/>.
 /// </remarks>
-public sealed class KashierPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class KashierPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly KashierOptions _options;
-    private readonly ILogger<KashierPaymentProvider> _logger;
     private readonly KashierIdempotencyCache _idempotency;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Kashier;
+    public override string ProviderName => ProviderNames.Kashier;
 
     /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
@@ -59,10 +59,10 @@ public sealed class KashierPaymentProvider : IPaymentGatewayProvider, IPayoutPro
         IOptions<KashierOptions> options,
         ILogger<KashierPaymentProvider> logger,
         KashierIdempotencyCache idempotency)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotency = idempotency ?? throw new ArgumentNullException(nameof(idempotency));
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
@@ -104,11 +104,11 @@ public sealed class KashierPaymentProvider : IPaymentGatewayProvider, IPayoutPro
         try
         {
             var body = await KashierHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Post, $"orders/{Uri.EscapeDataString(orderId)}/payments",
+                _httpClient, Logger, HttpMethod.Post, $"orders/{Uri.EscapeDataString(orderId)}/payments",
                 requestBody, "ProcessPayment", ct, request.IdempotencyKey).ConfigureAwait(false);
             var kashierResponse = JsonSerializer.Deserialize<KashierPaymentResponse>(body, KashierHttpClient.Json);
 
-            _logger.LogInformation("Kashier charge created: order={OrderId} tx={Tx} status={Status}",
+            Logger.LogInformation("Kashier charge created: order={OrderId} tx={Tx} status={Status}",
                 orderId, kashierResponse?.Response?.TransactionId, kashierResponse?.Response?.Status);
 
             var txId = kashierResponse?.Response?.TransactionId ?? orderId;
@@ -171,10 +171,10 @@ public sealed class KashierPaymentProvider : IPaymentGatewayProvider, IPayoutPro
         };
 
         var body = await KashierHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, "payments/refund", requestBody, "ProcessRefund", ct, request.IdempotencyKey).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Post, "payments/refund", requestBody, "ProcessRefund", ct, request.IdempotencyKey).ConfigureAwait(false);
         var refundResponse = JsonSerializer.Deserialize<KashierPaymentResponse>(body, KashierHttpClient.Json);
 
-        _logger.LogInformation("Kashier refund created: tx={Tx} status={Status}",
+        Logger.LogInformation("Kashier refund created: tx={Tx} status={Status}",
             request.GatewayReference, refundResponse?.Response?.Status);
 
         var mapped = MapStatus(refundResponse?.Response?.Status);
@@ -214,10 +214,10 @@ public sealed class KashierPaymentProvider : IPaymentGatewayProvider, IPayoutPro
         };
 
         var body = await KashierHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, "payouts", requestBody, "ProcessPayout", ct, request.IdempotencyKey).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Post, "payouts", requestBody, "ProcessPayout", ct, request.IdempotencyKey).ConfigureAwait(false);
         var payoutResponse = JsonSerializer.Deserialize<KashierPaymentResponse>(body, KashierHttpClient.Json);
 
-        _logger.LogInformation("Kashier payout created: id={Id} status={Status}",
+        Logger.LogInformation("Kashier payout created: id={Id} status={Status}",
             payoutResponse?.Response?.TransactionId, payoutResponse?.Response?.Status);
 
         var status = MapStatus(payoutResponse?.Response?.Status);
@@ -245,7 +245,7 @@ public sealed class KashierPaymentProvider : IPaymentGatewayProvider, IPayoutPro
         bool valid;
         if (string.IsNullOrWhiteSpace(secret))
         {
-            _logger.LogWarning("Kashier webhook secret not configured — signature verification cannot succeed.");
+            Logger.LogWarning("Kashier webhook secret not configured — signature verification cannot succeed.");
             valid = false;
         }
         else
@@ -262,7 +262,7 @@ public sealed class KashierPaymentProvider : IPaymentGatewayProvider, IPayoutPro
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Kashier webhook signature verification raised");
+                Logger.LogError(ex, "Kashier webhook signature verification raised");
                 valid = false;
             }
         }
@@ -284,7 +284,7 @@ public sealed class KashierPaymentProvider : IPaymentGatewayProvider, IPayoutPro
             var webhook = JsonSerializer.Deserialize<KashierWebhookEvent>(payload, KashierHttpClient.Json);
             if (webhook is null) return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed Kashier webhook: event={Event} status={Status}",
+            Logger.LogInformation("Parsed Kashier webhook: event={Event} status={Status}",
                 webhook.Event, webhook.Data?.Status);
 
             var data = webhook.Data;
@@ -375,7 +375,7 @@ public sealed class KashierPaymentProvider : IPaymentGatewayProvider, IPayoutPro
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse Kashier webhook");
+            Logger.LogError(ex, "Failed to parse Kashier webhook");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }

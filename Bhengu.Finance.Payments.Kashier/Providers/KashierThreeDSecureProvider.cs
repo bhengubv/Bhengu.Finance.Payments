@@ -6,6 +6,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.ThreeDSecure;
 using Bhengu.Finance.Payments.Core.Observability;
@@ -21,24 +22,23 @@ namespace Bhengu.Finance.Payments.Kashier.Providers;
 /// <c>/orders/{id}/payments</c> with the <c>3ds=true</c> flag — the response carries either
 /// an ACSURL (challenge required) or a CAVV (frictionless) depending on issuer policy.
 /// </summary>
-public sealed class KashierThreeDSecureProvider : IThreeDSecureProvider
+public sealed class KashierThreeDSecureProvider : BhenguProviderBase, IThreeDSecureProvider
 {
     private readonly HttpClient _httpClient;
     private readonly KashierOptions _options;
-    private readonly ILogger<KashierThreeDSecureProvider> _logger;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Kashier;
+    public override string ProviderName => ProviderNames.Kashier;
 
     /// <summary>Construct the provider. Designed to be registered via DI.</summary>
     public KashierThreeDSecureProvider(
         HttpClient httpClient,
         IOptions<KashierOptions> options,
         ILogger<KashierThreeDSecureProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(KashierOptions.ApiKey)} is required");
@@ -79,7 +79,7 @@ public sealed class KashierThreeDSecureProvider : IThreeDSecureProvider
         };
 
         var responseBody = await KashierHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, $"orders/{Uri.EscapeDataString(orderId)}/payments",
+            _httpClient, Logger, HttpMethod.Post, $"orders/{Uri.EscapeDataString(orderId)}/payments",
             requestBody, "Start3DS", ct, chargeIntent.IdempotencyKey).ConfigureAwait(false);
 
         var response = JsonSerializer.Deserialize<KashierThreeDsResponse>(responseBody, KashierHttpClient.Json)?.Response
@@ -95,7 +95,7 @@ public sealed class KashierThreeDSecureProvider : IThreeDSecureProvider
             _ => ThreeDSecureStatus.Attempted
         };
 
-        _logger.LogInformation("Kashier 3DS challenge: status={Status} acsUrl={HasAcs}", status, !string.IsNullOrEmpty(response.AcsUrl));
+        Logger.LogInformation("Kashier 3DS challenge: status={Status} acsUrl={HasAcs}", status, !string.IsNullOrEmpty(response.AcsUrl));
 
         return new ThreeDSecureChallenge
         {
@@ -117,7 +117,7 @@ public sealed class KashierThreeDSecureProvider : IThreeDSecureProvider
         try
         {
             var responseBody = await KashierHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get, $"payments/{Uri.EscapeDataString(challengeReference)}", null, "Get3DS", ct).ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Get, $"payments/{Uri.EscapeDataString(challengeReference)}", null, "Get3DS", ct).ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<KashierThreeDsResponse>(responseBody, KashierHttpClient.Json)?.Response;
             if (response is null)
                 return new ThreeDSecureChallenge { Status = ThreeDSecureStatus.ChallengeRequired, ChallengeReference = challengeReference };

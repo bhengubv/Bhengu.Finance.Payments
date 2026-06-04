@@ -7,6 +7,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models.Vault;
 using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Kashier.Configuration;
@@ -20,24 +21,23 @@ namespace Bhengu.Finance.Payments.Kashier.Providers;
 /// Kashier implementation of <see cref="ITokenisationProvider"/> backed by Kashier's Card-Token
 /// endpoint (<c>/cards</c>) for vaulting cards against a shopper.
 /// </summary>
-public sealed class KashierTokenisationProvider : ITokenisationProvider
+public sealed class KashierTokenisationProvider : BhenguProviderBase, ITokenisationProvider
 {
     private readonly HttpClient _httpClient;
     private readonly KashierOptions _options;
-    private readonly ILogger<KashierTokenisationProvider> _logger;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Kashier;
+    public override string ProviderName => ProviderNames.Kashier;
 
     /// <summary>Construct a tokenisation provider. Designed to be registered via DI.</summary>
     public KashierTokenisationProvider(
         HttpClient httpClient,
         IOptions<KashierOptions> options,
         ILogger<KashierTokenisationProvider> logger)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(KashierOptions.ApiKey)} is required");
@@ -55,7 +55,7 @@ public sealed class KashierTokenisationProvider : ITokenisationProvider
         try
         {
             var responseBody = await KashierHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get, $"cards/{Uri.EscapeDataString(token)}", null, "GetPaymentMethod", ct).ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Get, $"cards/{Uri.EscapeDataString(token)}", null, "GetPaymentMethod", ct).ConfigureAwait(false);
             var card = JsonSerializer.Deserialize<KashierCardResponse>(responseBody, KashierHttpClient.Json)?.Response;
             return card is null || string.IsNullOrEmpty(card.CardToken) ? null : Map(card, null);
         }
@@ -73,7 +73,7 @@ public sealed class KashierTokenisationProvider : ITokenisationProvider
         using (BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise.list"))
         {
             var responseBody = await KashierHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Get, $"cards?shopperReference={Uri.EscapeDataString(customerId)}", null, "ListPaymentMethods", ct).ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Get, $"cards?shopperReference={Uri.EscapeDataString(customerId)}", null, "ListPaymentMethods", ct).ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<KashierCardListResponse>(responseBody, KashierHttpClient.Json);
             items = response?.Response;
         }
@@ -95,7 +95,7 @@ public sealed class KashierTokenisationProvider : ITokenisationProvider
         try
         {
             await KashierHttpClient.SendAsync(
-                _httpClient, _logger, HttpMethod.Delete, $"cards/{Uri.EscapeDataString(token)}", null, "DeletePaymentMethod", ct).ConfigureAwait(false);
+                _httpClient, Logger, HttpMethod.Delete, $"cards/{Uri.EscapeDataString(token)}", null, "DeletePaymentMethod", ct).ConfigureAwait(false);
             return true;
         }
         catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
@@ -151,15 +151,14 @@ public sealed class KashierTokenisationProvider : ITokenisationProvider
 /// PCI-DSS SAQ-D-scope Kashier tokenisation. Sends raw PAN to Kashier's <c>/cards</c> endpoint to
 /// vault the card against a shopper. Prefer Kashier hosted checkout on the client where possible.
 /// </summary>
-public sealed class KashierRawCardTokenisationProvider : IRawCardTokenisationProvider
+public sealed class KashierRawCardTokenisationProvider : BhenguProviderBase, IRawCardTokenisationProvider
 {
     private readonly HttpClient _httpClient;
     private readonly KashierOptions _options;
-    private readonly ILogger<KashierRawCardTokenisationProvider> _logger;
     private readonly KashierIdempotencyCache _idempotency;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Kashier;
+    public override string ProviderName => ProviderNames.Kashier;
 
     /// <summary>Construct a raw-card tokenisation provider. Designed to be registered via DI.</summary>
     public KashierRawCardTokenisationProvider(
@@ -167,10 +166,10 @@ public sealed class KashierRawCardTokenisationProvider : IRawCardTokenisationPro
         IOptions<KashierOptions> options,
         ILogger<KashierRawCardTokenisationProvider> logger,
         KashierIdempotencyCache idempotency)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotency = idempotency ?? throw new ArgumentNullException(nameof(idempotency));
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
@@ -206,7 +205,7 @@ public sealed class KashierRawCardTokenisationProvider : IRawCardTokenisationPro
         };
 
         var responseBody = await KashierHttpClient.SendAsync(
-            _httpClient, _logger, HttpMethod.Post, "cards", body, "Tokenise", ct, request.IdempotencyKey).ConfigureAwait(false);
+            _httpClient, Logger, HttpMethod.Post, "cards", body, "Tokenise", ct, request.IdempotencyKey).ConfigureAwait(false);
         var response = JsonSerializer.Deserialize<KashierTokenisationProvider.KashierCardResponse>(responseBody, KashierHttpClient.Json)?.Response
             ?? throw new BhenguPaymentException(ProviderName, "Kashier tokenisation returned no payload", "no_data");
 
@@ -214,7 +213,7 @@ public sealed class KashierRawCardTokenisationProvider : IRawCardTokenisationPro
             throw new PaymentDeclinedException(ProviderName, "no_card_token",
                 "Kashier did not return a card_token — card may have been declined.");
 
-        _logger.LogInformation("Kashier tokenised card for shopper {Shopper} → token={Token}",
+        Logger.LogInformation("Kashier tokenised card for shopper {Shopper} → token={Token}",
             request.CustomerId, response.CardToken);
 
         return KashierTokenisationProvider.Map(response, request);

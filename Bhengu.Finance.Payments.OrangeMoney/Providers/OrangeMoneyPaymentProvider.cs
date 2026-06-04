@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Core.Observability;
@@ -39,11 +40,10 @@ namespace Bhengu.Finance.Payments.OrangeMoney.Providers;
 /// signature against the cached notif_token; callers must persist that token alongside their order record.
 /// </para>
 /// </summary>
-public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class OrangeMoneyPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly OrangeMoneyOptions _options;
-    private readonly ILogger<OrangeMoneyPaymentProvider> _logger;
     private readonly IBhenguDistributedCache? _idempotencyCache;
     private readonly string _baseUrl;
 
@@ -52,7 +52,7 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.OrangeMoney;
+    public override string ProviderName => ProviderNames.OrangeMoney;
 
     /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
@@ -70,10 +70,10 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
         IOptions<OrangeMoneyOptions> options,
         ILogger<OrangeMoneyPaymentProvider> logger,
         IBhenguDistributedCache? idempotencyCache = null)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotencyCache = idempotencyCache;
 
         if (string.IsNullOrWhiteSpace(_options.ConsumerKey))
@@ -133,7 +133,7 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
 
             var wp = JsonSerializer.Deserialize<OrangeWebPaymentResponse>(responseBody);
 
-            _logger.LogInformation(
+            Logger.LogInformation(
                 "Orange Money web payment created: OrderId={OrderId} PayToken={PayToken} Status={Status}",
                 orderId, wp?.PayToken, wp?.Status);
 
@@ -230,7 +230,7 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
 
             var b2c = JsonSerializer.Deserialize<OrangeB2cResponse>(responseBody);
 
-            _logger.LogInformation(
+            Logger.LogInformation(
                 "Orange Money B2C cashin created: OrderId={OrderId} TxnId={TxnId} Status={Status}",
                 orderId, b2c?.TxnId, b2c?.Status);
 
@@ -286,7 +286,7 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
             var notifToken = evt?.NotifToken;
             if (string.IsNullOrEmpty(notifToken))
             {
-                _logger.LogWarning("Orange Money notif payload missing notif_token — cannot verify.");
+                Logger.LogWarning("Orange Money notif payload missing notif_token — cannot verify.");
                 valid = false;
             }
             else
@@ -298,7 +298,7 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Orange Money notif token verification raised");
+            Logger.LogError(ex, "Orange Money notif token verification raised");
             valid = false;
         }
 
@@ -321,7 +321,7 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
             if (evt is null || string.IsNullOrEmpty(evt.PayToken))
                 return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation(
+            Logger.LogInformation(
                 "Parsed Orange Money notif: PayToken={PayToken} Status={Status}",
                 evt.PayToken, evt.Status);
 
@@ -361,7 +361,7 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse Orange Money notif payload");
+            Logger.LogError(ex, "Failed to parse Orange Money notif payload");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -444,7 +444,7 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Orange Money {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Orange Money {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
@@ -487,7 +487,7 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
             var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
             {
-                _logger.LogError("Orange Money OAuth failed: {StatusCode} {Body}", response.StatusCode, body);
+                Logger.LogError("Orange Money OAuth failed: {StatusCode} {Body}", response.StatusCode, body);
                 throw new ProviderUnavailableException(ProviderName, $"Orange Money OAuth HTTP {(int)response.StatusCode}: {body}");
             }
 
