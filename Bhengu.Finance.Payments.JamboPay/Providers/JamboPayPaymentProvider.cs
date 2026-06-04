@@ -14,7 +14,6 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
-using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.JamboPay.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -81,21 +80,14 @@ public sealed class JamboPayPaymentProvider : BhenguProviderBase, IPaymentGatewa
     }
 
     /// <inheritdoc/>
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
-        var started = DateTime.UtcNow;
-        var cached = await TryGetCachedAsync<PaymentResponse>(request.IdempotencyKey, "charge", ct).ConfigureAwait(false);
-        if (cached is not null)
+        return RunChargeAsync(request.Currency, async () =>
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return cached;
-        }
+            var cached = await TryGetCachedAsync<PaymentResponse>(request.IdempotencyKey, "charge", ct).ConfigureAwait(false);
+            if (cached is not null) return cached;
 
-        try
-        {
             var body = new
             {
                 merchant_code = _options.MerchantCode,
@@ -131,50 +123,19 @@ public sealed class JamboPayPaymentProvider : BhenguProviderBase, IPaymentGatewa
             };
 
             await TrySetCachedAsync(request.IdempotencyKey, "charge", response, ct).ConfigureAwait(false);
-            var outcome = response.Status switch
-            {
-                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
-                _ => BhenguPaymentDiagnostics.Outcomes.Declined
-            };
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcome));
-            activity.SetOutcome(outcome);
             return response;
-        }
-        catch (Exception ex)
-        {
-            var outcome = ClassifyOutcome(ex);
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcome));
-            activity.SetOutcome(outcome);
-            throw;
-        }
-        finally
-        {
-            BhenguPaymentDiagnostics.ChargeDurationMs.Record(
-                (DateTime.UtcNow - started).TotalMilliseconds,
-                new KeyValuePair<string, object?>("provider", ProviderName));
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
-        var cached = await TryGetCachedAsync<RefundResponse>(request.IdempotencyKey, "refund", ct).ConfigureAwait(false);
-        if (cached is not null)
+        return RunRefundAsync(request.GatewayReference, async () =>
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return cached;
-        }
+            var cached = await TryGetCachedAsync<RefundResponse>(request.IdempotencyKey, "refund", ct).ConfigureAwait(false);
+            if (cached is not null) return cached;
 
-        try
-        {
             var body = new
             {
                 transaction_ref = request.GatewayReference,
@@ -199,38 +160,19 @@ public sealed class JamboPayPaymentProvider : BhenguProviderBase, IPaymentGatewa
             };
 
             await TrySetCachedAsync(request.IdempotencyKey, "refund", response, ct).ConfigureAwait(false);
-            BhenguPaymentDiagnostics.RefundsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", BhenguPaymentDiagnostics.Outcomes.Success));
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             return response;
-        }
-        catch (Exception ex)
-        {
-            var outcome = ClassifyOutcome(ex);
-            BhenguPaymentDiagnostics.RefundsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcome));
-            activity.SetOutcome(outcome);
-            throw;
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, request.Currency);
-        var cached = await TryGetCachedAsync<PayoutResponse>(request.IdempotencyKey, "payout", ct).ConfigureAwait(false);
-        if (cached is not null)
+        return RunPayoutAsync(request.Currency, async () =>
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return cached;
-        }
+            var cached = await TryGetCachedAsync<PayoutResponse>(request.IdempotencyKey, "payout", ct).ConfigureAwait(false);
+            if (cached is not null) return cached;
 
-        try
-        {
             // DestinationToken layouts:
             //   "msisdn:254700000000"          → mobile-money payout
             //   "bank:KCBLKENX:1234567890"     → bank payout (bankCode + account)
@@ -276,21 +218,8 @@ public sealed class JamboPayPaymentProvider : BhenguProviderBase, IPaymentGatewa
             };
 
             await TrySetCachedAsync(request.IdempotencyKey, "payout", response, ct).ConfigureAwait(false);
-            BhenguPaymentDiagnostics.PayoutsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", BhenguPaymentDiagnostics.Outcomes.Success));
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
             return response;
-        }
-        catch (Exception ex)
-        {
-            var outcome = ClassifyOutcome(ex);
-            BhenguPaymentDiagnostics.PayoutsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", outcome));
-            activity.SetOutcome(outcome);
-            throw;
-        }
+        }, ct);
     }
 
     /// <inheritdoc/>
@@ -299,146 +228,140 @@ public sealed class JamboPayPaymentProvider : BhenguProviderBase, IPaymentGatewa
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
+        return RunWebhookVerify(() =>
         {
-            Logger.LogWarning("JamboPay WebhookSecret not configured — signature verification cannot succeed.");
-            BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("valid", false));
-            return false;
-        }
+            if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
+            {
+                Logger.LogWarning("JamboPay WebhookSecret not configured — signature verification cannot succeed.");
+                return false;
+            }
 
-        bool valid;
-        try
-        {
-            using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
-            var hash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
-            var hex = Convert.ToHexString(hash).ToLowerInvariant();
-            valid = CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
-                Encoding.UTF8.GetBytes(hex));
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "JamboPay webhook signature verification raised");
-            valid = false;
-        }
-
-        BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
-            new KeyValuePair<string, object?>("provider", ProviderName),
-            new KeyValuePair<string, object?>("valid", valid));
-        return valid;
+            try
+            {
+                using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
+                var hash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
+                var hex = Convert.ToHexString(hash).ToLowerInvariant();
+                return CryptographicOperations.FixedTimeEquals(
+                    Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
+                    Encoding.UTF8.GetBytes(hex));
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "JamboPay webhook signature verification raised");
+                return false;
+            }
+        });
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-
-        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
-
-        try
+        return RunOperationAsync("parse_webhook", () =>
         {
-            var evt = JsonSerializer.Deserialize<JamboPayWebhookEvent>(payload);
-            if (evt is null || string.IsNullOrEmpty(evt.TransactionRef))
-                return Task.FromResult<WebhookEvent?>(null);
-
-            Logger.LogInformation("Parsed JamboPay webhook event: {EventType}", evt.EventType);
-
-            var eventLower = evt.EventType?.ToLowerInvariant();
-            var currency = evt.Currency ?? _options.Currency;
-            WebhookEvent? typed = eventLower switch
+            try
             {
-                "payment.completed" or "payment.success" => new ChargeSucceededEvent
-                {
-                    GatewayReference = evt.TransactionRef,
-                    Status = PaymentStatus.Completed,
-                    EventType = evt.EventType,
-                    Category = WebhookEventCategory.ChargeSucceeded,
-                    Amount = evt.Amount,
-                    Currency = currency
-                },
-                "payment.failed" => new ChargeFailedEvent
-                {
-                    GatewayReference = evt.TransactionRef,
-                    Status = PaymentStatus.Failed,
-                    EventType = evt.EventType,
-                    Category = WebhookEventCategory.ChargeFailed,
-                    Amount = evt.Amount,
-                    Currency = currency,
-                    FailureCode = evt.Status,
-                    FailureMessage = evt.Message
-                },
-                "payment.pending" => new ChargePendingEvent
-                {
-                    GatewayReference = evt.TransactionRef,
-                    Status = PaymentStatus.Pending,
-                    EventType = evt.EventType,
-                    Category = WebhookEventCategory.ChargePending,
-                    Amount = evt.Amount,
-                    Currency = currency
-                },
-                "payment.cancelled" => new WebhookEvent
-                {
-                    GatewayReference = evt.TransactionRef,
-                    Status = PaymentStatus.Cancelled,
-                    EventType = evt.EventType,
-                    Category = WebhookEventCategory.Unknown
-                },
-                "refund.completed" or "refund.success" => new RefundSucceededEvent
-                {
-                    GatewayReference = evt.TransactionRef,
-                    Status = PaymentStatus.Refunded,
-                    EventType = evt.EventType,
-                    Category = WebhookEventCategory.RefundSucceeded,
-                    RefundReference = evt.RefundId ?? evt.TransactionRef,
-                    Amount = evt.Amount,
-                    Currency = currency,
-                    IsPartial = false
-                },
-                "refund.failed" => new RefundFailedEvent
-                {
-                    GatewayReference = evt.TransactionRef,
-                    Status = PaymentStatus.Failed,
-                    EventType = evt.EventType,
-                    Category = WebhookEventCategory.RefundFailed,
-                    Amount = evt.Amount,
-                    Currency = currency,
-                    FailureCode = evt.Status,
-                    FailureMessage = evt.Message
-                },
-                "payout.completed" or "payout.success" => new PayoutCompletedEvent
-                {
-                    GatewayReference = evt.TransactionRef,
-                    Status = PaymentStatus.Completed,
-                    EventType = evt.EventType,
-                    Category = WebhookEventCategory.PayoutCompleted,
-                    PayoutReference = evt.TransactionRef,
-                    Amount = evt.Amount,
-                    Currency = currency
-                },
-                "payout.failed" => new PayoutFailedEvent
-                {
-                    GatewayReference = evt.TransactionRef,
-                    Status = PaymentStatus.Failed,
-                    EventType = evt.EventType,
-                    Category = WebhookEventCategory.PayoutFailed,
-                    PayoutReference = evt.TransactionRef,
-                    Amount = evt.Amount,
-                    Currency = currency,
-                    FailureCode = evt.Status,
-                    FailureMessage = evt.Message
-                },
-                _ => null
-            };
+                var evt = JsonSerializer.Deserialize<JamboPayWebhookEvent>(payload);
+                if (evt is null || string.IsNullOrEmpty(evt.TransactionRef))
+                    return Task.FromResult<WebhookEvent?>(null);
 
-            return Task.FromResult(typed);
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Failed to parse JamboPay webhook event");
-            return Task.FromResult<WebhookEvent?>(null);
-        }
+                Logger.LogInformation("Parsed JamboPay webhook event: {EventType}", evt.EventType);
+
+                var eventLower = evt.EventType?.ToLowerInvariant();
+                var currency = evt.Currency ?? _options.Currency;
+                WebhookEvent? typed = eventLower switch
+                {
+                    "payment.completed" or "payment.success" => new ChargeSucceededEvent
+                    {
+                        GatewayReference = evt.TransactionRef,
+                        Status = PaymentStatus.Completed,
+                        EventType = evt.EventType,
+                        Category = WebhookEventCategory.ChargeSucceeded,
+                        Amount = evt.Amount,
+                        Currency = currency
+                    },
+                    "payment.failed" => new ChargeFailedEvent
+                    {
+                        GatewayReference = evt.TransactionRef,
+                        Status = PaymentStatus.Failed,
+                        EventType = evt.EventType,
+                        Category = WebhookEventCategory.ChargeFailed,
+                        Amount = evt.Amount,
+                        Currency = currency,
+                        FailureCode = evt.Status,
+                        FailureMessage = evt.Message
+                    },
+                    "payment.pending" => new ChargePendingEvent
+                    {
+                        GatewayReference = evt.TransactionRef,
+                        Status = PaymentStatus.Pending,
+                        EventType = evt.EventType,
+                        Category = WebhookEventCategory.ChargePending,
+                        Amount = evt.Amount,
+                        Currency = currency
+                    },
+                    "payment.cancelled" => new WebhookEvent
+                    {
+                        GatewayReference = evt.TransactionRef,
+                        Status = PaymentStatus.Cancelled,
+                        EventType = evt.EventType,
+                        Category = WebhookEventCategory.Unknown
+                    },
+                    "refund.completed" or "refund.success" => new RefundSucceededEvent
+                    {
+                        GatewayReference = evt.TransactionRef,
+                        Status = PaymentStatus.Refunded,
+                        EventType = evt.EventType,
+                        Category = WebhookEventCategory.RefundSucceeded,
+                        RefundReference = evt.RefundId ?? evt.TransactionRef,
+                        Amount = evt.Amount,
+                        Currency = currency,
+                        IsPartial = false
+                    },
+                    "refund.failed" => new RefundFailedEvent
+                    {
+                        GatewayReference = evt.TransactionRef,
+                        Status = PaymentStatus.Failed,
+                        EventType = evt.EventType,
+                        Category = WebhookEventCategory.RefundFailed,
+                        Amount = evt.Amount,
+                        Currency = currency,
+                        FailureCode = evt.Status,
+                        FailureMessage = evt.Message
+                    },
+                    "payout.completed" or "payout.success" => new PayoutCompletedEvent
+                    {
+                        GatewayReference = evt.TransactionRef,
+                        Status = PaymentStatus.Completed,
+                        EventType = evt.EventType,
+                        Category = WebhookEventCategory.PayoutCompleted,
+                        PayoutReference = evt.TransactionRef,
+                        Amount = evt.Amount,
+                        Currency = currency
+                    },
+                    "payout.failed" => new PayoutFailedEvent
+                    {
+                        GatewayReference = evt.TransactionRef,
+                        Status = PaymentStatus.Failed,
+                        EventType = evt.EventType,
+                        Category = WebhookEventCategory.PayoutFailed,
+                        PayoutReference = evt.TransactionRef,
+                        Amount = evt.Amount,
+                        Currency = currency,
+                        FailureCode = evt.Status,
+                        FailureMessage = evt.Message
+                    },
+                    _ => null
+                };
+
+                return Task.FromResult(typed);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Failed to parse JamboPay webhook event");
+                return Task.FromResult<WebhookEvent?>(null);
+            }
+        }, ct);
     }
 
     private async Task<string> EnsureTokenAsync(CancellationToken ct)
@@ -561,14 +484,6 @@ public sealed class JamboPayPaymentProvider : BhenguProviderBase, IPaymentGatewa
         var key = $"jambopay:{operation}:{idempotencyKey}";
         await _idempotencyCache.SetAsync(key, value, TimeSpan.FromHours(24), ct).ConfigureAwait(false);
     }
-
-    private static string ClassifyOutcome(Exception ex) => ex switch
-    {
-        PaymentDeclinedException => BhenguPaymentDiagnostics.Outcomes.Declined,
-        ProviderRateLimitException => BhenguPaymentDiagnostics.Outcomes.RateLimited,
-        ProviderUnavailableException => BhenguPaymentDiagnostics.Outcomes.Unavailable,
-        _ => BhenguPaymentDiagnostics.Outcomes.Error
-    };
 
     private static PaymentStatus MapStatus(string raw) => raw?.ToLowerInvariant() switch
     {
