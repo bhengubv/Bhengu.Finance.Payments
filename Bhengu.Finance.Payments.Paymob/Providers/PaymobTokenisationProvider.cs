@@ -55,34 +55,30 @@ public sealed class PaymobTokenisationProvider : BhenguProviderBase, ITokenisati
     }
 
     /// <inheritdoc/>
-    public async Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
+    public Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(token);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise.get");
-        try
+        return RunOperationAsync<PaymentMethod?>("get_payment_method", async () =>
         {
-            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
-            var responseBody = await PaymobHttpClient.SendAsync(
-                _httpClient, Logger, HttpMethod.Get,
-                $"api/acceptance/saved_cards/{Uri.EscapeDataString(token)}?auth_token={Uri.EscapeDataString(authToken)}",
-                null, "GetPaymentMethod", ct).ConfigureAwait(false);
+            try
+            {
+                var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
+                var responseBody = await PaymobHttpClient.SendAsync(
+                    _httpClient, Logger, HttpMethod.Get,
+                    $"api/acceptance/saved_cards/{Uri.EscapeDataString(token)}?auth_token={Uri.EscapeDataString(authToken)}",
+                    null, "GetPaymentMethod", ct).ConfigureAwait(false);
 
-            var response = JsonSerializer.Deserialize<PaymobSavedCard>(responseBody, PaymobHttpClient.Json);
-            if (response is null || string.IsNullOrEmpty(response.CardToken))
+                var response = JsonSerializer.Deserialize<PaymobSavedCard>(responseBody, PaymobHttpClient.Json);
+                if (response is null || string.IsNullOrEmpty(response.CardToken))
+                    return null;
+
+                return Map(response);
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
                 return null;
-
-            return Map(response);
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            return null;
-        }
-        catch (Exception)
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+            }
+        }, ct);
     }
 
     /// <inheritdoc/>
@@ -119,29 +115,25 @@ public sealed class PaymobTokenisationProvider : BhenguProviderBase, ITokenisati
     }
 
     /// <inheritdoc/>
-    public async Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
+    public Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(token);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise.delete");
-        try
+        return RunOperationAsync("delete_payment_method", async () =>
         {
-            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
-            await PaymobHttpClient.SendAsync(
-                _httpClient, Logger, HttpMethod.Delete,
-                $"api/acceptance/saved_cards/{Uri.EscapeDataString(token)}?auth_token={Uri.EscapeDataString(authToken)}",
-                null, "DeletePaymentMethod", ct).ConfigureAwait(false);
-            return true;
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            return false;
-        }
-        catch (Exception)
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
+            try
+            {
+                var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
+                await PaymobHttpClient.SendAsync(
+                    _httpClient, Logger, HttpMethod.Delete,
+                    $"api/acceptance/saved_cards/{Uri.EscapeDataString(token)}?auth_token={Uri.EscapeDataString(authToken)}",
+                    null, "DeletePaymentMethod", ct).ConfigureAwait(false);
+                return true;
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return false;
+            }
+        }, ct);
     }
 
     internal static PaymentMethod Map(PaymobSavedCard card) => new()
@@ -228,10 +220,8 @@ public sealed class PaymobRawCardTokenisationProvider : BhenguProviderBase, IRaw
         return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => TokeniseCoreAsync(request, ct), ct);
     }
 
-    private async Task<PaymentMethod> TokeniseCoreAsync(TokeniseRequest request, CancellationToken ct)
-    {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise");
-        try
+    private Task<PaymentMethod> TokeniseCoreAsync(TokeniseRequest request, CancellationToken ct)
+        => RunOperationAsync("tokenise_card", async () =>
         {
             var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
 
@@ -273,11 +263,5 @@ public sealed class PaymobRawCardTokenisationProvider : BhenguProviderBase, IRaw
                 IsDefault = request.SetAsDefault,
                 CreatedAt = DateTime.UtcNow
             };
-        }
-        catch (Exception)
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            throw;
-        }
-    }
+        }, ct);
 }

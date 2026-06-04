@@ -1,6 +1,5 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
-using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
@@ -12,7 +11,6 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
-using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Paymob.Configuration;
 using Bhengu.Finance.Payments.Paymob.Internals;
 using Microsoft.Extensions.Logging;
@@ -80,34 +78,25 @@ public sealed class PaymobPaymentProvider : BhenguProviderBase, IPaymentGatewayP
         return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPaymentCoreAsync(request, ct), ct);
     }
 
-    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
-    {
-        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
-        var sw = Stopwatch.StartNew();
-
-        var integrationId = request.Metadata?.GetValueOrDefault("integration_id") is { Length: > 0 } iidStr
-                && int.TryParse(iidStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out var iid)
-            ? iid
-            : _options.IntegrationId;
-        var iframeId = request.Metadata?.GetValueOrDefault("iframe_id") is { Length: > 0 } ifStr
-                && int.TryParse(ifStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ifv)
-            ? ifv
-            : _options.IframeId;
-
-        if (integrationId <= 0)
+    private Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+        => RunChargeAsync(request.Currency, async () =>
         {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", BhenguPaymentDiagnostics.Outcomes.Error));
-            throw new PaymentDeclinedException(ProviderName, "missing_integration_id",
-                "Paymob requires an 'integration_id' in PaymentRequest.Metadata or PaymobOptions.IntegrationId.");
-        }
+            var integrationId = request.Metadata?.GetValueOrDefault("integration_id") is { Length: > 0 } iidStr
+                    && int.TryParse(iidStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out var iid)
+                ? iid
+                : _options.IntegrationId;
+            var iframeId = request.Metadata?.GetValueOrDefault("iframe_id") is { Length: > 0 } ifStr
+                    && int.TryParse(ifStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ifv)
+                ? ifv
+                : _options.IframeId;
 
-        var amountCents = (long)(request.Amount * 100);
-        var currency = string.IsNullOrWhiteSpace(request.Currency) ? _options.Currency : request.Currency.ToUpperInvariant();
+            if (integrationId <= 0)
+                throw new PaymentDeclinedException(ProviderName, "missing_integration_id",
+                    "Paymob requires an 'integration_id' in PaymentRequest.Metadata or PaymobOptions.IntegrationId.");
 
-        try
-        {
+            var amountCents = (long)(request.Amount * 100);
+            var currency = string.IsNullOrWhiteSpace(request.Currency) ? _options.Currency : request.Currency.ToUpperInvariant();
+
             // 1. Authenticate
             var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
 
@@ -155,10 +144,6 @@ public sealed class PaymobPaymentProvider : BhenguProviderBase, IPaymentGatewayP
                 ? $"https://accept.paymob.com/api/acceptance/iframes/{iframeId}?payment_token={paymentKey}"
                 : paymentKey;
 
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Pending);
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", BhenguPaymentDiagnostics.Outcomes.Pending));
-
             return new PaymentResponse
             {
                 GatewayReference = orderId.Value.ToString(CultureInfo.InvariantCulture),
@@ -168,34 +153,7 @@ public sealed class PaymobPaymentProvider : BhenguProviderBase, IPaymentGatewayP
                 ProcessedAt = DateTime.UtcNow,
                 RedirectUrl = iframeUrl
             };
-        }
-        catch (PaymentDeclinedException)
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Declined);
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", BhenguPaymentDiagnostics.Outcomes.Declined));
-            throw;
-        }
-        catch (ProviderRateLimitException)
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.RateLimited);
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", BhenguPaymentDiagnostics.Outcomes.RateLimited));
-            throw;
-        }
-        catch (Exception)
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Unavailable);
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", BhenguPaymentDiagnostics.Outcomes.Unavailable));
-            throw;
-        }
-        finally
-        {
-            BhenguPaymentDiagnostics.ChargeDurationMs.Record(sw.Elapsed.TotalMilliseconds,
-                new KeyValuePair<string, object?>("provider", ProviderName));
-        }
-    }
+        }, ct);
 
     /// <inheritdoc/>
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
@@ -204,10 +162,8 @@ public sealed class PaymobPaymentProvider : BhenguProviderBase, IPaymentGatewayP
         return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessRefundCoreAsync(request, ct), ct);
     }
 
-    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
-    {
-        using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
-        try
+    private Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+        => RunRefundAsync(request.GatewayReference, async () =>
         {
             var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
             var amountCents = (long)(request.Amount * 100);
@@ -225,9 +181,6 @@ public sealed class PaymobPaymentProvider : BhenguProviderBase, IPaymentGatewayP
                 request.GatewayReference, refund?.Success);
 
             var status = refund?.Success == true ? PaymentStatus.Refunded : PaymentStatus.Pending;
-            activity.SetOutcome(status == PaymentStatus.Refunded ? BhenguPaymentDiagnostics.Outcomes.Success : BhenguPaymentDiagnostics.Outcomes.Pending);
-            BhenguPaymentDiagnostics.RefundsTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", status == PaymentStatus.Refunded ? BhenguPaymentDiagnostics.Outcomes.Success : BhenguPaymentDiagnostics.Outcomes.Pending));
 
             return new RefundResponse
             {
@@ -237,15 +190,7 @@ public sealed class PaymobPaymentProvider : BhenguProviderBase, IPaymentGatewayP
                 ProcessedAt = DateTime.UtcNow,
                 Message = refund?.Success.ToString()
             };
-        }
-        catch (Exception)
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            BhenguPaymentDiagnostics.RefundsTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", BhenguPaymentDiagnostics.Outcomes.Error));
-            throw;
-        }
-    }
+        }, ct);
 
     /// <inheritdoc/>
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
@@ -254,10 +199,8 @@ public sealed class PaymobPaymentProvider : BhenguProviderBase, IPaymentGatewayP
         return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPayoutCoreAsync(request, ct), ct);
     }
 
-    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
-    {
-        using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, request.Currency);
-        try
+    private Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+        => RunPayoutAsync(request.Currency, async () =>
         {
             var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
             var amountCents = (long)(request.Amount * 100);
@@ -277,9 +220,6 @@ public sealed class PaymobPaymentProvider : BhenguProviderBase, IPaymentGatewayP
                 disbursement?.Id, disbursement?.Success);
 
             var status = disbursement?.Success == true ? PaymentStatus.Completed : PaymentStatus.Pending;
-            activity.SetOutcome(status == PaymentStatus.Completed ? BhenguPaymentDiagnostics.Outcomes.Success : BhenguPaymentDiagnostics.Outcomes.Pending);
-            BhenguPaymentDiagnostics.PayoutsTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", status == PaymentStatus.Completed ? BhenguPaymentDiagnostics.Outcomes.Success : BhenguPaymentDiagnostics.Outcomes.Pending));
 
             return new PayoutResponse
             {
@@ -289,15 +229,7 @@ public sealed class PaymobPaymentProvider : BhenguProviderBase, IPaymentGatewayP
                 Status = status,
                 ProcessedAt = DateTime.UtcNow
             };
-        }
-        catch (Exception)
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            BhenguPaymentDiagnostics.PayoutsTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", BhenguPaymentDiagnostics.Outcomes.Error));
-            throw;
-        }
-    }
+        }, ct);
 
     /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
@@ -305,45 +237,40 @@ public sealed class PaymobPaymentProvider : BhenguProviderBase, IPaymentGatewayP
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        bool valid;
-        if (string.IsNullOrWhiteSpace(_options.HmacSecret))
+        return RunWebhookVerify(() =>
         {
-            Logger.LogWarning("Paymob HmacSecret not configured — webhook signature verification cannot succeed.");
-            valid = false;
-        }
-        else
-        {
+            if (string.IsNullOrWhiteSpace(_options.HmacSecret))
+            {
+                Logger.LogWarning("Paymob HmacSecret not configured — webhook signature verification cannot succeed.");
+                return false;
+            }
+
             try
             {
                 using var hmac = new HMACSHA512(Encoding.UTF8.GetBytes(_options.HmacSecret));
                 var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
                 var computedSignature = Convert.ToHexString(computedHash).ToLowerInvariant();
 
-                valid = CryptographicOperations.FixedTimeEquals(
+                return CryptographicOperations.FixedTimeEquals(
                     Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
                     Encoding.UTF8.GetBytes(computedSignature));
             }
             catch (Exception ex)
             {
                 Logger.LogError(ex, "Paymob webhook signature verification raised");
-                valid = false;
+                return false;
             }
-        }
-
-        BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
-            new KeyValuePair<string, object?>("provider", ProviderName),
-            new KeyValuePair<string, object?>("valid", valid));
-        return valid;
+        });
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-
-        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
-        try
+        return RunOperationAsync("parse_webhook", () =>
         {
+            try
+            {
             var callback = JsonSerializer.Deserialize<PaymobWebhookCallback>(payload, PaymobHttpClient.Json);
             if (callback?.Obj is null) return Task.FromResult<WebhookEvent?>(null);
 
@@ -462,12 +389,13 @@ public sealed class PaymobPaymentProvider : BhenguProviderBase, IPaymentGatewayP
             }
 
             return Task.FromResult<WebhookEvent?>(null);
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Failed to parse Paymob webhook callback");
-            return Task.FromResult<WebhookEvent?>(null);
-        }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Failed to parse Paymob webhook callback");
+                return Task.FromResult<WebhookEvent?>(null);
+            }
+        }, ct);
     }
 
     private static object BuildBillingPayload(PaymentRequest request) => new

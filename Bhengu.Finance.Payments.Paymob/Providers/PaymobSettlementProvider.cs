@@ -72,25 +72,27 @@ public sealed class PaymobSettlementProvider : BhenguProviderBase, ISettlementPr
     }
 
     /// <inheritdoc/>
-    public async Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
+    public Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "settlement.get");
-        try
+        return RunOperationAsync<Settlement?>("get_settlement", async () =>
         {
-            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
-            var responseBody = await PaymobHttpClient.SendAsync(
-                _httpClient, Logger, HttpMethod.Get,
-                $"api/acceptance/settlements/{Uri.EscapeDataString(settlementReference)}?auth_token={Uri.EscapeDataString(authToken)}",
-                null, "GetSettlement", ct).ConfigureAwait(false);
+            try
+            {
+                var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
+                var responseBody = await PaymobHttpClient.SendAsync(
+                    _httpClient, Logger, HttpMethod.Get,
+                    $"api/acceptance/settlements/{Uri.EscapeDataString(settlementReference)}?auth_token={Uri.EscapeDataString(authToken)}",
+                    null, "GetSettlement", ct).ConfigureAwait(false);
 
-            var settlement = JsonSerializer.Deserialize<PaymobSettlement>(responseBody, PaymobHttpClient.Json);
-            return settlement is null ? null : MapSettlement(settlement);
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            return null;
-        }
+                var settlement = JsonSerializer.Deserialize<PaymobSettlement>(responseBody, PaymobHttpClient.Json);
+                return settlement is null ? null : MapSettlement(settlement);
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return null;
+            }
+        }, ct);
     }
 
     /// <inheritdoc/>

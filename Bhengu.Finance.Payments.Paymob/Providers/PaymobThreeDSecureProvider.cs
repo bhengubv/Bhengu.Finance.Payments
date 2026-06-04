@@ -57,127 +57,128 @@ public sealed class PaymobThreeDSecureProvider : BhenguProviderBase, IThreeDSecu
     }
 
     /// <inheritdoc/>
-    public async Task<ThreeDSecureChallenge> StartAuthenticationAsync(PaymentRequest chargeIntent, CancellationToken ct = default)
+    public Task<ThreeDSecureChallenge> StartAuthenticationAsync(PaymentRequest chargeIntent, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(chargeIntent);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "3ds.start");
-
-        // Frictionless escape hatch — merchant explicitly opted out of 3DS.
-        var requestThreeDs = !string.Equals(chargeIntent.Metadata?.GetValueOrDefault("request_3d_secure"), "false", StringComparison.OrdinalIgnoreCase);
-        if (!requestThreeDs)
+        return RunOperationAsync("start_3ds_authentication", async () =>
         {
-            return new ThreeDSecureChallenge
+            // Frictionless escape hatch — merchant explicitly opted out of 3DS.
+            var requestThreeDs = !string.Equals(chargeIntent.Metadata?.GetValueOrDefault("request_3d_secure"), "false", StringComparison.OrdinalIgnoreCase);
+            if (!requestThreeDs)
             {
-                Status = ThreeDSecureStatus.NotRequired,
-                ChallengeReference = chargeIntent.IdempotencyKey ?? $"paymob-noscapen-{Guid.NewGuid():N}"
-            };
-        }
+                return new ThreeDSecureChallenge
+                {
+                    Status = ThreeDSecureStatus.NotRequired,
+                    ChallengeReference = chargeIntent.IdempotencyKey ?? $"paymob-noscapen-{Guid.NewGuid():N}"
+                };
+            }
 
-        var integrationId = chargeIntent.Metadata?.GetValueOrDefault("integration_id") is { Length: > 0 } iidStr
-                && int.TryParse(iidStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out var iid)
-            ? iid
-            : _options.IntegrationId;
-        var iframeId = chargeIntent.Metadata?.GetValueOrDefault("iframe_id") is { Length: > 0 } ifStr
-                && int.TryParse(ifStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ifv)
-            ? ifv
-            : _options.IframeId;
+            var integrationId = chargeIntent.Metadata?.GetValueOrDefault("integration_id") is { Length: > 0 } iidStr
+                    && int.TryParse(iidStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out var iid)
+                ? iid
+                : _options.IntegrationId;
+            var iframeId = chargeIntent.Metadata?.GetValueOrDefault("iframe_id") is { Length: > 0 } ifStr
+                    && int.TryParse(ifStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ifv)
+                ? ifv
+                : _options.IframeId;
 
-        if (integrationId <= 0)
-            throw new PaymentDeclinedException(ProviderName, "missing_integration_id",
-                "Paymob 3DS requires an 'integration_id' on PaymentRequest.Metadata or PaymobOptions.IntegrationId.");
+            if (integrationId <= 0)
+                throw new PaymentDeclinedException(ProviderName, "missing_integration_id",
+                    "Paymob 3DS requires an 'integration_id' on PaymentRequest.Metadata or PaymobOptions.IntegrationId.");
 
-        var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
+            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
 
-        var amountCents = (long)(chargeIntent.Amount * 100);
-        var currency = string.IsNullOrWhiteSpace(chargeIntent.Currency) ? _options.Currency : chargeIntent.Currency.ToUpperInvariant();
+            var amountCents = (long)(chargeIntent.Amount * 100);
+            var currency = string.IsNullOrWhiteSpace(chargeIntent.Currency) ? _options.Currency : chargeIntent.Currency.ToUpperInvariant();
 
-        // Step 1 — create order
-        var orderJson = await PaymobHttpClient.SendAsync(_httpClient, Logger, HttpMethod.Post, "api/ecommerce/orders", new
-        {
-            auth_token = authToken,
-            delivery_needed = false,
-            amount_cents = amountCents,
-            currency,
-            items = Array.Empty<object>()
-        }, "3ds.CreateOrder", ct).ConfigureAwait(false);
-
-        var order = JsonSerializer.Deserialize<OrderResponse>(orderJson, PaymobHttpClient.Json)
-            ?? throw new ProviderUnavailableException(ProviderName, "Paymob order creation returned no payload");
-        if (order.Id is null or 0)
-            throw new ProviderUnavailableException(ProviderName, "Paymob order creation returned no id");
-
-        // Step 2 — payment-key with 3DS forced on
-        var keyJson = await PaymobHttpClient.SendAsync(_httpClient, Logger, HttpMethod.Post, "api/acceptance/payment_keys", new
-        {
-            auth_token = authToken,
-            amount_cents = amountCents,
-            expiration = 3600,
-            order_id = order.Id,
-            billing_data = BuildBillingPayload(chargeIntent),
-            currency,
-            integration_id = integrationId,
-            lock_order_when_paid = true,
-            request_3d_secure = true
-        }, "3ds.CreatePaymentKey", ct).ConfigureAwait(false);
-
-        var keyResponse = JsonSerializer.Deserialize<PaymentKeyResponse>(keyJson, PaymobHttpClient.Json);
-        var paymentKey = keyResponse?.Token;
-        if (string.IsNullOrEmpty(paymentKey))
-            throw new ProviderUnavailableException(ProviderName, "Paymob payment_keys returned no token");
-
-        var iframeUrl = iframeId > 0
-            ? $"https://accept.paymob.com/api/acceptance/iframes/{iframeId}?payment_token={paymentKey}"
-            : null;
-
-        Logger.LogInformation("Paymob 3DS challenge started: order={OrderId} iframe={Iframe}", order.Id, iframeId);
-
-        return new ThreeDSecureChallenge
-        {
-            Status = ThreeDSecureStatus.ChallengeRequired,
-            ChallengeReference = order.Id!.Value.ToString(CultureInfo.InvariantCulture),
-            RedirectUrl = iframeUrl,
-            ChallengePayload = paymentKey,
-            ProtocolVersion = "2.x"
-        };
-    }
-
-    /// <inheritdoc/>
-    public async Task<ThreeDSecureChallenge> GetChallengeAsync(string challengeReference, CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(challengeReference);
-
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "3ds.get");
-        var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
-
-        try
-        {
-            // Inquire the transaction associated with the order — Paymob exposes it via
-            // /api/ecommerce/orders/transaction_inquiry once the order has a settled txn.
-            var responseBody = await PaymobHttpClient.SendAsync(
-                _httpClient, Logger, HttpMethod.Post, "api/ecommerce/orders/transaction_inquiry",
-                new { auth_token = authToken, order_id = challengeReference },
-                "3ds.Inquire", ct).ConfigureAwait(false);
-
-            var inquiry = JsonSerializer.Deserialize<TransactionInquiry>(responseBody, PaymobHttpClient.Json);
-            var status = MapStatus(inquiry);
-            return new ThreeDSecureChallenge
+            // Step 1 — create order
+            var orderJson = await PaymobHttpClient.SendAsync(_httpClient, Logger, HttpMethod.Post, "api/ecommerce/orders", new
             {
-                Status = status,
-                ChallengeReference = challengeReference,
-                DsTransactionId = inquiry?.TransactionId?.ToString(CultureInfo.InvariantCulture),
-                ProtocolVersion = "2.x"
-            };
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            // No transaction yet → challenge still in flight.
+                auth_token = authToken,
+                delivery_needed = false,
+                amount_cents = amountCents,
+                currency,
+                items = Array.Empty<object>()
+            }, "3ds.CreateOrder", ct).ConfigureAwait(false);
+
+            var order = JsonSerializer.Deserialize<OrderResponse>(orderJson, PaymobHttpClient.Json)
+                ?? throw new ProviderUnavailableException(ProviderName, "Paymob order creation returned no payload");
+            if (order.Id is null or 0)
+                throw new ProviderUnavailableException(ProviderName, "Paymob order creation returned no id");
+
+            // Step 2 — payment-key with 3DS forced on
+            var keyJson = await PaymobHttpClient.SendAsync(_httpClient, Logger, HttpMethod.Post, "api/acceptance/payment_keys", new
+            {
+                auth_token = authToken,
+                amount_cents = amountCents,
+                expiration = 3600,
+                order_id = order.Id,
+                billing_data = BuildBillingPayload(chargeIntent),
+                currency,
+                integration_id = integrationId,
+                lock_order_when_paid = true,
+                request_3d_secure = true
+            }, "3ds.CreatePaymentKey", ct).ConfigureAwait(false);
+
+            var keyResponse = JsonSerializer.Deserialize<PaymentKeyResponse>(keyJson, PaymobHttpClient.Json);
+            var paymentKey = keyResponse?.Token;
+            if (string.IsNullOrEmpty(paymentKey))
+                throw new ProviderUnavailableException(ProviderName, "Paymob payment_keys returned no token");
+
+            var iframeUrl = iframeId > 0
+                ? $"https://accept.paymob.com/api/acceptance/iframes/{iframeId}?payment_token={paymentKey}"
+                : null;
+
+            Logger.LogInformation("Paymob 3DS challenge started: order={OrderId} iframe={Iframe}", order.Id, iframeId);
+
             return new ThreeDSecureChallenge
             {
                 Status = ThreeDSecureStatus.ChallengeRequired,
-                ChallengeReference = challengeReference
+                ChallengeReference = order.Id!.Value.ToString(CultureInfo.InvariantCulture),
+                RedirectUrl = iframeUrl,
+                ChallengePayload = paymentKey,
+                ProtocolVersion = "2.x"
             };
-        }
+        }, ct);
+    }
+
+    /// <inheritdoc/>
+    public Task<ThreeDSecureChallenge> GetChallengeAsync(string challengeReference, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(challengeReference);
+        return RunOperationAsync("get_3ds_challenge", async () =>
+        {
+            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
+
+            try
+            {
+                // Inquire the transaction associated with the order — Paymob exposes it via
+                // /api/ecommerce/orders/transaction_inquiry once the order has a settled txn.
+                var responseBody = await PaymobHttpClient.SendAsync(
+                    _httpClient, Logger, HttpMethod.Post, "api/ecommerce/orders/transaction_inquiry",
+                    new { auth_token = authToken, order_id = challengeReference },
+                    "3ds.Inquire", ct).ConfigureAwait(false);
+
+                var inquiry = JsonSerializer.Deserialize<TransactionInquiry>(responseBody, PaymobHttpClient.Json);
+                var status = MapStatus(inquiry);
+                return new ThreeDSecureChallenge
+                {
+                    Status = status,
+                    ChallengeReference = challengeReference,
+                    DsTransactionId = inquiry?.TransactionId?.ToString(CultureInfo.InvariantCulture),
+                    ProtocolVersion = "2.x"
+                };
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                // No transaction yet → challenge still in flight.
+                return new ThreeDSecureChallenge
+                {
+                    Status = ThreeDSecureStatus.ChallengeRequired,
+                    ChallengeReference = challengeReference
+                };
+            }
+        }, ct);
     }
 
     private static ThreeDSecureStatus MapStatus(TransactionInquiry? inquiry) => inquiry switch

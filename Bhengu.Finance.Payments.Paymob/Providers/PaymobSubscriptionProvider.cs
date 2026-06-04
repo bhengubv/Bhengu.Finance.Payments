@@ -58,52 +58,54 @@ public sealed class PaymobSubscriptionProvider : BhenguProviderBase, ISubscripti
         return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreatePlanCoreAsync(request, ct), ct);
     }
 
-    private async Task<Plan> CreatePlanCoreAsync(PlanRequest request, CancellationToken ct)
-    {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "createPlan");
-        var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
-
-        var body = new
-        {
-            auth_token = authToken,
-            name = request.Name,
-            amount_cents = (long)(request.Amount * 100m),
-            currency = request.Currency.ToUpperInvariant(),
-            frequency_value = 1,
-            frequency_unit = MapInterval(request.Interval),
-            number_of_deductions = request.TotalCycles ?? 0,
-            description = request.Description,
-            integration = _options.IntegrationId
-        };
-
-        var responseBody = await PaymobHttpClient.SendAsync(
-            _httpClient, Logger, HttpMethod.Post, "api/acceptance/plans", body, "CreatePlan", ct).ConfigureAwait(false);
-        var plan = JsonSerializer.Deserialize<PaymobPlanResponse>(responseBody, PaymobHttpClient.Json)
-            ?? throw new BhenguPaymentException(ProviderName, "Paymob plan create returned no payload", "no_plan_data");
-
-        return MapPlan(plan, request);
-    }
-
-    /// <inheritdoc/>
-    public async Task<Plan?> GetPlanAsync(string planReference, CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(planReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "getPlan");
-        try
+    private Task<Plan> CreatePlanCoreAsync(PlanRequest request, CancellationToken ct)
+        => RunOperationAsync("create_plan", async () =>
         {
             var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
-            var responseBody = await PaymobHttpClient.SendAsync(
-                _httpClient, Logger, HttpMethod.Get,
-                $"api/acceptance/plans/{Uri.EscapeDataString(planReference)}?auth_token={Uri.EscapeDataString(authToken)}",
-                null, "GetPlan", ct).ConfigureAwait(false);
 
-            var plan = JsonSerializer.Deserialize<PaymobPlanResponse>(responseBody, PaymobHttpClient.Json);
-            return plan is null ? null : MapPlan(plan, null);
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            var body = new
+            {
+                auth_token = authToken,
+                name = request.Name,
+                amount_cents = (long)(request.Amount * 100m),
+                currency = request.Currency.ToUpperInvariant(),
+                frequency_value = 1,
+                frequency_unit = MapInterval(request.Interval),
+                number_of_deductions = request.TotalCycles ?? 0,
+                description = request.Description,
+                integration = _options.IntegrationId
+            };
+
+            var responseBody = await PaymobHttpClient.SendAsync(
+                _httpClient, Logger, HttpMethod.Post, "api/acceptance/plans", body, "CreatePlan", ct).ConfigureAwait(false);
+            var plan = JsonSerializer.Deserialize<PaymobPlanResponse>(responseBody, PaymobHttpClient.Json)
+                ?? throw new BhenguPaymentException(ProviderName, "Paymob plan create returned no payload", "no_plan_data");
+
+            return MapPlan(plan, request);
+        }, ct);
+
+    /// <inheritdoc/>
+    public Task<Plan?> GetPlanAsync(string planReference, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(planReference);
+        return RunOperationAsync<Plan?>("get_plan", async () =>
         {
-            return null;
-        }
+            try
+            {
+                var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
+                var responseBody = await PaymobHttpClient.SendAsync(
+                    _httpClient, Logger, HttpMethod.Get,
+                    $"api/acceptance/plans/{Uri.EscapeDataString(planReference)}?auth_token={Uri.EscapeDataString(authToken)}",
+                    null, "GetPlan", ct).ConfigureAwait(false);
+
+                var plan = JsonSerializer.Deserialize<PaymobPlanResponse>(responseBody, PaymobHttpClient.Json);
+                return plan is null ? null : MapPlan(plan, null);
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return null;
+            }
+        }, ct);
     }
 
     /// <inheritdoc/>
@@ -113,49 +115,51 @@ public sealed class PaymobSubscriptionProvider : BhenguProviderBase, ISubscripti
         return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreateSubscriptionCoreAsync(request, ct), ct);
     }
 
-    private async Task<Subscription> CreateSubscriptionCoreAsync(SubscriptionRequest request, CancellationToken ct)
-    {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "createSubscription");
-        var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
-
-        var body = new
-        {
-            auth_token = authToken,
-            plan_id = request.PlanReference,
-            payment_token = request.PaymentMethodToken,
-            identifier = request.CustomerId,
-            start_date = request.StartAt?.ToString("o", CultureInfo.InvariantCulture),
-            trial_period_days = request.TrialDays
-        };
-
-        var responseBody = await PaymobHttpClient.SendAsync(
-            _httpClient, Logger, HttpMethod.Post, "api/acceptance/subscriptions", body, "CreateSubscription", ct).ConfigureAwait(false);
-        var sub = JsonSerializer.Deserialize<PaymobSubscriptionResponse>(responseBody, PaymobHttpClient.Json)
-            ?? throw new BhenguPaymentException(ProviderName, "Paymob subscription create returned no payload", "no_subscription_data");
-
-        return MapSubscription(sub, request);
-    }
-
-    /// <inheritdoc/>
-    public async Task<Subscription?> GetSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "getSubscription");
-        try
+    private Task<Subscription> CreateSubscriptionCoreAsync(SubscriptionRequest request, CancellationToken ct)
+        => RunOperationAsync("create_subscription", async () =>
         {
             var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
-            var responseBody = await PaymobHttpClient.SendAsync(
-                _httpClient, Logger, HttpMethod.Get,
-                $"api/acceptance/subscriptions/{Uri.EscapeDataString(subscriptionReference)}?auth_token={Uri.EscapeDataString(authToken)}",
-                null, "GetSubscription", ct).ConfigureAwait(false);
 
-            var sub = JsonSerializer.Deserialize<PaymobSubscriptionResponse>(responseBody, PaymobHttpClient.Json);
-            return sub is null ? null : MapSubscription(sub, null);
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            var body = new
+            {
+                auth_token = authToken,
+                plan_id = request.PlanReference,
+                payment_token = request.PaymentMethodToken,
+                identifier = request.CustomerId,
+                start_date = request.StartAt?.ToString("o", CultureInfo.InvariantCulture),
+                trial_period_days = request.TrialDays
+            };
+
+            var responseBody = await PaymobHttpClient.SendAsync(
+                _httpClient, Logger, HttpMethod.Post, "api/acceptance/subscriptions", body, "CreateSubscription", ct).ConfigureAwait(false);
+            var sub = JsonSerializer.Deserialize<PaymobSubscriptionResponse>(responseBody, PaymobHttpClient.Json)
+                ?? throw new BhenguPaymentException(ProviderName, "Paymob subscription create returned no payload", "no_subscription_data");
+
+            return MapSubscription(sub, request);
+        }, ct);
+
+    /// <inheritdoc/>
+    public Task<Subscription?> GetSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
+        return RunOperationAsync<Subscription?>("get_subscription", async () =>
         {
-            return null;
-        }
+            try
+            {
+                var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
+                var responseBody = await PaymobHttpClient.SendAsync(
+                    _httpClient, Logger, HttpMethod.Get,
+                    $"api/acceptance/subscriptions/{Uri.EscapeDataString(subscriptionReference)}?auth_token={Uri.EscapeDataString(authToken)}",
+                    null, "GetSubscription", ct).ConfigureAwait(false);
+
+                var sub = JsonSerializer.Deserialize<PaymobSubscriptionResponse>(responseBody, PaymobHttpClient.Json);
+                return sub is null ? null : MapSubscription(sub, null);
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return null;
+            }
+        }, ct);
     }
 
     /// <inheritdoc/>
@@ -179,38 +183,38 @@ public sealed class PaymobSubscriptionProvider : BhenguProviderBase, ISubscripti
         return await TransitionAsync(subscriptionReference, "resume", SubscriptionStatus.Active, ct).ConfigureAwait(false);
     }
 
-    private async Task<Subscription> TransitionAsync(string subscriptionReference, string action, SubscriptionStatus expected, CancellationToken ct)
-    {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, $"subscription.{action}");
-        var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
-        var body = new { auth_token = authToken, action };
+    private Task<Subscription> TransitionAsync(string subscriptionReference, string action, SubscriptionStatus expected, CancellationToken ct)
+        => RunOperationAsync($"subscription_{action}", async () =>
+        {
+            var authToken = await PaymobHttpClient.AuthenticateAsync(_httpClient, Logger, _options, ct).ConfigureAwait(false);
+            var body = new { auth_token = authToken, action };
 
-        try
-        {
-            var responseBody = await PaymobHttpClient.SendAsync(
-                _httpClient, Logger, HttpMethod.Post,
-                $"api/acceptance/subscriptions/{Uri.EscapeDataString(subscriptionReference)}/action",
-                body, $"Subscription.{action}", ct).ConfigureAwait(false);
-            var sub = JsonSerializer.Deserialize<PaymobSubscriptionResponse>(responseBody, PaymobHttpClient.Json);
-            if (sub is not null) return MapSubscription(sub, null);
-        }
-        catch (PaymentDeclinedException ex) when (action.StartsWith("cancel", StringComparison.Ordinal)
-            && ex.ProviderErrorMessage?.Contains("already", StringComparison.OrdinalIgnoreCase) == true)
-        {
-            // Idempotent — cancelling an already-cancelled subscription is success.
-        }
+            try
+            {
+                var responseBody = await PaymobHttpClient.SendAsync(
+                    _httpClient, Logger, HttpMethod.Post,
+                    $"api/acceptance/subscriptions/{Uri.EscapeDataString(subscriptionReference)}/action",
+                    body, $"Subscription.{action}", ct).ConfigureAwait(false);
+                var sub = JsonSerializer.Deserialize<PaymobSubscriptionResponse>(responseBody, PaymobHttpClient.Json);
+                if (sub is not null) return MapSubscription(sub, null);
+            }
+            catch (PaymentDeclinedException ex) when (action.StartsWith("cancel", StringComparison.Ordinal)
+                && ex.ProviderErrorMessage?.Contains("already", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                // Idempotent — cancelling an already-cancelled subscription is success.
+            }
 
-        return new Subscription
-        {
-            Reference = subscriptionReference,
-            PlanReference = string.Empty,
-            CustomerId = string.Empty,
-            Status = expected,
-            StartedAt = DateTime.UtcNow,
-            CancelledAt = expected == SubscriptionStatus.Cancelled ? DateTime.UtcNow : null,
-            CyclesCompleted = 0
-        };
-    }
+            return new Subscription
+            {
+                Reference = subscriptionReference,
+                PlanReference = string.Empty,
+                CustomerId = string.Empty,
+                Status = expected,
+                StartedAt = DateTime.UtcNow,
+                CancelledAt = expected == SubscriptionStatus.Cancelled ? DateTime.UtcNow : null,
+                CyclesCompleted = 0
+            };
+        }, ct);
 
     private static string MapInterval(SubscriptionInterval interval) => interval switch
     {
