@@ -58,7 +58,8 @@ public sealed class PaystackMarketplaceProvider : IMarketplaceProvider
     public Task<SubAccount> CreateSubAccountAsync(SubAccountRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreateSubAccountCoreAsync(request, ct));
+        return PaystackObservability.ObserveAsync("create_sub_account", () =>
+            _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreateSubAccountCoreAsync(request, ct)));
     }
 
     private async Task<SubAccount> CreateSubAccountCoreAsync(SubAccountRequest request, CancellationToken ct)
@@ -97,9 +98,14 @@ public sealed class PaystackMarketplaceProvider : IMarketplaceProvider
     }
 
     /// <inheritdoc/>
-    public async Task<SubAccount?> GetSubAccountAsync(string subAccountReference, CancellationToken ct = default)
+    public Task<SubAccount?> GetSubAccountAsync(string subAccountReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subAccountReference);
+        return PaystackObservability.ObserveAsync("get_sub_account", () => GetSubAccountCoreAsync(subAccountReference, ct));
+    }
+
+    private async Task<SubAccount?> GetSubAccountCoreAsync(string subAccountReference, CancellationToken ct)
+    {
         try
         {
             var responseBody = await PaystackHttpClient.SendAsync(
@@ -114,7 +120,10 @@ public sealed class PaystackMarketplaceProvider : IMarketplaceProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<SubAccount>> ListSubAccountsAsync(CancellationToken ct = default)
+    public Task<IReadOnlyList<SubAccount>> ListSubAccountsAsync(CancellationToken ct = default)
+        => PaystackObservability.ObserveAsync("list_sub_accounts", () => ListSubAccountsCoreAsync(ct));
+
+    private async Task<IReadOnlyList<SubAccount>> ListSubAccountsCoreAsync(CancellationToken ct)
     {
         var responseBody = await PaystackHttpClient.SendAsync(
             _httpClient, _logger, HttpMethod.Get, "subaccount?perPage=100", null, "ListSubAccounts", ct).ConfigureAwait(false);
@@ -130,7 +139,8 @@ public sealed class PaystackMarketplaceProvider : IMarketplaceProvider
     public Task<SplitDefinition> CreateSplitAsync(SplitDefinitionRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreateSplitCoreAsync(request, ct));
+        return PaystackObservability.ObserveAsync("create_split", () =>
+            _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreateSplitCoreAsync(request, ct)));
     }
 
     private async Task<SplitDefinition> CreateSplitCoreAsync(SplitDefinitionRequest request, CancellationToken ct)
@@ -168,9 +178,14 @@ public sealed class PaystackMarketplaceProvider : IMarketplaceProvider
     }
 
     /// <inheritdoc/>
-    public async Task<SplitDefinition?> GetSplitAsync(string splitReference, CancellationToken ct = default)
+    public Task<SplitDefinition?> GetSplitAsync(string splitReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(splitReference);
+        return PaystackObservability.ObserveAsync("get_split", () => GetSplitCoreAsync(splitReference, ct));
+    }
+
+    private async Task<SplitDefinition?> GetSplitCoreAsync(string splitReference, CancellationToken ct)
+    {
         try
         {
             var responseBody = await PaystackHttpClient.SendAsync(
@@ -185,9 +200,14 @@ public sealed class PaystackMarketplaceProvider : IMarketplaceProvider
     }
 
     /// <inheritdoc/>
-    public async Task<PaymentResponse> ChargeWithSplitAsync(ChargeWithSplitRequest request, CancellationToken ct = default)
+    public Task<PaymentResponse> ChargeWithSplitAsync(ChargeWithSplitRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return PaystackObservability.ObserveChargeAsync(request.Payment.Currency, () => ChargeWithSplitCoreAsync(request, ct));
+    }
+
+    private async Task<PaymentResponse> ChargeWithSplitCoreAsync(ChargeWithSplitRequest request, CancellationToken ct)
+    {
         if (request.SplitReference is null && (request.InlineRules is null || request.InlineRules.Count == 0))
             throw new BhenguPaymentException(ProviderName, "ChargeWithSplitRequest requires SplitReference or InlineRules.", "missing_split");
 

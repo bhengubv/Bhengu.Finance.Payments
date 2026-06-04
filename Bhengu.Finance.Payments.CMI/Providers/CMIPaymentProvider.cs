@@ -1,15 +1,18 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using System.Diagnostics;
 using System.Globalization;
-using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Xml.Linq;
 using Bhengu.Finance.Payments.CMI.Configuration;
+using Bhengu.Finance.Payments.CMI.Internals;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Observability;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -18,28 +21,37 @@ namespace Bhengu.Finance.Payments.CMI.Providers;
 /// <summary>
 /// CMI (Centre Monetique Interbancaire / Morocco) 3D Secure payment gateway provider.
 /// CMI is a redirect-only 3DS card gateway based on the Garanti BBVA POS XML protocol.
-/// ProcessPaymentAsync returns a redirect URL in <see cref="PaymentResponse.Message"/> that
-/// the caller must navigate the payer to. There is no payouts API — CMI does not implement
-/// <see cref="IPayoutProvider"/>.
+/// <see cref="ProcessPaymentAsync"/> returns a signed redirect URL on
+/// <see cref="PaymentResponse.RedirectUrl"/> that the caller must navigate the payer to.
+/// There is no payouts API — CMI does not implement <see cref="IPayoutProvider"/>.
 /// </summary>
+/// <remarks>
+/// 3DS is MANDATORY on every CMI charge — there is no opt-out. Liability shift applies whenever
+/// the issuer's <c>mdStatus</c> is 1 (full auth) or 2/3/4 (attempted, Visa-only shift). See
+/// <see cref="CMIThreeDSecureProvider"/> for an explicit step-up API.
+/// </remarks>
 public sealed class CMIPaymentProvider : IPaymentGatewayProvider
 {
-    private const string LiveDefaultUrl = "https://payment.cmi.co.ma/";
-    private const string SandboxDefaultUrl = "https://testpayment.cmi.co.ma/";
-
     private readonly HttpClient _httpClient;
     private readonly CMIOptions _options;
     private readonly ILogger<CMIPaymentProvider> _logger;
 
+    /// <inheritdoc/>
     public string ProviderName => ProviderNames.CMI;
 
+    /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
         ProviderCapabilities.Refund |
+        ProviderCapabilities.PartialRefund |
         ProviderCapabilities.Webhook |
         ProviderCapabilities.RedirectFlow |
-        ProviderCapabilities.Cards;
+        ProviderCapabilities.Cards |
+        ProviderCapabilities.ThreeDSecure |
+        ProviderCapabilities.Settlement |
+        ProviderCapabilities.TypedWebhooks;
 
+    /// <summary>Construct the provider. Designed to be registered via DI.</summary>
     public CMIPaymentProvider(
         HttpClient httpClient,
         IOptions<CMIOptions> options,
@@ -54,21 +66,16 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
         if (string.IsNullOrWhiteSpace(_options.StoreKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(CMIOptions.StoreKey)} is required");
 
-        if (_httpClient.BaseAddress is null)
-        {
-            var url = _options.UseSandbox
-                ? _options.SandboxUrl ?? SandboxDefaultUrl
-                : _options.BaseUrl ?? LiveDefaultUrl;
-            _httpClient.BaseAddress = new Uri(url);
-        }
+        CMIHttpClient.ConfigureClient(_httpClient, _options);
     }
 
+    /// <inheritdoc/>
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        // PaymentMethodToken is the merchant's order id (oid). CMI does not have card tokens —
-        // the caller is responsible for the (oid, amount, email) tuple.
+        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
+
         var orderId = string.IsNullOrWhiteSpace(request.PaymentMethodToken)
             ? $"cmi-{Guid.NewGuid():N}"
             : request.PaymentMethodToken;
@@ -78,8 +85,6 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
         var billToName = request.Metadata?.GetValueOrDefault("BillToName") ?? string.Empty;
         var rnd = request.Metadata?.GetValueOrDefault("rnd") ?? DateTime.UtcNow.Ticks.ToString(CultureInfo.InvariantCulture);
 
-        // Field order is documented by CMI/Garanti BBVA. We follow hashAlgorithm=ver3 which
-        // hashes all POSTed fields (sorted, pipe-joined) plus the storekey, then SHA-512 base64.
         var fields = new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
             ["clientid"] = _options.ClientId,
@@ -102,7 +107,7 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
         var hash = ComputeRedirectHash(fields, _options.StoreKey);
         fields["hash"] = hash;
 
-        var baseUrl = _httpClient.BaseAddress?.ToString().TrimEnd('/') ?? (_options.UseSandbox ? SandboxDefaultUrl : LiveDefaultUrl);
+        var baseUrl = _httpClient.BaseAddress?.ToString().TrimEnd('/') ?? (_options.UseSandbox ? CMIHttpClient.SandboxDefaultUrl : CMIHttpClient.LiveDefaultUrl);
         var sb = new StringBuilder();
         sb.Append(baseUrl).Append("/fim/est3Dgate?");
         var first = true;
@@ -118,6 +123,11 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
         _logger.LogInformation("CMI redirect URL built for oid={OrderId} amount={Amount} currency={Currency}",
             orderId, amount, currency);
 
+        activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Pending);
+        BhenguPaymentDiagnostics.ChargesTotal.Add(1,
+            new KeyValuePair<string, object?>("provider", ProviderName),
+            new KeyValuePair<string, object?>("outcome", BhenguPaymentDiagnostics.Outcomes.Pending));
+
         return Task.FromResult(new PaymentResponse
         {
             GatewayReference = orderId,
@@ -129,64 +139,79 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
         });
     }
 
+    /// <inheritdoc/>
     public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
 
+        using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
         var total = request.Amount.ToString("0.00", CultureInfo.InvariantCulture);
         var xml = BuildCC5Request("Credit", request.GatewayReference, total);
+        var body = await CMIHttpClient.SendFormAsync(_httpClient, _logger, "fim/api",
+            new Dictionary<string, string> { ["DATA"] = xml }, "ProcessRefund", ct).ConfigureAwait(false);
 
-        var body = await SendXmlAsync("fim/api", xml, ct, "ProcessRefund").ConfigureAwait(false);
         var parsed = ParseCC5Response(body);
-
         _logger.LogInformation("CMI refund for oid={OrderId} response={Response} procReturnCode={Code}",
             request.GatewayReference, parsed.Response, parsed.ProcReturnCode);
+
+        var status = parsed.Response == "Approved" ? PaymentStatus.Refunded : PaymentStatus.Failed;
+        BhenguPaymentDiagnostics.RefundsTotal.Add(1,
+            new KeyValuePair<string, object?>("provider", ProviderName),
+            new KeyValuePair<string, object?>("outcome", status == PaymentStatus.Refunded ? BhenguPaymentDiagnostics.Outcomes.Success : BhenguPaymentDiagnostics.Outcomes.Error));
 
         return new RefundResponse
         {
             GatewayReference = request.GatewayReference,
             Amount = request.Amount,
-            Status = parsed.Response == "Approved" ? PaymentStatus.Refunded : PaymentStatus.Failed,
+            Status = status,
             ProcessedAt = DateTime.UtcNow,
             Message = parsed.Response
         };
     }
 
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
+        bool valid;
         if (string.IsNullOrWhiteSpace(_options.StoreKey))
         {
             _logger.LogWarning("CMI StoreKey not configured — callback hash verification cannot succeed.");
-            return false;
+            valid = false;
+        }
+        else
+        {
+            try
+            {
+                var canonical = payload + _options.StoreKey;
+                var bytes = SHA512.HashData(Encoding.UTF8.GetBytes(canonical));
+                var computed = Convert.ToBase64String(bytes);
+
+                valid = CryptographicOperations.FixedTimeEquals(
+                    Encoding.UTF8.GetBytes(signature),
+                    Encoding.UTF8.GetBytes(computed));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "CMI callback hash verification raised");
+                valid = false;
+            }
         }
 
-        try
-        {
-            // CMI callback payload arrives as a form-urlencoded body. We expect callers to pass the
-            // already-parsed payload as a sorted "k=v&k=v" string (or anything that the StoreKey will
-            // close out to the recomputed SHA-512 base64 digest CMI sends in the HASH field).
-            var canonical = payload + _options.StoreKey;
-            var bytes = SHA512.HashData(Encoding.UTF8.GetBytes(canonical));
-            var computed = Convert.ToBase64String(bytes);
-
-            return CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(signature),
-                Encoding.UTF8.GetBytes(computed));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "CMI callback hash verification raised");
-            return false;
-        }
+        BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
+            new KeyValuePair<string, object?>("provider", ProviderName),
+            new KeyValuePair<string, object?>("valid", valid));
+        return valid;
     }
 
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
 
+        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
         try
         {
             var pairs = ParseFormUrlEncoded(payload);
@@ -194,6 +219,8 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
             var procReturnCode = pairs.GetValueOrDefault("ProcReturnCode") ?? pairs.GetValueOrDefault("procReturnCode");
             var response = pairs.GetValueOrDefault("Response") ?? pairs.GetValueOrDefault("response");
             var mdStatus = pairs.GetValueOrDefault("mdStatus");
+            var amount = decimal.TryParse(pairs.GetValueOrDefault("amount"), NumberStyles.Number, CultureInfo.InvariantCulture, out var amt) ? amt : 0m;
+            var currency = pairs.GetValueOrDefault("currency") ?? _options.Currency;
 
             _logger.LogInformation("Parsed CMI callback: oid={Oid} response={Response} procReturn={Proc} mdStatus={MdStatus}",
                 oid, response, procReturnCode, mdStatus);
@@ -201,26 +228,59 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
             if (string.IsNullOrEmpty(oid))
                 return Task.FromResult<WebhookEvent?>(null);
 
-            // 3D Secure mdStatus: 1 = full auth, 2/3/4 = attempted, else failed.
-            // procReturnCode = "00" means approved on the issuer side.
-            var status = (response?.ToUpperInvariant(), procReturnCode) switch
+            // Refund signal — TranType=Credit in callback indicates refund acknowledgement.
+            var tranType = pairs.GetValueOrDefault("TranType") ?? pairs.GetValueOrDefault("tranType");
+            if (string.Equals(tranType, "Credit", StringComparison.OrdinalIgnoreCase) && response?.Equals("Approved", StringComparison.OrdinalIgnoreCase) == true)
             {
-                ("APPROVED", "00") => PaymentStatus.Completed,
-                ("APPROVED", _) => PaymentStatus.Completed,
-                ("DECLINED", _) => PaymentStatus.Failed,
-                ("ERROR", _) => PaymentStatus.Failed,
-                _ when mdStatus == "1" => PaymentStatus.Completed,
-                _ => (PaymentStatus?)null
-            };
+                return Task.FromResult<WebhookEvent?>(new RefundSucceededEvent
+                {
+                    GatewayReference = oid,
+                    Status = PaymentStatus.Refunded,
+                    EventType = response,
+                    Category = WebhookEventCategory.RefundSucceeded,
+                    RefundReference = oid,
+                    Amount = amount,
+                    Currency = currency,
+                    IsPartial = false,
+                    RawPayload = pairs.AsReadOnly()
+                });
+            }
 
-            if (status is null)
-                return Task.FromResult<WebhookEvent?>(null);
-
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
+            var statusUpper = response?.ToUpperInvariant();
+            return Task.FromResult<WebhookEvent?>((statusUpper, procReturnCode) switch
             {
-                GatewayReference = oid,
-                Status = status.Value,
-                EventType = response
+                ("APPROVED", _) => new ChargeSucceededEvent
+                {
+                    GatewayReference = oid,
+                    Status = PaymentStatus.Completed,
+                    EventType = response,
+                    Category = WebhookEventCategory.ChargeSucceeded,
+                    Amount = amount,
+                    Currency = currency,
+                    RawPayload = pairs.AsReadOnly()
+                },
+                ("DECLINED", _) or ("ERROR", _) => new ChargeFailedEvent
+                {
+                    GatewayReference = oid,
+                    Status = PaymentStatus.Failed,
+                    EventType = response,
+                    Category = WebhookEventCategory.ChargeFailed,
+                    Amount = amount,
+                    Currency = currency,
+                    FailureCode = procReturnCode,
+                    FailureMessage = pairs.GetValueOrDefault("ErrMsg"),
+                    RawPayload = pairs.AsReadOnly()
+                },
+                _ when mdStatus == "1" => new ChargeSucceededEvent
+                {
+                    GatewayReference = oid,
+                    Status = PaymentStatus.Completed,
+                    EventType = response,
+                    Category = WebhookEventCategory.ChargeSucceeded,
+                    Amount = amount,
+                    Currency = currency
+                },
+                _ => null
             });
         }
         catch (Exception ex)
@@ -232,8 +292,6 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
 
     internal static string ComputeRedirectHash(SortedDictionary<string, string> fields, string storeKey)
     {
-        // hashAlgorithm=ver3: pipe-join all values in sorted-key order, escape pipes/backslashes
-        // in values, then append storeKey, then SHA-512 base64.
         var sb = new StringBuilder();
         foreach (var kv in fields)
         {
@@ -250,7 +308,6 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
 
     private string BuildCC5Request(string type, string orderId, string total)
     {
-        // System.Xml.Linq for safety — we never concatenate XML by hand.
         var doc = new XDocument(
             new XDeclaration("1.0", "ISO-8859-9", null),
             new XElement("CC5Request",
@@ -283,44 +340,6 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
         }
     }
 
-    private async Task<string> SendXmlAsync(string path, string xml, CancellationToken ct, string operation)
-    {
-        using var req = new HttpRequestMessage(HttpMethod.Post, path)
-        {
-            Content = new StringContent(xml, Encoding.UTF8, "application/x-www-form-urlencoded")
-        };
-        // CMI's fim/api endpoint expects the XML body as form data under the key DATA.
-        req.Content = new FormUrlEncodedContent(new Dictionary<string, string> { ["DATA"] = xml });
-
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to CMI failed", ex);
-        }
-
-        var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-
-        if (response.StatusCode == HttpStatusCode.TooManyRequests)
-        {
-            var retryAfter = response.Headers.RetryAfter?.Delta?.TotalSeconds is double d ? (int)d : (int?)null;
-            throw new ProviderRateLimitException(ProviderName, retryAfter, responseBody);
-        }
-
-        if (!response.IsSuccessStatusCode)
-        {
-            _logger.LogError("CMI {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
-            if ((int)response.StatusCode is >= 400 and < 500)
-                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
-            throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
-        }
-
-        return responseBody;
-    }
-
     private static Dictionary<string, string> ParseFormUrlEncoded(string body)
     {
         var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -338,7 +357,6 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
 
     private static string NormaliseCurrency(string currency)
     {
-        // Accept either alpha-3 (MAD) or numeric (504). CMI requires numeric.
         return currency.ToUpperInvariant() switch
         {
             "MAD" => "504",
@@ -348,4 +366,11 @@ public sealed class CMIPaymentProvider : IPaymentGatewayProvider
             _ => currency
         };
     }
+}
+
+/// <summary>Helpers for Dictionary surface used across CMI's webhooks.</summary>
+internal static class CMIDictExtensions
+{
+    /// <summary>Project to an IReadOnlyDictionary view without copying.</summary>
+    public static IReadOnlyDictionary<string, string> AsReadOnly(this Dictionary<string, string> source) => source;
 }

@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Validation;
@@ -29,6 +30,7 @@ public static class ServiceCollectionExtensions
         if (string.IsNullOrWhiteSpace(probe.AccessToken))
             throw new ProviderConfigurationException("mercadopago", $"{MercadoPagoOptions.ConfigSection}:AccessToken is required");
 
+        services.AddBhenguInMemoryCache();
         services.AddHttpClient<MercadoPagoPaymentProvider>();
         services.AddTransient<IPaymentGatewayProvider, MercadoPagoPaymentProvider>(sp =>
             sp.GetRequiredService<MercadoPagoPaymentProvider>());
@@ -51,6 +53,11 @@ public static class ServiceCollectionExtensions
         services.AddHttpClient<MercadoPagoTokenisationProvider>();
         services.AddTransient<ITokenisationProvider, MercadoPagoTokenisationProvider>(sp => sp.GetRequiredService<MercadoPagoTokenisationProvider>());
         services.AddKeyedTransient<ITokenisationProvider>(ProviderNames.MercadoPago, (sp, _) => sp.GetRequiredService<MercadoPagoTokenisationProvider>());
+
+        // Marketplace (collector_id + application_fee splits).
+        services.AddHttpClient<MercadoPagoMarketplaceProvider>();
+        services.AddTransient<IMarketplaceProvider, MercadoPagoMarketplaceProvider>(sp => sp.GetRequiredService<MercadoPagoMarketplaceProvider>());
+        services.AddKeyedTransient<IMarketplaceProvider>(ProviderNames.MercadoPago, (sp, _) => sp.GetRequiredService<MercadoPagoMarketplaceProvider>());
 
         services.AddBhenguPaymentStartupValidation();
 

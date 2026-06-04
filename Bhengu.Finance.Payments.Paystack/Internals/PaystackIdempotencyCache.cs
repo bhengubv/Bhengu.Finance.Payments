@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Collections.Concurrent;
+using Bhengu.Finance.Payments.Core.Caching;
 
 namespace Bhengu.Finance.Payments.Paystack.Internals;
 
@@ -8,52 +9,103 @@ namespace Bhengu.Finance.Payments.Paystack.Internals;
 /// Client-side idempotency-key deduplication helper for the Paystack provider.
 /// Paystack does NOT expose a native idempotency-key header — this cache implements the contract
 /// the Bhengu Core surface promises by coalescing concurrent and repeat calls that share the same
-/// caller-supplied <c>IdempotencyKey</c> against the same in-flight or completed <see cref="Task{TResult}"/>.
+/// caller-supplied <c>IdempotencyKey</c> against the same in-flight or completed result.
 /// </summary>
 /// <remarks>
-/// <para><strong>In-memory only.</strong> The cache lives in process memory; it does NOT survive process
-/// restarts, and it is NOT shared across replicas. A node-crash mid-call followed by a client retry
-/// will still reach Paystack a second time. For at-most-once semantics across a restart you must back
-/// the cache with a distributed store at the application layer.</para>
-/// <para>Entries are retained for the lifetime of the process. The cache is intentionally
-/// unbounded — keys are caller-supplied UUIDs that exhibit natural turnover, but pathological
-/// callers can grow it. Wrap with eviction at the call site if that is a concern.</para>
+/// <para>Backed by <see cref="IBhenguDistributedCache"/> so the dedupe survives process restarts
+/// and works across replicas when a Redis cache is installed
+/// (<c>Bhengu.Finance.Payments.Redis.AddBhenguRedisCache</c>); falls back to the process-local
+/// <see cref="InMemoryBhenguDistributedCache"/> for single-instance deployments.</para>
+/// <para>Concurrent in-flight calls within a single process are still coalesced onto one
+/// <see cref="Task{TResult}"/> so a burst of identical retries does not produce N redundant API
+/// calls; only the first completes and its result is shared with peers and then committed to the
+/// distributed store with a 24h TTL.</para>
 /// </remarks>
 public sealed class PaystackIdempotencyCache
 {
+    private const string KeyPrefix = "paystack:idempotency:";
+    private static readonly TimeSpan TimeToLive = TimeSpan.FromHours(24);
+
+    private readonly IBhenguDistributedCache _cache;
     private readonly ConcurrentDictionary<string, object> _inFlight = new(StringComparer.Ordinal);
 
     /// <summary>
+    /// Construct with an injected distributed cache. The default <see cref="InMemoryBhenguDistributedCache"/>
+    /// is registered automatically by <c>AddPaystackPayments</c> so single-instance callers do not
+    /// have to do anything; multi-replica callers install the Redis package and re-register.
+    /// </summary>
+    public PaystackIdempotencyCache(IBhenguDistributedCache cache)
+    {
+        _cache = cache ?? throw new ArgumentNullException(nameof(cache));
+    }
+
+    /// <summary>
+    /// Default-constructor convenience for tests and back-compat callers that do not have a DI
+    /// container. Uses a private <see cref="InMemoryBhenguDistributedCache"/>.
+    /// </summary>
+    public PaystackIdempotencyCache() : this(new InMemoryBhenguDistributedCache()) { }
+
+    /// <summary>
     /// Execute <paramref name="factory"/> at most once for the given <paramref name="idempotencyKey"/>.
-    /// Subsequent calls (concurrent or sequential) with the same key return the same <see cref="Task{TResult}"/>
-    /// instance, so callers observe an identical result (including a thrown exception).
+    /// Concurrent in-flight callers share the same <see cref="Task{TResult}"/>; subsequent callers
+    /// after the first one completes are served from the distributed cache for <c>24h</c>.
     /// </summary>
     /// <typeparam name="T">Result type of the factory.</typeparam>
-    /// <param name="idempotencyKey">
-    /// The caller-supplied idempotency key. When null or whitespace the factory is invoked without
-    /// any deduplication — preserves prior behaviour for callers that do not opt in.
-    /// </param>
-    /// <param name="factory">Delegate that performs the side-effecting work.</param>
+    /// <param name="idempotencyKey">Caller-supplied dedupe token. Null or whitespace bypasses the cache.</param>
+    /// <param name="factory">Async factory producing the result. Only invoked on cache miss.</param>
     /// <returns>The Task returned by the factory, possibly cached from a prior call.</returns>
-    public Task<T> GetOrAddAsync<T>(string? idempotencyKey, Func<Task<T>> factory)
+    public async Task<T> GetOrAddAsync<T>(string? idempotencyKey, Func<Task<T>> factory) where T : class
     {
         ArgumentNullException.ThrowIfNull(factory);
 
         if (string.IsNullOrWhiteSpace(idempotencyKey))
-            return factory();
+            return await factory().ConfigureAwait(false);
 
-        var task = (Task<T>)_inFlight.GetOrAdd(idempotencyKey, _ => factory());
-        return task;
+        var cacheKey = KeyPrefix + idempotencyKey;
+
+        // Hot path: distributed cache hit.
+        var cached = await _cache.GetAsync<T>(cacheKey).ConfigureAwait(false);
+        if (cached is not null)
+            return cached;
+
+        // In-flight coalesce: peers share the same Task.
+        var task = (Task<T>)_inFlight.GetOrAdd(idempotencyKey, _ => RunAndPersistAsync(factory, cacheKey));
+        try
+        {
+            return await task.ConfigureAwait(false);
+        }
+        finally
+        {
+            // Evict only the entry we added — survives concurrent peers using the same key.
+            _inFlight.TryRemove(new KeyValuePair<string, object>(idempotencyKey, task));
+        }
+    }
+
+    private async Task<T> RunAndPersistAsync<T>(Func<Task<T>> factory, string cacheKey) where T : class
+    {
+        var result = await factory().ConfigureAwait(false);
+        if (result is not null)
+            await _cache.SetAsync(cacheKey, result, TimeToLive).ConfigureAwait(false);
+        return result!;
     }
 
     /// <summary>
     /// Remove a cached entry. Use after a deliberate retry decision to allow a future call with the
     /// same key to reach the provider again. Most callers will not need this.
     /// </summary>
-    /// <returns>True when an entry was evicted; false when the key was not cached.</returns>
+    /// <returns>
+    /// True when an entry was evicted from either the in-flight map or the distributed cache;
+    /// false only when nothing was cached under that key.
+    /// </returns>
     public bool Invalidate(string idempotencyKey)
     {
         ArgumentException.ThrowIfNullOrEmpty(idempotencyKey);
-        return _inFlight.TryRemove(idempotencyKey, out _);
+        var inFlightRemoved = _inFlight.TryRemove(idempotencyKey, out _);
+        // Sync-over-async on a process-local InMemoryBhenguDistributedCache is safe (it never blocks
+        // on I/O); Redis-backed implementations should expose an InvalidateAsync overload — out of scope here.
+        var cacheKey = KeyPrefix + idempotencyKey;
+        var existed = _cache.GetAsync<object>(cacheKey).GetAwaiter().GetResult() is not null;
+        _cache.RemoveAsync(cacheKey).GetAwaiter().GetResult();
+        return inFlightRemoved || existed;
     }
 }

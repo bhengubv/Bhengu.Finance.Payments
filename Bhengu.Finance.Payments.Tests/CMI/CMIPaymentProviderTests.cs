@@ -7,6 +7,7 @@ using Bhengu.Finance.Payments.CMI.Configuration;
 using Bhengu.Finance.Payments.CMI.Providers;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Tests.TestHelpers;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -73,6 +74,18 @@ public class CMIPaymentProviderTests
     }
 
     [Fact]
+    public void Capabilities_Include3DSAndTypedWebhooksAndSettlement()
+    {
+        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+        Assert.True(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.ThreeDSecure));
+        Assert.True(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.TypedWebhooks));
+        Assert.True(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.Settlement));
+        Assert.True(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.PartialRefund));
+        Assert.False(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.Tokenisation));
+        Assert.False(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.Payout));
+    }
+
+    [Fact]
     public async Task ProcessPaymentAsync_ReturnsPendingWithRedirectUrl_AndSignedHash()
     {
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
@@ -86,7 +99,6 @@ public class CMIPaymentProviderTests
         Assert.Contains("clientid=600000001", response.RedirectUrl);
         Assert.Contains("oid=ORDER_42", response.RedirectUrl);
         Assert.Contains("hash=", response.RedirectUrl);
-        // Currency 'MAD' should be normalised to '504'.
         Assert.Contains("currency=504", response.RedirectUrl);
     }
 
@@ -204,22 +216,36 @@ public class CMIPaymentProviderTests
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsCompletedEvent_OnApprovedCallback()
+    public async Task ParseWebhookAsync_ReturnsTypedChargeSucceeded_OnApprovedCallback()
     {
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
-        var evt = await provider.ParseWebhookAsync("oid=ORDER_42&Response=Approved&ProcReturnCode=00&mdStatus=1");
+        var evt = await provider.ParseWebhookAsync("oid=ORDER_42&Response=Approved&ProcReturnCode=00&mdStatus=1&amount=150.00&currency=504");
         Assert.NotNull(evt);
-        Assert.Equal("ORDER_42", evt!.GatewayReference);
-        Assert.Equal(PaymentStatus.Completed, evt.Status);
+        var typed = Assert.IsType<ChargeSucceededEvent>(evt);
+        Assert.Equal("ORDER_42", typed.GatewayReference);
+        Assert.Equal(WebhookEventCategory.ChargeSucceeded, typed.Category);
+        Assert.Equal(150m, typed.Amount);
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsFailedEvent_OnDeclinedCallback()
+    public async Task ParseWebhookAsync_ReturnsTypedChargeFailed_OnDeclinedCallback()
     {
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
-        var evt = await provider.ParseWebhookAsync("oid=ORDER_42&Response=Declined&ProcReturnCode=05");
+        var evt = await provider.ParseWebhookAsync("oid=ORDER_42&Response=Declined&ProcReturnCode=05&amount=10.00&currency=504");
         Assert.NotNull(evt);
-        Assert.Equal(PaymentStatus.Failed, evt!.Status);
+        var typed = Assert.IsType<ChargeFailedEvent>(evt);
+        Assert.Equal(WebhookEventCategory.ChargeFailed, typed.Category);
+        Assert.Equal("05", typed.FailureCode);
+    }
+
+    [Fact]
+    public async Task ParseWebhookAsync_ReturnsTypedRefund_OnCreditCallback()
+    {
+        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+        var evt = await provider.ParseWebhookAsync("oid=ORDER_42&TranType=Credit&Response=Approved&ProcReturnCode=00&amount=50.00&currency=504");
+        Assert.NotNull(evt);
+        var typed = Assert.IsType<RefundSucceededEvent>(evt);
+        Assert.Equal(PaymentStatus.Refunded, typed.Status);
     }
 
     [Fact]

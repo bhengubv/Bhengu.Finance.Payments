@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Validation;
@@ -11,6 +12,7 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace Bhengu.Finance.Payments.Slydepay.Extensions;
 
+/// <summary>DI registration helpers for the Slydepay provider.</summary>
 public static class ServiceCollectionExtensions
 {
     /// <summary>
@@ -31,12 +33,14 @@ public static class ServiceCollectionExtensions
         if (string.IsNullOrWhiteSpace(probe.MerchantKey))
             throw new ProviderConfigurationException("slydepay", $"{SlydepayOptions.ConfigSection}:MerchantKey is required");
 
+        services.AddBhenguInMemoryCache();
+
         services.AddHttpClient<SlydepayPaymentProvider>();
         services.AddTransient<IPaymentGatewayProvider, SlydepayPaymentProvider>(sp =>
             sp.GetRequiredService<SlydepayPaymentProvider>());
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Slydepay, (sp, _) => sp.GetRequiredService<SlydepayPaymentProvider>());
-        services.AddBhenguPaymentStartupValidation();
 
+        services.AddBhenguPaymentStartupValidation();
         return services;
     }
 }

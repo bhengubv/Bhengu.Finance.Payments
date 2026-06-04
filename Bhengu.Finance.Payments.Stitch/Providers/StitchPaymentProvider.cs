@@ -12,6 +12,7 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Stitch.Configuration;
+using Bhengu.Finance.Payments.Stitch.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -74,10 +75,15 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
             : new Uri(_httpClient.BaseAddress, "graphql");
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return StitchObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+    }
 
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+    {
         if (string.IsNullOrWhiteSpace(_options.BeneficiaryAccountNumber) ||
             string.IsNullOrWhiteSpace(_options.BeneficiaryBankId))
             throw new ProviderConfigurationException(ProviderName,
@@ -141,10 +147,15 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         };
     }
 
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return StitchObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+    }
 
+    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+    {
         // DestinationToken format: "<bankId>:<accountNumber>:<beneficiaryName>"
         var parts = request.DestinationToken.Split(':');
         if (parts.Length < 3)
@@ -205,10 +216,15 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         };
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return StitchObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+    }
 
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
         var requestBody = new
         {
             amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture),
@@ -232,6 +248,7 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         };
     }
 
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -240,9 +257,11 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
             _logger.LogWarning("Stitch WebhookSecret not configured — signature verification cannot succeed.");
+            StitchObservability.RecordWebhookVerification(false);
             return false;
         }
 
+        bool verified;
         try
         {
             using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
@@ -250,21 +269,28 @@ public sealed class StitchPaymentProvider : IPaymentGatewayProvider, IPayoutProv
             var supplied = signature.StartsWith("sha256=", StringComparison.OrdinalIgnoreCase)
                 ? signature["sha256=".Length..]
                 : signature;
-            return CryptographicOperations.FixedTimeEquals(
+            verified = CryptographicOperations.FixedTimeEquals(
                 Encoding.UTF8.GetBytes(computed),
                 Encoding.UTF8.GetBytes(supplied.ToLowerInvariant()));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Stitch webhook signature verification raised");
-            return false;
+            verified = false;
         }
+        StitchObservability.RecordWebhookVerification(verified);
+        return verified;
     }
 
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+        return StitchObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+    }
 
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
+    {
         try
         {
             var webhookEvent = JsonSerializer.Deserialize<StitchWebhookEvent>(payload);

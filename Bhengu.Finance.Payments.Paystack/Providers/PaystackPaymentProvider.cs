@@ -74,10 +74,12 @@ public sealed class PaystackPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _options.SecretKey);
     }
 
+    /// <inheritdoc/>
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPaymentCoreAsync(request, ct));
+        return PaystackObservability.ObserveChargeAsync(request.Currency, () =>
+            _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPaymentCoreAsync(request, ct)));
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
@@ -115,10 +117,12 @@ public sealed class PaystackPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         };
     }
 
+    /// <inheritdoc/>
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPayoutCoreAsync(request, ct));
+        return PaystackObservability.ObservePayoutAsync(request.Currency, () =>
+            _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPayoutCoreAsync(request, ct)));
     }
 
     private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
@@ -154,10 +158,12 @@ public sealed class PaystackPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         };
     }
 
+    /// <inheritdoc/>
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessRefundCoreAsync(request, ct));
+        return PaystackObservability.ObserveRefundAsync(request.GatewayReference, () =>
+            _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessRefundCoreAsync(request, ct)));
     }
 
     private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
@@ -185,6 +191,7 @@ public sealed class PaystackPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         };
     }
 
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -194,30 +201,39 @@ public sealed class PaystackPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         if (string.IsNullOrWhiteSpace(secret))
         {
             _logger.LogWarning("Paystack webhook secret not configured — signature verification cannot succeed.");
+            PaystackObservability.RecordWebhookVerification(false);
             return false;
         }
 
+        bool verified;
         try
         {
             using var hmac = new HMACSHA512(Encoding.UTF8.GetBytes(secret));
             var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
             var computedSignature = Convert.ToHexString(computedHash).ToLowerInvariant();
 
-            return CryptographicOperations.FixedTimeEquals(
+            verified = CryptographicOperations.FixedTimeEquals(
                 Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
                 Encoding.UTF8.GetBytes(computedSignature));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Paystack webhook signature verification raised");
-            return false;
+            verified = false;
         }
+        PaystackObservability.RecordWebhookVerification(verified);
+        return verified;
     }
 
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+        return PaystackObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+    }
 
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
+    {
         try
         {
             var webhookEvent = JsonSerializer.Deserialize<PaystackWebhookEvent>(payload);

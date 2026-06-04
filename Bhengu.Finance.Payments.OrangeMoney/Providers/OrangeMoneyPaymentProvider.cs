@@ -7,9 +7,12 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.OrangeMoney.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -26,8 +29,8 @@ namespace Bhengu.Finance.Payments.OrangeMoney.Providers;
 /// process the reversal manually via the Orange Money merchant portal.
 /// </para>
 /// <para>
-/// <b>Payouts:</b> Orange Money Web Payment does not expose disbursements, so this provider
-/// intentionally does NOT implement <see cref="IPayoutProvider"/>.
+/// <b>Payouts:</b> Implemented via the Orange Money B2C cash-in API
+/// (<c>/orange-money-b2c/{country}/v1/cashin</c>) — see <see cref="ProcessPayoutAsync"/>.
 /// </para>
 /// <para>
 /// <b>Webhook signature note:</b> Orange Money's notif callback does not carry a cryptographic signature.
@@ -36,33 +39,42 @@ namespace Bhengu.Finance.Payments.OrangeMoney.Providers;
 /// signature against the cached notif_token; callers must persist that token alongside their order record.
 /// </para>
 /// </summary>
-public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider
+public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly OrangeMoneyOptions _options;
     private readonly ILogger<OrangeMoneyPaymentProvider> _logger;
+    private readonly IBhenguDistributedCache? _idempotencyCache;
     private readonly string _baseUrl;
 
     private string? _cachedAccessToken;
     private DateTime _cachedTokenExpiresUtc = DateTime.MinValue;
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
 
+    /// <inheritdoc/>
     public string ProviderName => ProviderNames.OrangeMoney;
 
+    /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
+        ProviderCapabilities.Payout |
         ProviderCapabilities.Webhook |
         ProviderCapabilities.RedirectFlow |
-        ProviderCapabilities.MobileMoney;
+        ProviderCapabilities.MobileMoney |
+        ProviderCapabilities.Idempotency |
+        ProviderCapabilities.TypedWebhooks;
 
+    /// <summary>Construct the Orange Money payment provider. <paramref name="idempotencyCache"/> is optional — when omitted, idempotency replay is a no-op.</summary>
     public OrangeMoneyPaymentProvider(
         HttpClient httpClient,
         IOptions<OrangeMoneyOptions> options,
-        ILogger<OrangeMoneyPaymentProvider> logger)
+        ILogger<OrangeMoneyPaymentProvider> logger,
+        IBhenguDistributedCache? idempotencyCache = null)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _idempotencyCache = idempotencyCache;
 
         if (string.IsNullOrWhiteSpace(_options.ConsumerKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(OrangeMoneyOptions.ConsumerKey)} is required");
@@ -82,48 +94,89 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider
             _httpClient.BaseAddress = new Uri(_baseUrl);
     }
 
+    /// <inheritdoc/>
     public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        var orderId = request.Metadata?.TryGetValue("order_id", out var oid) == true
-            ? oid
-            : Guid.NewGuid().ToString("N")[..20];
-        var lang = request.Metadata?.TryGetValue("lang", out var l) == true ? l : "fr";
-
-        var body = new
+        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
+        var started = DateTime.UtcNow;
+        var cached = await TryGetCachedAsync<PaymentResponse>(request.IdempotencyKey, "charge", ct).ConfigureAwait(false);
+        if (cached is not null)
         {
-            merchant_key = _options.MerchantKey,
-            currency = request.Currency.ToUpperInvariant(),
-            order_id = orderId,
-            amount = (int)Math.Round(request.Amount, MidpointRounding.AwayFromZero),
-            return_url = _options.ReturnUrl,
-            cancel_url = _options.CancelUrl,
-            notif_url = _options.NotifUrl,
-            lang,
-            reference = request.Description
-        };
+            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+            return cached;
+        }
 
-        var (responseBody, _) = await SendAsync(
-            HttpMethod.Post, $"orange-money-webpay/{_options.Country}/v1/webpayment", body, ct, "Webpayment").ConfigureAwait(false);
-
-        var wp = JsonSerializer.Deserialize<OrangeWebPaymentResponse>(responseBody);
-
-        _logger.LogInformation(
-            "Orange Money web payment created: OrderId={OrderId} PayToken={PayToken} Status={Status}",
-            orderId, wp?.PayToken, wp?.Status);
-
-        // payment_url is returned to the caller via RedirectUrl — they redirect the payer to it.
-        return new PaymentResponse
+        try
         {
-            GatewayReference = wp?.PayToken ?? orderId,
-            Status = MapStatus(wp?.Status),
-            Amount = request.Amount,
-            Currency = request.Currency,
-            ProcessedAt = DateTime.UtcNow,
-            RedirectUrl = wp?.PaymentUrl,
-            Message = wp?.Message ?? wp?.Status
-        };
+            var orderId = request.Metadata?.TryGetValue("order_id", out var oid) == true
+                ? oid
+                : (request.IdempotencyKey is { Length: > 0 } k ? k[..Math.Min(20, k.Length)] : Guid.NewGuid().ToString("N")[..20]);
+            var lang = request.Metadata?.TryGetValue("lang", out var l) == true ? l : "fr";
+
+            var body = new
+            {
+                merchant_key = _options.MerchantKey,
+                currency = request.Currency.ToUpperInvariant(),
+                order_id = orderId,
+                amount = (int)Math.Round(request.Amount, MidpointRounding.AwayFromZero),
+                return_url = _options.ReturnUrl,
+                cancel_url = _options.CancelUrl,
+                notif_url = _options.NotifUrl,
+                lang,
+                reference = request.Description
+            };
+
+            var (responseBody, _) = await SendAsync(
+                HttpMethod.Post, $"orange-money-webpay/{_options.Country}/v1/webpayment", body, ct, "Webpayment").ConfigureAwait(false);
+
+            var wp = JsonSerializer.Deserialize<OrangeWebPaymentResponse>(responseBody);
+
+            _logger.LogInformation(
+                "Orange Money web payment created: OrderId={OrderId} PayToken={PayToken} Status={Status}",
+                orderId, wp?.PayToken, wp?.Status);
+
+            // payment_url is returned to the caller via RedirectUrl — they redirect the payer to it.
+            var response = new PaymentResponse
+            {
+                GatewayReference = wp?.PayToken ?? orderId,
+                Status = MapStatus(wp?.Status),
+                Amount = request.Amount,
+                Currency = request.Currency,
+                ProcessedAt = DateTime.UtcNow,
+                RedirectUrl = wp?.PaymentUrl,
+                Message = wp?.Message ?? wp?.Status
+            };
+
+            await TrySetCachedAsync(request.IdempotencyKey, "charge", response, ct).ConfigureAwait(false);
+            var outcome = response.Status switch
+            {
+                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
+                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
+                _ => BhenguPaymentDiagnostics.Outcomes.Declined
+            };
+            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("outcome", outcome));
+            activity.SetOutcome(outcome);
+            return response;
+        }
+        catch (Exception ex)
+        {
+            var outcome = ClassifyOutcome(ex);
+            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("outcome", outcome));
+            activity.SetOutcome(outcome);
+            throw;
+        }
+        finally
+        {
+            BhenguPaymentDiagnostics.ChargeDurationMs.Record(
+                (DateTime.UtcNow - started).TotalMilliseconds,
+                new KeyValuePair<string, object?>("provider", ProviderName));
+        }
     }
 
     /// <summary>
@@ -139,6 +192,84 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider
     }
 
     /// <summary>
+    /// Pay funds out via the Orange Money B2C cash-in API
+    /// (<c>/orange-money-b2c/{country}/v1/cashin</c>). The <see cref="PayoutRequest.DestinationToken"/>
+    /// must be the recipient's Orange Money MSISDN (with country prefix, e.g. <c>225XXXXXXXX</c>).
+    /// </summary>
+    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, request.Currency);
+        var cached = await TryGetCachedAsync<PayoutResponse>(request.IdempotencyKey, "payout", ct).ConfigureAwait(false);
+        if (cached is not null)
+        {
+            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+            return cached;
+        }
+
+        try
+        {
+            var orderId = request.IdempotencyKey is { Length: > 0 } k
+                ? k[..Math.Min(20, k.Length)]
+                : Guid.NewGuid().ToString("N")[..20];
+
+            var body = new
+            {
+                merchant_key = _options.MerchantKey,
+                currency = request.Currency.ToUpperInvariant(),
+                order_id = orderId,
+                amount = (int)Math.Round(request.Amount, MidpointRounding.AwayFromZero),
+                subscriber_msisdn = request.DestinationToken.TrimStart('+'),
+                notif_url = _options.NotifUrl,
+                reference = request.Description
+            };
+
+            var (responseBody, _) = await SendAsync(
+                HttpMethod.Post, $"orange-money-b2c/{_options.Country}/v1/cashin", body, ct, "Cashin").ConfigureAwait(false);
+
+            var b2c = JsonSerializer.Deserialize<OrangeB2cResponse>(responseBody);
+
+            _logger.LogInformation(
+                "Orange Money B2C cashin created: OrderId={OrderId} TxnId={TxnId} Status={Status}",
+                orderId, b2c?.TxnId, b2c?.Status);
+
+            var status = MapStatus(b2c?.Status);
+            var response = new PayoutResponse
+            {
+                GatewayReference = b2c?.TxnId ?? orderId,
+                Status = status,
+                Amount = request.Amount,
+                Currency = request.Currency,
+                ProcessedAt = DateTime.UtcNow
+            };
+
+            await TrySetCachedAsync(request.IdempotencyKey, "payout", response, ct).ConfigureAwait(false);
+            var outcome = status switch
+            {
+                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
+                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
+                PaymentStatus.Failed => BhenguPaymentDiagnostics.Outcomes.Declined,
+                _ => BhenguPaymentDiagnostics.Outcomes.Success
+            };
+            BhenguPaymentDiagnostics.PayoutsTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("outcome", outcome));
+            activity.SetOutcome(outcome);
+            return response;
+        }
+        catch (Exception ex)
+        {
+            var outcome = ClassifyOutcome(ex);
+            BhenguPaymentDiagnostics.PayoutsTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("outcome", outcome));
+            activity.SetOutcome(outcome);
+            throw;
+        }
+    }
+
+    /// <summary>
     /// Orange Money does NOT cryptographically sign callbacks. Pass the persisted <c>notif_token</c>
     /// (returned by <see cref="ProcessPaymentAsync"/> as part of the underlying API response) as
     /// <paramref name="signature"/>. The payload's <c>notif_token</c> field is compared in constant time.
@@ -148,6 +279,7 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
+        bool valid = false;
         try
         {
             var evt = JsonSerializer.Deserialize<OrangeNotifPayload>(payload);
@@ -155,23 +287,33 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider
             if (string.IsNullOrEmpty(notifToken))
             {
                 _logger.LogWarning("Orange Money notif payload missing notif_token — cannot verify.");
-                return false;
+                valid = false;
             }
-
-            return System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(notifToken),
-                Encoding.UTF8.GetBytes(signature));
+            else
+            {
+                valid = System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
+                    Encoding.UTF8.GetBytes(notifToken),
+                    Encoding.UTF8.GetBytes(signature));
+            }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Orange Money notif token verification raised");
-            return false;
+            valid = false;
         }
+
+        BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
+            new KeyValuePair<string, object?>("provider", ProviderName),
+            new KeyValuePair<string, object?>("valid", valid));
+        return valid;
     }
 
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+
+        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
 
         try
         {
@@ -183,18 +325,89 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider
                 "Parsed Orange Money notif: PayToken={PayToken} Status={Status}",
                 evt.PayToken, evt.Status);
 
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
+            var status = MapStatus(evt.Status);
+            decimal.TryParse(evt.Amount, NumberStyles.Number, CultureInfo.InvariantCulture, out var amount);
+            var currency = evt.Currency ?? "XOF";
+            var statusLower = evt.Status?.ToUpperInvariant();
+            var notifType = evt.NotificationType?.ToLowerInvariant();
+
+            WebhookEvent? typed = (notifType, statusLower) switch
             {
-                GatewayReference = evt.PayToken,
-                Status = MapStatus(evt.Status),
-                EventType = (evt.Status ?? "unknown").ToLowerInvariant()
-            });
+                ("cashin", "SUCCESS") or ("cashin", "SUCCESSFUL") or ("cashin", "COMPLETED") => new PayoutCompletedEvent
+                {
+                    GatewayReference = evt.PayToken,
+                    Status = PaymentStatus.Completed,
+                    EventType = evt.Status,
+                    Category = WebhookEventCategory.PayoutCompleted,
+                    PayoutReference = evt.PayToken,
+                    Amount = amount,
+                    Currency = currency
+                },
+                ("cashin", _) when status == PaymentStatus.Failed => new PayoutFailedEvent
+                {
+                    GatewayReference = evt.PayToken,
+                    Status = PaymentStatus.Failed,
+                    EventType = evt.Status,
+                    Category = WebhookEventCategory.PayoutFailed,
+                    PayoutReference = evt.PayToken,
+                    Amount = amount,
+                    Currency = currency,
+                    FailureCode = evt.Status
+                },
+                _ => MapChargeStatus(evt, status, amount, currency)
+            };
+
+            return Task.FromResult(typed);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to parse Orange Money notif payload");
             return Task.FromResult<WebhookEvent?>(null);
         }
+    }
+
+    private static WebhookEvent? MapChargeStatus(OrangeNotifPayload evt, PaymentStatus status, decimal amount, string currency)
+    {
+        var eventType = (evt.Status ?? "unknown").ToLowerInvariant();
+        return status switch
+        {
+            PaymentStatus.Completed => new ChargeSucceededEvent
+            {
+                GatewayReference = evt.PayToken!,
+                Status = PaymentStatus.Completed,
+                EventType = eventType,
+                Category = WebhookEventCategory.ChargeSucceeded,
+                Amount = amount,
+                Currency = currency
+            },
+            PaymentStatus.Pending => new ChargePendingEvent
+            {
+                GatewayReference = evt.PayToken!,
+                Status = PaymentStatus.Pending,
+                EventType = eventType,
+                Category = WebhookEventCategory.ChargePending,
+                Amount = amount,
+                Currency = currency
+            },
+            PaymentStatus.Failed => new ChargeFailedEvent
+            {
+                GatewayReference = evt.PayToken!,
+                Status = PaymentStatus.Failed,
+                EventType = eventType,
+                Category = WebhookEventCategory.ChargeFailed,
+                Amount = amount,
+                Currency = currency,
+                FailureCode = evt.Status
+            },
+            PaymentStatus.Cancelled => new WebhookEvent
+            {
+                GatewayReference = evt.PayToken!,
+                Status = PaymentStatus.Cancelled,
+                EventType = eventType,
+                Category = WebhookEventCategory.Unknown
+            },
+            _ => null
+        };
     }
 
     // ===== HTTP plumbing =====
@@ -233,7 +446,7 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider
         {
             _logger.LogError("Orange Money {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
-                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
+                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
         }
 
@@ -292,6 +505,30 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider
         }
     }
 
+    private async Task<T?> TryGetCachedAsync<T>(string? idempotencyKey, string operation, CancellationToken ct) where T : class
+    {
+        if (_idempotencyCache is null || string.IsNullOrWhiteSpace(idempotencyKey))
+            return null;
+        var key = $"orangemoney:{operation}:{idempotencyKey}";
+        return await _idempotencyCache.GetAsync<T>(key, ct).ConfigureAwait(false);
+    }
+
+    private async Task TrySetCachedAsync<T>(string? idempotencyKey, string operation, T value, CancellationToken ct) where T : class
+    {
+        if (_idempotencyCache is null || string.IsNullOrWhiteSpace(idempotencyKey))
+            return;
+        var key = $"orangemoney:{operation}:{idempotencyKey}";
+        await _idempotencyCache.SetAsync(key, value, TimeSpan.FromHours(24), ct).ConfigureAwait(false);
+    }
+
+    private static string ClassifyOutcome(Exception ex) => ex switch
+    {
+        PaymentDeclinedException => BhenguPaymentDiagnostics.Outcomes.Declined,
+        ProviderRateLimitException => BhenguPaymentDiagnostics.Outcomes.RateLimited,
+        ProviderUnavailableException => BhenguPaymentDiagnostics.Outcomes.Unavailable,
+        _ => BhenguPaymentDiagnostics.Outcomes.Error
+    };
+
     private static PaymentStatus MapStatus(string? raw) => (raw ?? string.Empty).ToUpperInvariant() switch
     {
         "SUCCESS" or "SUCCESSFUL" or "COMPLETED" or "PAID" => PaymentStatus.Completed,
@@ -320,6 +557,14 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider
         [JsonPropertyName("notif_token")] public string? NotifToken { get; set; }
     }
 
+    private sealed class OrangeB2cResponse
+    {
+        [JsonPropertyName("status")] public string? Status { get; set; }
+        [JsonPropertyName("message")] public string? Message { get; set; }
+        [JsonPropertyName("txnid")] public string? TxnId { get; set; }
+        [JsonPropertyName("order_id")] public string? OrderId { get; set; }
+    }
+
     private sealed class OrangeNotifPayload
     {
         [JsonPropertyName("status")] public string? Status { get; set; }
@@ -329,5 +574,6 @@ public sealed class OrangeMoneyPaymentProvider : IPaymentGatewayProvider
         [JsonPropertyName("amount")] public string? Amount { get; set; }
         [JsonPropertyName("currency")] public string? Currency { get; set; }
         [JsonPropertyName("txnid")] public string? TxnId { get; set; }
+        [JsonPropertyName("notification_type")] public string? NotificationType { get; set; }
     }
 }

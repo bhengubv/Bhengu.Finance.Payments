@@ -1,17 +1,18 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
-using System.Collections.Concurrent;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.PayFast.Configuration;
+using Bhengu.Finance.Payments.PayFast.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -24,10 +25,15 @@ namespace Bhengu.Finance.Payments.PayFast.Providers;
 /// </summary>
 public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
 {
+    private const string SubSeenKeyPrefix = "payfast:sub-seen:";
+    private static readonly TimeSpan SubSeenTtl = TimeSpan.FromDays(90);
+
     private readonly HttpClient _httpClient;
     private readonly PayFastOptions _options;
     private readonly ILogger<PayFastPaymentProvider> _logger;
+    private readonly IBhenguDistributedCache _cache;
 
+    /// <inheritdoc/>
     public string ProviderName => ProviderNames.PayFast;
 
     /// <inheritdoc/>
@@ -42,14 +48,21 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
         ProviderCapabilities.Subscriptions |
         ProviderCapabilities.Mandates;
 
+    /// <summary>
+    /// Construct the provider. The <paramref name="cache"/> backs the subscription "first-seen"
+    /// dedup used to distinguish SubscriptionCreated from SubscriptionRenewed across replicas and
+    /// process restarts (entries are TTL'd to 90 days).
+    /// </summary>
     public PayFastPaymentProvider(
         HttpClient httpClient,
         IOptions<PayFastOptions> options,
-        ILogger<PayFastPaymentProvider> logger)
+        ILogger<PayFastPaymentProvider> logger,
+        IBhenguDistributedCache cache)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _cache = cache ?? throw new ArgumentNullException(nameof(cache));
 
         if (string.IsNullOrWhiteSpace(_options.MerchantId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PayFastOptions.MerchantId)} is required");
@@ -62,10 +75,24 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
         }
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <summary>Back-compat constructor that uses the process-local in-memory cache.</summary>
+    public PayFastPaymentProvider(
+        HttpClient httpClient,
+        IOptions<PayFastOptions> options,
+        ILogger<PayFastPaymentProvider> logger)
+        : this(httpClient, options, logger, new InMemoryBhenguDistributedCache())
+    {
+    }
+
+    /// <inheritdoc/>
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return PayFastObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+    }
 
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+    {
         var amountInCents = (int)(request.Amount * 100);
         var timestamp = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss");
 
@@ -140,10 +167,15 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
         };
     }
 
+    /// <inheritdoc/>
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return PayFastObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+    }
 
+    private Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
         // PayFast does not expose a refund API — refunds are processed manually via merchant dashboard.
         // We return a deterministic tracking reference so the caller can match this entry to the manual
         // action when reconciling. Consumers requiring automated refunds must use a different provider.
@@ -171,6 +203,7 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
+        bool verified;
         try
         {
             var parameters = ParseFormUrlEncoded(payload);
@@ -188,15 +221,17 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
             var hashBytes = MD5.HashData(Encoding.UTF8.GetBytes(paramString));
             var computed = Convert.ToHexString(hashBytes).ToLowerInvariant();
 
-            return CryptographicOperations.FixedTimeEquals(
+            verified = CryptographicOperations.FixedTimeEquals(
                 Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
                 Encoding.UTF8.GetBytes(computed));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "PayFast signature verification raised");
-            return false;
+            verified = false;
         }
+        PayFastObservability.RecordWebhookVerification(verified);
+        return verified;
     }
 
     /// <summary>
@@ -215,10 +250,15 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
     /// Subscription-token dedup is tracked in a process-local set; for production deployments
     /// (multi-instance, restart-safe), wrap with an external idempotency layer keyed on token+pf_payment_id.
     /// </remarks>
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+        return PayFastObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+    }
 
+    private async Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
+    {
         try
         {
             var parameters = ParseFormUrlEncoded(payload);
@@ -234,10 +274,24 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
             _logger.LogInformation("PayFast ITN parsed: gatewayReference={PfPaymentId} status={Status} hasToken={HasToken}",
                 pfPaymentId, status, hasToken);
 
+            // For COMPLETE+token (subscription), decide created-vs-renewed by checking a distributed
+            // dedup record. First sighting → Created; subsequent → Renewed. 90d TTL bounds growth.
+            var isFirstSeen = false;
+            if (string.Equals(paymentStatus, "COMPLETE", StringComparison.OrdinalIgnoreCase) && hasToken)
+            {
+                var key = SubSeenKeyPrefix + token;
+                var prior = await _cache.GetAsync<TokenMarker>(key, ct).ConfigureAwait(false);
+                if (prior is null)
+                {
+                    await _cache.SetAsync(key, new TokenMarker(token), SubSeenTtl, ct).ConfigureAwait(false);
+                    isFirstSeen = true;
+                }
+            }
+
             // Typed sub-records by (payment_status, hasToken).
             WebhookEvent? typed = (paymentStatus.ToUpperInvariant(), hasToken) switch
             {
-                ("COMPLETE", true) when _seenSubscriptionTokens.TryAdd(token, 0) => new SubscriptionCreatedEvent
+                ("COMPLETE", true) when isFirstSeen => new SubscriptionCreatedEvent
                 {
                     GatewayReference = pfPaymentId,
                     Status = status,
@@ -313,19 +367,17 @@ public sealed class PayFastPaymentProvider : IPaymentGatewayProvider
                 }
             };
 
-            return Task.FromResult<WebhookEvent?>(typed);
+            return typed;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to parse PayFast ITN payload");
-            return Task.FromResult<WebhookEvent?>(null);
+            return null;
         }
     }
 
-    // Process-local set used to differentiate first-time subscription IPNs (SubscriptionCreated)
-    // from subsequent ones (SubscriptionRenewed). Production deployments should externalise this
-    // to a persistent store keyed on token (Redis / DB) to survive restarts.
-    private static readonly ConcurrentDictionary<string, byte> _seenSubscriptionTokens = new(StringComparer.Ordinal);
+    /// <summary>Serialisable marker persisted in the distributed cache for subscription-seen dedup.</summary>
+    private sealed record TokenMarker(string Token);
 
     // === PayFast-specific extensions (not on IPaymentGatewayProvider) ===
 

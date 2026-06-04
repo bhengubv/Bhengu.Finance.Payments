@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <IsPackable>true</IsPackable>
+    <Version>2.0.0-preview.5</Version>
+    <PackageId>Bhengu.Finance.Payments.Redis</PackageId>
+    <Authors>T.M. Bengu</Authors>
+    <Company>Bhengu B.V.</Company>
+    <Description>Redis-backed IBhenguDistributedCache for the Bhengu Finance Payments SDK — replaces the process-local in-memory default so idempotency caches and plan/split definition stores survive restarts and work across replicas.</Description>
+    <PackageTags>Payments;Redis;StackExchangeRedis;Cache;Idempotency;Bhengu;Bengu</PackageTags>
+    <RepositoryUrl>https://github.com/bhengubv/Bhengu.Finance.Payments</RepositoryUrl>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="StackExchange.Redis" Version="2.8.16" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="9.0.6" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Core\Bhengu.Finance.Payments.Core.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,16 +1,17 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
-using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Subscription;
 using Bhengu.Finance.Payments.MercadoPago.Configuration;
+using Bhengu.Finance.Payments.MercadoPago.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -33,8 +34,8 @@ namespace Bhengu.Finance.Payments.MercadoPago.Providers;
 /// </remarks>
 public sealed class MercadoPagoSubscriptionProvider : ISubscriptionProvider
 {
-    // Plans are cached in-process. Singleton so the cache survives across requests within a host.
-    private static readonly ConcurrentDictionary<string, Plan> PlanCache = new(StringComparer.Ordinal);
+    private const string PlanKeyPrefix = "mercadopago:plan:";
+    private static readonly TimeSpan PlanTtl = TimeSpan.FromDays(365);
 
     private static readonly JsonSerializerOptions WriteOptions = new()
     {
@@ -44,19 +45,22 @@ public sealed class MercadoPagoSubscriptionProvider : ISubscriptionProvider
     private readonly HttpClient _httpClient;
     private readonly MercadoPagoOptions _options;
     private readonly ILogger<MercadoPagoSubscriptionProvider> _logger;
+    private readonly IBhenguDistributedCache _cache;
 
     /// <inheritdoc />
     public string ProviderName => ProviderNames.MercadoPago;
 
-    /// <summary>Create a new Mercado Pago subscription provider bound to the supplied HTTP client and options.</summary>
+    /// <summary>Create a new Mercado Pago subscription provider bound to the supplied HTTP client, options, and distributed cache for plan templates.</summary>
     public MercadoPagoSubscriptionProvider(
         HttpClient httpClient,
         IOptions<MercadoPagoOptions> options,
-        ILogger<MercadoPagoSubscriptionProvider> logger)
+        ILogger<MercadoPagoSubscriptionProvider> logger,
+        IBhenguDistributedCache cache)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _cache = cache ?? throw new ArgumentNullException(nameof(cache));
 
         if (string.IsNullOrWhiteSpace(_options.AccessToken))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(MercadoPagoOptions.AccessToken)} is required");
@@ -68,12 +72,24 @@ public sealed class MercadoPagoSubscriptionProvider : ISubscriptionProvider
             _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _options.AccessToken);
     }
 
+    /// <summary>Back-compat constructor that uses the process-local in-memory cache.</summary>
+    public MercadoPagoSubscriptionProvider(
+        HttpClient httpClient,
+        IOptions<MercadoPagoOptions> options,
+        ILogger<MercadoPagoSubscriptionProvider> logger)
+        : this(httpClient, options, logger, new InMemoryBhenguDistributedCache())
+    {
+    }
+
     /// <inheritdoc />
     public Task<Plan> CreatePlanAsync(PlanRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return MercadoPagoObservability.ObserveAsync("create_plan", () => CreatePlanCoreAsync(request, ct));
+    }
 
-        // No remote round-trip; the plan lives in-process until a subscription is created against it.
+    private async Task<Plan> CreatePlanCoreAsync(PlanRequest request, CancellationToken ct)
+    {
         var reference = "mp_plan_" + Guid.NewGuid().ToString("N");
         var plan = new Plan
         {
@@ -86,28 +102,33 @@ public sealed class MercadoPagoSubscriptionProvider : ISubscriptionProvider
             Description = request.Description
         };
 
-        PlanCache[reference] = plan;
-        _logger.LogInformation("Mercado Pago plan cached in-process: {Reference} name={Name}", reference, request.Name);
+        await _cache.SetAsync(PlanKeyPrefix + reference, plan, PlanTtl, ct).ConfigureAwait(false);
+        _logger.LogInformation("Mercado Pago plan cached: {Reference} name={Name}", reference, request.Name);
 
-        return Task.FromResult(plan);
+        return plan;
     }
 
     /// <inheritdoc />
     public Task<Plan?> GetPlanAsync(string planReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(planReference);
-        return Task.FromResult(PlanCache.TryGetValue(planReference, out var plan) ? plan : null);
+        return MercadoPagoObservability.ObserveAsync("get_plan", () =>
+            _cache.GetAsync<Plan>(PlanKeyPrefix + planReference, ct));
     }
 
     /// <inheritdoc />
-    public async Task<Subscription> CreateSubscriptionAsync(SubscriptionRequest request, CancellationToken ct = default)
+    public Task<Subscription> CreateSubscriptionAsync(SubscriptionRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return MercadoPagoObservability.ObserveAsync("create_subscription", () => CreateSubscriptionCoreAsync(request, ct));
+    }
 
-        if (!PlanCache.TryGetValue(request.PlanReference, out var plan))
-            throw new BhenguPaymentException(
+    private async Task<Subscription> CreateSubscriptionCoreAsync(SubscriptionRequest request, CancellationToken ct)
+    {
+        var plan = await _cache.GetAsync<Plan>(PlanKeyPrefix + request.PlanReference, ct).ConfigureAwait(false)
+            ?? throw new BhenguPaymentException(
                 ProviderName,
-                $"Plan reference '{request.PlanReference}' is not cached. Mercado Pago requires the plan template to live in-process; call CreatePlanAsync first.",
+                $"Plan reference '{request.PlanReference}' is not cached. Call CreatePlanAsync first.",
                 providerErrorCode: "unknown_plan");
 
         var (frequency, frequencyType) = MapInterval(plan.Interval);
@@ -143,10 +164,14 @@ public sealed class MercadoPagoSubscriptionProvider : ISubscriptionProvider
     }
 
     /// <inheritdoc />
-    public async Task<Subscription?> GetSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
+    public Task<Subscription?> GetSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(subscriptionReference);
+        return MercadoPagoObservability.ObserveAsync("get_subscription", () => GetSubscriptionCoreAsync(subscriptionReference, ct));
+    }
 
+    private async Task<Subscription?> GetSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
+    {
         try
         {
             var raw = await SendAsync(HttpMethod.Get, $"/preapproval/{Uri.EscapeDataString(subscriptionReference)}", body: null, ct, "GetSubscription").ConfigureAwait(false);
@@ -160,10 +185,14 @@ public sealed class MercadoPagoSubscriptionProvider : ISubscriptionProvider
     }
 
     /// <inheritdoc />
-    public async Task<Subscription> CancelSubscriptionAsync(string subscriptionReference, bool immediately = false, CancellationToken ct = default)
+    public Task<Subscription> CancelSubscriptionAsync(string subscriptionReference, bool immediately = false, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(subscriptionReference);
+        return MercadoPagoObservability.ObserveAsync("cancel_subscription", () => CancelSubscriptionCoreAsync(subscriptionReference, immediately, ct));
+    }
 
+    private async Task<Subscription> CancelSubscriptionCoreAsync(string subscriptionReference, bool immediately, CancellationToken ct)
+    {
         try
         {
             var body = new Dictionary<string, object?> { ["status"] = "cancelled" };
@@ -183,10 +212,14 @@ public sealed class MercadoPagoSubscriptionProvider : ISubscriptionProvider
     }
 
     /// <inheritdoc />
-    public async Task<Subscription> PauseSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
+    public Task<Subscription> PauseSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(subscriptionReference);
+        return MercadoPagoObservability.ObserveAsync("pause_subscription", () => PauseSubscriptionCoreAsync(subscriptionReference, ct));
+    }
 
+    private async Task<Subscription> PauseSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
+    {
         var body = new Dictionary<string, object?> { ["status"] = "paused" };
         var raw = await SendAsync(HttpMethod.Put, $"/preapproval/{Uri.EscapeDataString(subscriptionReference)}", body, ct, "PauseSubscription").ConfigureAwait(false);
         var pre = DeserialiseOrThrow<MercadoPagoPreapproval>(raw, "PauseSubscription");
@@ -194,10 +227,14 @@ public sealed class MercadoPagoSubscriptionProvider : ISubscriptionProvider
     }
 
     /// <inheritdoc />
-    public async Task<Subscription> ResumeSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
+    public Task<Subscription> ResumeSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(subscriptionReference);
+        return MercadoPagoObservability.ObserveAsync("resume_subscription", () => ResumeSubscriptionCoreAsync(subscriptionReference, ct));
+    }
 
+    private async Task<Subscription> ResumeSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
+    {
         var body = new Dictionary<string, object?> { ["status"] = "authorized" };
         var raw = await SendAsync(HttpMethod.Put, $"/preapproval/{Uri.EscapeDataString(subscriptionReference)}", body, ct, "ResumeSubscription").ConfigureAwait(false);
         var pre = DeserialiseOrThrow<MercadoPagoPreapproval>(raw, "ResumeSubscription");

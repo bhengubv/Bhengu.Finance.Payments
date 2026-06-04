@@ -3,9 +3,12 @@
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Ozow.Configuration;
+using Bhengu.Finance.Payments.Ozow.Internals;
 using Bhengu.Finance.Payments.Ozow.Providers;
 using Bhengu.Finance.Payments.Tests.TestHelpers;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -20,7 +23,8 @@ public class OzowPaymentProviderTests
     {
         opts ??= new OzowOptions { SiteCode = "TEST", PrivateKey = "priv", ApiKey = "apik", UseSandbox = true };
         var http = new HttpClient(handler);
-        return new OzowPaymentProvider(http, Options.Create(opts), NullLogger<OzowPaymentProvider>.Instance);
+        return new OzowPaymentProvider(http, Options.Create(opts), NullLogger<OzowPaymentProvider>.Instance,
+            new OzowIdempotencyCache(new InMemoryBhenguDistributedCache()));
     }
 
     private static PaymentRequest SamplePayment() => new()
@@ -36,7 +40,8 @@ public class OzowPaymentProviderTests
     {
         var http = new HttpClient(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
         Assert.Throws<ProviderConfigurationException>(() =>
-            new OzowPaymentProvider(http, Options.Create(new OzowOptions { PrivateKey = "x", ApiKey = "y" }), NullLogger<OzowPaymentProvider>.Instance));
+            new OzowPaymentProvider(http, Options.Create(new OzowOptions { PrivateKey = "x", ApiKey = "y" }), NullLogger<OzowPaymentProvider>.Instance,
+                new OzowIdempotencyCache(new InMemoryBhenguDistributedCache())));
     }
 
     [Fact]
@@ -44,7 +49,8 @@ public class OzowPaymentProviderTests
     {
         var http = new HttpClient(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
         Assert.Throws<ProviderConfigurationException>(() =>
-            new OzowPaymentProvider(http, Options.Create(new OzowOptions { SiteCode = "x", ApiKey = "y" }), NullLogger<OzowPaymentProvider>.Instance));
+            new OzowPaymentProvider(http, Options.Create(new OzowOptions { SiteCode = "x", ApiKey = "y" }), NullLogger<OzowPaymentProvider>.Instance,
+                new OzowIdempotencyCache(new InMemoryBhenguDistributedCache())));
     }
 
     [Fact]
@@ -52,7 +58,19 @@ public class OzowPaymentProviderTests
     {
         var http = new HttpClient(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
         Assert.Throws<ProviderConfigurationException>(() =>
-            new OzowPaymentProvider(http, Options.Create(new OzowOptions { SiteCode = "x", PrivateKey = "y" }), NullLogger<OzowPaymentProvider>.Instance));
+            new OzowPaymentProvider(http, Options.Create(new OzowOptions { SiteCode = "x", PrivateKey = "y" }), NullLogger<OzowPaymentProvider>.Instance,
+                new OzowIdempotencyCache(new InMemoryBhenguDistributedCache())));
+    }
+
+    [Fact]
+    public void Capabilities_IncludeIdempotencyAndTypedWebhooks()
+    {
+        var provider = Create(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
+        Assert.True(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.TypedWebhooks));
+        Assert.True(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.Idempotency));
+        Assert.True(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.PartialRefund));
+        Assert.False(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.Payout));
+        Assert.False(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.ThreeDSecure));
     }
 
     [Fact]
@@ -98,6 +116,23 @@ public class OzowPaymentProviderTests
     }
 
     [Fact]
+    public async Task ProcessPaymentAsync_Dedupes_OnSameIdempotencyKey()
+    {
+        var calls = 0;
+        var handler = new StubHttpMessageHandler((_, _) =>
+        {
+            calls++;
+            return StubHttpMessageHandler.Json(HttpStatusCode.OK,
+                $$"""{"transactionId":"ozow_{{calls}}","status":"pending"}""");
+        });
+        var provider = Create(handler);
+        var r1 = await provider.ProcessPaymentAsync(SamplePayment() with { IdempotencyKey = "key-1" });
+        var r2 = await provider.ProcessPaymentAsync(SamplePayment() with { IdempotencyKey = "key-1" });
+        Assert.Equal(r1.GatewayReference, r2.GatewayReference);
+        Assert.Equal(1, calls);
+    }
+
+    [Fact]
     public async Task ProcessRefundAsync_ReturnsResponse_OnSuccess()
     {
         var handler = new StubHttpMessageHandler((req, _) =>
@@ -119,11 +154,8 @@ public class OzowPaymentProviderTests
     }
 
     [Fact]
-    public void VerifyWebhookSignature_ReturnsFalse_WhenPrivateKeyMissing()
+    public void VerifyWebhookSignature_ReturnsFalse_ForTamperedSignature()
     {
-        // Constructor would throw with empty PrivateKey, so simulate post-construction with reflection-free approach:
-        // verify the runtime check by setting PrivateKey to whitespace via a dummy Options.
-        // We can't easily bypass constructor validation, so this test asserts via tampered signature only.
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
         Assert.False(provider.VerifyWebhookSignature("anything", "tampered"));
     }
@@ -141,16 +173,17 @@ public class OzowPaymentProviderTests
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsEvent_WhenPayloadIsComplete()
+    public async Task ParseWebhookAsync_ReturnsTypedChargeSucceeded_WhenComplete()
     {
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
         var evt = await provider.ParseWebhookAsync("""
             {"transactionId":"ozow_99","transactionReference":"ref_99","status":"complete","amount":250.00}
             """);
         Assert.NotNull(evt);
-        Assert.Equal("ref_99", evt!.GatewayReference);
-        Assert.Equal(PaymentStatus.Completed, evt.Status);
-        Assert.Equal("ozow.notification", evt.EventType);
+        var typed = Assert.IsType<ChargeSucceededEvent>(evt);
+        Assert.Equal("ref_99", typed.GatewayReference);
+        Assert.Equal(WebhookEventCategory.ChargeSucceeded, typed.Category);
+        Assert.Equal(250m, typed.Amount);
     }
 
     [Fact]
@@ -162,6 +195,18 @@ public class OzowPaymentProviderTests
             """);
         Assert.NotNull(evt);
         Assert.Equal("ozow_99", evt!.GatewayReference);
+    }
+
+    [Fact]
+    public async Task ParseWebhookAsync_ReturnsTypedChargeFailed_WhenError()
+    {
+        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+        var evt = await provider.ParseWebhookAsync("""
+            {"transactionId":"ozow_99","status":"error","amount":250.00,"statusMessage":"declined"}
+            """);
+        Assert.NotNull(evt);
+        var typed = Assert.IsType<ChargeFailedEvent>(evt);
+        Assert.Equal("declined", typed.FailureMessage);
     }
 
     [Fact]

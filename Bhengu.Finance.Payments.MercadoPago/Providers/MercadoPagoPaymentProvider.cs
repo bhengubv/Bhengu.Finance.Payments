@@ -12,6 +12,7 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.MercadoPago.Configuration;
+using Bhengu.Finance.Payments.MercadoPago.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -42,7 +43,8 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
         ProviderCapabilities.Tokenisation |
         ProviderCapabilities.TypedWebhooks |
         ProviderCapabilities.PartialRefund |
-        ProviderCapabilities.Idempotency;
+        ProviderCapabilities.Idempotency |
+        ProviderCapabilities.Marketplace;
 
     public MercadoPagoPaymentProvider(
         HttpClient httpClient,
@@ -62,10 +64,15 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
         _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _options.AccessToken);
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return MercadoPagoObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+    }
 
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+    {
         var metadata = request.Metadata ?? new Dictionary<string, string>();
         var paymentMethodId = metadata.TryGetValue("payment_method_id", out var pmid) ? pmid : "visa";
         var payerEmail = metadata.TryGetValue("payer_email", out var pe) ? pe : metadata.GetValueOrDefault("email");
@@ -118,10 +125,15 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
         };
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return MercadoPagoObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+    }
 
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
         // Mercado Pago: POST /v1/payments/{id}/refunds. Omit amount for full refund.
         var requestBody = new { amount = request.Amount };
 
@@ -147,10 +159,15 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
         };
     }
 
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return MercadoPagoObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+    }
 
+    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+    {
         // Mercado Pago money-out: POST /v1/money_requests
         var requestBody = new
         {
@@ -188,6 +205,7 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
     /// <c>id:&lt;data.id&gt;;request-id:&lt;x-request-id&gt;;ts:&lt;ts&gt;;</c>. The merchant constructs that
     /// manifest from the relevant headers and the body before calling here.
     /// </summary>
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -196,38 +214,50 @@ public sealed class MercadoPagoPaymentProvider : IPaymentGatewayProvider, IPayou
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
             _logger.LogWarning("Mercado Pago WebhookSecret not configured — signature verification cannot succeed.");
+            MercadoPagoObservability.RecordWebhookVerification(false);
             return false;
         }
 
+        bool verified;
         try
         {
-            // Extract v1=... from the header
             var v1Part = signature.Split(',')
                 .Select(p => p.Trim())
                 .FirstOrDefault(p => p.StartsWith("v1=", StringComparison.OrdinalIgnoreCase));
 
-            if (v1Part is null) return false;
+            if (v1Part is null)
+            {
+                MercadoPagoObservability.RecordWebhookVerification(false);
+                return false;
+            }
             var providedHash = v1Part["v1=".Length..];
 
             using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
             var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
             var computedSignature = Convert.ToHexString(computedHash).ToLowerInvariant();
 
-            return CryptographicOperations.FixedTimeEquals(
+            verified = CryptographicOperations.FixedTimeEquals(
                 Encoding.UTF8.GetBytes(providedHash.ToLowerInvariant()),
                 Encoding.UTF8.GetBytes(computedSignature));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Mercado Pago webhook signature verification raised");
-            return false;
+            verified = false;
         }
+        MercadoPagoObservability.RecordWebhookVerification(verified);
+        return verified;
     }
 
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+        return MercadoPagoObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+    }
 
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
+    {
         try
         {
             var webhookEvent = JsonSerializer.Deserialize<MercadoPagoWebhookEvent>(payload);

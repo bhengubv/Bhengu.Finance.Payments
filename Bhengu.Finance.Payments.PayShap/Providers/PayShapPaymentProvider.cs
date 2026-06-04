@@ -9,6 +9,7 @@ using Bhengu.Finance.Payments.PayShap.Configuration;
 using Bhengu.Finance.Payments.PayShap.Models.Events;
 using Bhengu.Finance.Payments.PayShap.Models.Requests;
 using Bhengu.Finance.Payments.PayShap.Models.Responses;
+using Bhengu.Finance.Payments.PayShap.Internals;
 using Bhengu.Finance.Payments.PayShap.Services.Interfaces;
 using Bhengu.Finance.Payments.PayShap.Utilities;
 using Microsoft.Extensions.Logging;
@@ -70,9 +71,15 @@ public sealed class PayShapPaymentProvider : IPaymentGatewayProvider
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return PayShapObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+    }
+
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+    {
         var meta = request.Metadata ?? new Dictionary<string, string>();
 
         var reference = meta.GetValueOrDefault("payshap.reference") ?? Guid.NewGuid().ToString("N");
@@ -140,11 +147,14 @@ public sealed class PayShapPaymentProvider : IPaymentGatewayProvider
     /// Consumers needing reversal must build a new <see cref="PaymentRequest"/> with swapped payer / payee
     /// metadata and call <see cref="ProcessPaymentAsync"/> again.
     /// </summary>
+    /// <inheritdoc/>
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default) =>
-        throw new BhenguPaymentException(
-            ProviderName,
-            "PayShap has no refund API. To reverse a transfer, initiate a new RTC payment with payer and payee swapped.");
+        PayShapObservability.ObserveRefundAsync<RefundResponse>(request?.GatewayReference ?? "n/a", () =>
+            throw new BhenguPaymentException(
+                ProviderName,
+                "PayShap has no refund API. To reverse a transfer, initiate a new RTC payment with payer and payee swapped."));
 
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -153,27 +163,36 @@ public sealed class PayShapPaymentProvider : IPaymentGatewayProvider
         if (string.IsNullOrWhiteSpace(_settings.SignatureKey))
         {
             _logger.LogWarning("PayShap SignatureKey not configured — signature verification cannot succeed.");
+            PayShapObservability.RecordWebhookVerification(false);
             return false;
         }
 
+        bool verified;
         try
         {
             var expected = PayShapSignatureHelper.GenerateSignature(payload, _settings.SignatureKey);
-            return System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
+            verified = System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
                 System.Text.Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
                 System.Text.Encoding.UTF8.GetBytes(expected));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "PayShap webhook signature verification raised");
-            return false;
+            verified = false;
         }
+        PayShapObservability.RecordWebhookVerification(verified);
+        return verified;
     }
 
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+        return PayShapObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+    }
 
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
+    {
         try
         {
             var evt = JsonSerializer.Deserialize<InboundPaymentEvent>(payload);

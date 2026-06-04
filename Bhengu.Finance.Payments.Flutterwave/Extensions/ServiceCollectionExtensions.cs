@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Validation;
@@ -33,6 +34,7 @@ public static class ServiceCollectionExtensions
         if (string.IsNullOrWhiteSpace(probe.SecretKey))
             throw new ProviderConfigurationException("flutterwave", $"{FlutterwaveOptions.ConfigSection}:SecretKey is required");
 
+        services.AddBhenguInMemoryCache();
         services.AddHttpClient<FlutterwavePaymentProvider>();
         services.AddTransient<IPaymentGatewayProvider, FlutterwavePaymentProvider>(sp =>
             sp.GetRequiredService<FlutterwavePaymentProvider>());
@@ -66,16 +68,19 @@ public static class ServiceCollectionExtensions
         services.AddHttpClient<FlutterwaveSubscriptionProvider>();
         services.AddHttpClient<FlutterwaveSettlementProvider>();
         services.AddHttpClient<FlutterwaveMarketplaceProvider>();
+        services.AddHttpClient<FlutterwaveDisputeProvider>();
 
         services.AddTransient<ITokenisationProvider>(sp => sp.GetRequiredService<FlutterwaveTokenisationProvider>());
         services.AddTransient<ISubscriptionProvider>(sp => sp.GetRequiredService<FlutterwaveSubscriptionProvider>());
         services.AddTransient<ISettlementProvider>(sp => sp.GetRequiredService<FlutterwaveSettlementProvider>());
         services.AddTransient<IMarketplaceProvider>(sp => sp.GetRequiredService<FlutterwaveMarketplaceProvider>());
+        services.AddTransient<IDisputeProvider>(sp => sp.GetRequiredService<FlutterwaveDisputeProvider>());
 
         services.AddKeyedTransient<ITokenisationProvider>(ProviderNames.Flutterwave, (sp, _) => sp.GetRequiredService<FlutterwaveTokenisationProvider>());
         services.AddKeyedTransient<ISubscriptionProvider>(ProviderNames.Flutterwave, (sp, _) => sp.GetRequiredService<FlutterwaveSubscriptionProvider>());
         services.AddKeyedTransient<ISettlementProvider>(ProviderNames.Flutterwave, (sp, _) => sp.GetRequiredService<FlutterwaveSettlementProvider>());
         services.AddKeyedTransient<IMarketplaceProvider>(ProviderNames.Flutterwave, (sp, _) => sp.GetRequiredService<FlutterwaveMarketplaceProvider>());
+        services.AddKeyedTransient<IDisputeProvider>(ProviderNames.Flutterwave, (sp, _) => sp.GetRequiredService<FlutterwaveDisputeProvider>());
         services.AddKeyedTransient<IPayoutProvider>(ProviderNames.Flutterwave, (sp, _) => sp.GetRequiredService<FlutterwavePaymentProvider>());
 
         return services;

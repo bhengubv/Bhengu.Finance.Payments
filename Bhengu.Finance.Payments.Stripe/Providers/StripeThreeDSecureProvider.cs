@@ -6,6 +6,7 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.ThreeDSecure;
 using Bhengu.Finance.Payments.Stripe.Configuration;
+using Bhengu.Finance.Payments.Stripe.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Stripe;
@@ -46,10 +47,14 @@ public sealed class StripeThreeDSecureProvider : IThreeDSecureProvider
     }
 
     /// <inheritdoc />
-    public async Task<ThreeDSecureChallenge> StartAuthenticationAsync(PaymentRequest chargeIntent, CancellationToken ct = default)
+    public Task<ThreeDSecureChallenge> StartAuthenticationAsync(PaymentRequest chargeIntent, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(chargeIntent);
+        return StripeObservability.ObserveAsync("start_3ds", () => StartAuthenticationCoreAsync(chargeIntent, ct));
+    }
 
+    private async Task<ThreeDSecureChallenge> StartAuthenticationCoreAsync(PaymentRequest chargeIntent, CancellationToken ct)
+    {
         var requestOptions = BuildRequestOptions(chargeIntent.IdempotencyKey);
         try
         {
@@ -89,10 +94,14 @@ public sealed class StripeThreeDSecureProvider : IThreeDSecureProvider
     }
 
     /// <inheritdoc />
-    public async Task<ThreeDSecureChallenge> GetChallengeAsync(string challengeReference, CancellationToken ct = default)
+    public Task<ThreeDSecureChallenge> GetChallengeAsync(string challengeReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(challengeReference);
+        return StripeObservability.ObserveAsync("get_3ds_challenge", () => GetChallengeCoreAsync(challengeReference, ct));
+    }
 
+    private async Task<ThreeDSecureChallenge> GetChallengeCoreAsync(string challengeReference, CancellationToken ct)
+    {
         try
         {
             var service = new PaymentIntentService(_stripeClient);

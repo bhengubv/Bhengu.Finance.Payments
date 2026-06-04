@@ -7,10 +7,14 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.PayUIndia.Configuration;
+using Bhengu.Finance.Payments.PayUIndia.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -35,25 +39,39 @@ public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutP
     private readonly HttpClient _httpClient;
     private readonly PayUIndiaOptions _options;
     private readonly ILogger<PayUIndiaPaymentProvider> _logger;
+    private readonly PayUIndiaIdempotencyCache _idempotencyCache;
 
+    /// <inheritdoc />
     public string ProviderName => ProviderNames.PayUIndia;
 
+    /// <inheritdoc />
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
         ProviderCapabilities.Refund |
         ProviderCapabilities.Payout |
         ProviderCapabilities.Webhook |
+        ProviderCapabilities.TypedWebhooks |
         ProviderCapabilities.RedirectFlow |
-        ProviderCapabilities.Cards;
+        ProviderCapabilities.Cards |
+        ProviderCapabilities.BankTransfer |
+        ProviderCapabilities.Tokenisation |
+        ProviderCapabilities.Subscriptions |
+        ProviderCapabilities.ThreeDSecure |
+        ProviderCapabilities.Settlement |
+        ProviderCapabilities.Idempotency |
+        ProviderCapabilities.PartialRefund;
 
+    /// <summary>Create a new PayU India provider bound to the supplied HTTP client, options, and (optionally) a distributed cache used for client-side idempotency-key dedupe.</summary>
     public PayUIndiaPaymentProvider(
         HttpClient httpClient,
         IOptions<PayUIndiaOptions> options,
-        ILogger<PayUIndiaPaymentProvider> logger)
+        ILogger<PayUIndiaPaymentProvider> logger,
+        IBhenguDistributedCache? cache = null)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _idempotencyCache = new PayUIndiaIdempotencyCache(cache ?? new InMemoryBhenguDistributedCache());
 
         if (string.IsNullOrWhiteSpace(_options.MerchantKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PayUIndiaOptions.MerchantKey)} is required");
@@ -66,147 +84,210 @@ public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutP
         }
     }
 
+    /// <inheritdoc />
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        var txnid = request.Metadata?.GetValueOrDefault("txnid") ?? $"txn-{Guid.NewGuid():N}";
-        var amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture);
-        var productinfo = request.Description ?? "Bhengu PayU India payment";
-        var firstname = request.Metadata?.GetValueOrDefault("firstname") ?? "Customer";
-        var email = request.Metadata?.GetValueOrDefault("email") ?? "buyer@example.com";
-        var phone = request.Metadata?.GetValueOrDefault("phone") ?? string.Empty;
-        var udf1 = request.Metadata?.GetValueOrDefault("udf1") ?? string.Empty;
-        var udf2 = request.Metadata?.GetValueOrDefault("udf2") ?? string.Empty;
-        var udf3 = request.Metadata?.GetValueOrDefault("udf3") ?? string.Empty;
-        var udf4 = request.Metadata?.GetValueOrDefault("udf4") ?? string.Empty;
-        var udf5 = request.Metadata?.GetValueOrDefault("udf5") ?? string.Empty;
-
-        // hash = SHA-512(key|txnid|amount|productinfo|firstname|email|udf1|udf2|udf3|udf4|udf5|||||salt)
-        var hashInput = string.Join("|",
-            _options.MerchantKey, txnid, amount, productinfo, firstname, email,
-            udf1, udf2, udf3, udf4, udf5,
-            "", "", "", "", "",
-            _options.Salt);
-        var hash = Sha512Hex(hashInput);
-
-        var baseUrl = _options.UseSandbox
-            ? (_options.SandboxUrl ?? "https://test.payu.in")
-            : (_options.BaseUrl ?? "https://secure.payu.in");
-
-        var fields = new Dictionary<string, string>
+        var currency = string.IsNullOrWhiteSpace(request.Currency) ? _options.Currency : request.Currency.ToUpperInvariant();
+        return _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, async () =>
         {
-            ["key"] = _options.MerchantKey,
-            ["txnid"] = txnid,
-            ["amount"] = amount,
-            ["productinfo"] = productinfo,
-            ["firstname"] = firstname,
-            ["email"] = email,
-            ["phone"] = phone,
-            ["surl"] = request.Metadata?.GetValueOrDefault("surl") ?? _options.SuccessUrl,
-            ["furl"] = request.Metadata?.GetValueOrDefault("furl") ?? _options.FailureUrl,
-            ["udf1"] = udf1,
-            ["udf2"] = udf2,
-            ["udf3"] = udf3,
-            ["udf4"] = udf4,
-            ["udf5"] = udf5,
-            ["hash"] = hash
-        };
+            using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, currency);
+            try
+            {
+                var txnid = request.Metadata?.GetValueOrDefault("txnid") ?? $"txn-{Guid.NewGuid():N}";
+                var amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture);
+                var productinfo = request.Description ?? "Bhengu PayU India payment";
+                var firstname = request.Metadata?.GetValueOrDefault("firstname") ?? "Customer";
+                var email = request.Metadata?.GetValueOrDefault("email") ?? "buyer@example.com";
+                var phone = request.Metadata?.GetValueOrDefault("phone") ?? string.Empty;
+                var udf1 = request.Metadata?.GetValueOrDefault("udf1") ?? string.Empty;
+                var udf2 = request.Metadata?.GetValueOrDefault("udf2") ?? string.Empty;
+                var udf3 = request.Metadata?.GetValueOrDefault("udf3") ?? string.Empty;
+                var udf4 = request.Metadata?.GetValueOrDefault("udf4") ?? string.Empty;
+                var udf5 = request.Metadata?.GetValueOrDefault("udf5") ?? string.Empty;
 
-        var query = string.Join("&", fields.Select(kv =>
-            $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(kv.Value)}"));
-        var redirectUrl = $"{baseUrl.TrimEnd('/')}/_payment?{query}";
+                // hash = SHA-512(key|txnid|amount|productinfo|firstname|email|udf1|udf2|udf3|udf4|udf5|||||salt)
+                var hashInput = string.Join("|",
+                    _options.MerchantKey, txnid, amount, productinfo, firstname, email,
+                    udf1, udf2, udf3, udf4, udf5,
+                    "", "", "", "", "",
+                    _options.Salt);
+                var hash = Sha512Hex(hashInput);
 
-        _logger.LogInformation("PayU India payment initiated: txnid={Txnid} (redirect URL built)", txnid);
+                var baseUrl = _options.UseSandbox
+                    ? (_options.SandboxUrl ?? "https://test.payu.in")
+                    : (_options.BaseUrl ?? "https://secure.payu.in");
 
-        return Task.FromResult(new PaymentResponse
-        {
-            GatewayReference = txnid,
-            Status = PaymentStatus.Pending,
-            Amount = request.Amount,
-            Currency = string.IsNullOrWhiteSpace(request.Currency) ? _options.Currency : request.Currency.ToUpperInvariant(),
-            ProcessedAt = DateTime.UtcNow,
-            RedirectUrl = redirectUrl
+                var fields = new Dictionary<string, string>
+                {
+                    ["key"] = _options.MerchantKey,
+                    ["txnid"] = txnid,
+                    ["amount"] = amount,
+                    ["productinfo"] = productinfo,
+                    ["firstname"] = firstname,
+                    ["email"] = email,
+                    ["phone"] = phone,
+                    ["surl"] = request.Metadata?.GetValueOrDefault("surl") ?? _options.SuccessUrl,
+                    ["furl"] = request.Metadata?.GetValueOrDefault("furl") ?? _options.FailureUrl,
+                    ["udf1"] = udf1,
+                    ["udf2"] = udf2,
+                    ["udf3"] = udf3,
+                    ["udf4"] = udf4,
+                    ["udf5"] = udf5,
+                    ["hash"] = hash
+                };
+
+                var query = string.Join("&", fields.Select(kv =>
+                    $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(kv.Value)}"));
+                var redirectUrl = $"{baseUrl.TrimEnd('/')}/_payment?{query}";
+
+                _logger.LogInformation("PayU India payment initiated: txnid={Txnid} (redirect URL built)", txnid);
+
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Pending);
+                BhenguPaymentDiagnostics.ChargesTotal.Add(1,
+                    new KeyValuePair<string, object?>("provider", ProviderName),
+                    new KeyValuePair<string, object?>("outcome", BhenguPaymentDiagnostics.Outcomes.Pending));
+
+                return await Task.FromResult(new PaymentResponse
+                {
+                    GatewayReference = txnid,
+                    Status = PaymentStatus.Pending,
+                    Amount = request.Amount,
+                    Currency = currency,
+                    ProcessedAt = DateTime.UtcNow,
+                    RedirectUrl = redirectUrl
+                }).ConfigureAwait(false);
+            }
+            catch
+            {
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
+                throw;
+            }
         });
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    /// <inheritdoc />
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        const string command = "cancel_refund_transaction";
-        var paymentId = request.GatewayReference;
-        var tokenId = $"refund-{Guid.NewGuid():N}";
-        var amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture);
-
-        // hash = SHA-512(key|command|var1|salt) — var1 = paymentId
-        var hashInput = string.Join("|", _options.MerchantKey, command, paymentId, _options.Salt);
-        var hash = Sha512Hex(hashInput);
-
-        var form = new Dictionary<string, string>
+        return _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, async () =>
         {
-            ["key"] = _options.MerchantKey,
-            ["command"] = command,
-            ["var1"] = paymentId,
-            ["var2"] = tokenId,
-            ["var3"] = amount,
-            ["hash"] = hash
-        };
+            using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
+            try
+            {
+                const string command = "cancel_refund_transaction";
+                var paymentId = request.GatewayReference;
+                var tokenId = $"refund-{Guid.NewGuid():N}";
+                var amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture);
 
-        var raw = await PostFormAsync("merchant/postservice.php?form=2", form, ct, "ProcessRefund").ConfigureAwait(false);
-        var refund = TryParseInfoResponse<PayUIndiaInfoResponse>(raw);
+                // hash = SHA-512(key|command|var1|salt) — var1 = paymentId
+                var hashInput = string.Join("|", _options.MerchantKey, command, paymentId, _options.Salt);
+                var hash = Sha512Hex(hashInput);
 
-        _logger.LogInformation("PayU India refund created for payment {PaymentId} token {TokenId} status={Status}",
-            paymentId, tokenId, refund?.Status);
+                var form = new Dictionary<string, string>
+                {
+                    ["key"] = _options.MerchantKey,
+                    ["command"] = command,
+                    ["var1"] = paymentId,
+                    ["var2"] = tokenId,
+                    ["var3"] = amount,
+                    ["hash"] = hash
+                };
 
-        return new RefundResponse
-        {
-            GatewayReference = tokenId,
-            Amount = request.Amount,
-            Status = MapStatus(refund?.Status ?? "pending"),
-            ProcessedAt = DateTime.UtcNow,
-            Message = refund?.Msg ?? refund?.Status
-        };
+                var raw = await PostFormAsync("merchant/postservice.php?form=2", form, ct, "ProcessRefund").ConfigureAwait(false);
+                var refund = TryParseInfoResponse<PayUIndiaInfoResponse>(raw);
+
+                _logger.LogInformation("PayU India refund created for payment {PaymentId} token {TokenId} status={Status}",
+                    paymentId, tokenId, refund?.Status);
+
+                var status = MapStatus(refund?.Status ?? "pending");
+                activity.SetOutcome(status == PaymentStatus.Refunded || status == PaymentStatus.Completed
+                    ? BhenguPaymentDiagnostics.Outcomes.Success
+                    : BhenguPaymentDiagnostics.Outcomes.Pending);
+                BhenguPaymentDiagnostics.RefundsTotal.Add(1,
+                    new KeyValuePair<string, object?>("provider", ProviderName),
+                    new KeyValuePair<string, object?>("outcome", status == PaymentStatus.Refunded ? "success" : "pending"));
+
+                return new RefundResponse
+                {
+                    GatewayReference = tokenId,
+                    Amount = request.Amount,
+                    Status = status,
+                    ProcessedAt = DateTime.UtcNow,
+                    Message = refund?.Msg ?? refund?.Status
+                };
+            }
+            catch
+            {
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
+                throw;
+            }
+        });
     }
 
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    /// <inheritdoc />
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        const string command = "fund_transfer";
-        var var1 = request.DestinationToken;
-        var var2 = request.Amount.ToString("F2", CultureInfo.InvariantCulture);
-        var var3 = request.Description ?? "Bhengu payout";
-
-        // hash = SHA-512(key|command|var1|salt)
-        var hashInput = string.Join("|", _options.MerchantKey, command, var1, _options.Salt);
-        var hash = Sha512Hex(hashInput);
-
-        var form = new Dictionary<string, string>
+        var currency = string.IsNullOrWhiteSpace(request.Currency) ? _options.Currency : request.Currency.ToUpperInvariant();
+        return _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, async () =>
         {
-            ["key"] = _options.MerchantKey,
-            ["command"] = command,
-            ["var1"] = var1,
-            ["var2"] = var2,
-            ["var3"] = var3,
-            ["hash"] = hash
-        };
+            using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, currency);
+            try
+            {
+                const string command = "fund_transfer";
+                var var1 = request.DestinationToken;
+                var var2 = request.Amount.ToString("F2", CultureInfo.InvariantCulture);
+                var var3 = request.Description ?? "Bhengu payout";
 
-        var raw = await PostFormAsync("merchant/postservice.php?form=2", form, ct, "ProcessPayout").ConfigureAwait(false);
-        var payout = TryParseInfoResponse<PayUIndiaInfoResponse>(raw);
+                // hash = SHA-512(key|command|var1|salt)
+                var hashInput = string.Join("|", _options.MerchantKey, command, var1, _options.Salt);
+                var hash = Sha512Hex(hashInput);
 
-        _logger.LogInformation("PayU India payout initiated to {Destination} status={Status}", var1, payout?.Status);
+                var form = new Dictionary<string, string>
+                {
+                    ["key"] = _options.MerchantKey,
+                    ["command"] = command,
+                    ["var1"] = var1,
+                    ["var2"] = var2,
+                    ["var3"] = var3,
+                    ["hash"] = hash
+                };
 
-        return new PayoutResponse
-        {
-            GatewayReference = payout?.Mihpayid ?? $"payout-{Guid.NewGuid():N}",
-            Status = MapStatus(payout?.Status ?? "pending"),
-            Amount = request.Amount,
-            Currency = string.IsNullOrWhiteSpace(request.Currency) ? _options.Currency : request.Currency.ToUpperInvariant(),
-            ProcessedAt = DateTime.UtcNow
-        };
+                var raw = await PostFormAsync("merchant/postservice.php?form=2", form, ct, "ProcessPayout").ConfigureAwait(false);
+                var payout = TryParseInfoResponse<PayUIndiaInfoResponse>(raw);
+
+                _logger.LogInformation("PayU India payout initiated to {Destination} status={Status}", var1, payout?.Status);
+
+                var status = MapStatus(payout?.Status ?? "pending");
+                activity.SetOutcome(status == PaymentStatus.Completed
+                    ? BhenguPaymentDiagnostics.Outcomes.Success
+                    : BhenguPaymentDiagnostics.Outcomes.Pending);
+                BhenguPaymentDiagnostics.PayoutsTotal.Add(1,
+                    new KeyValuePair<string, object?>("provider", ProviderName),
+                    new KeyValuePair<string, object?>("outcome", status == PaymentStatus.Completed ? "success" : "pending"));
+
+                return new PayoutResponse
+                {
+                    GatewayReference = payout?.Mihpayid ?? $"payout-{Guid.NewGuid():N}",
+                    Status = status,
+                    Amount = request.Amount,
+                    Currency = currency,
+                    ProcessedAt = DateTime.UtcNow
+                };
+            }
+            catch
+            {
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
+                throw;
+            }
+        });
     }
 
+    /// <inheritdoc />
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -215,6 +296,9 @@ public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutP
         if (string.IsNullOrWhiteSpace(_options.Salt))
         {
             _logger.LogWarning("PayU India Salt not configured — signature verification cannot succeed.");
+            BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("valid", false));
             return false;
         }
 
@@ -226,9 +310,14 @@ public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutP
             // Production callers should call VerifyWebhookSignature(reconstructedHashInput, response.hash).
             var computedHash = Sha512Hex(payload);
 
-            return CryptographicOperations.FixedTimeEquals(
+            var valid = CryptographicOperations.FixedTimeEquals(
                 Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
                 Encoding.UTF8.GetBytes(computedHash));
+
+            BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("valid", valid));
+            return valid;
         }
         catch (Exception ex)
         {
@@ -237,15 +326,26 @@ public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutP
         }
     }
 
+    /// <summary>
+    /// Parse a PayU India webhook payload into a typed <see cref="WebhookEvent"/> sub-record where possible.
+    /// </summary>
+    /// <remarks>
+    /// PayU India sends URL-encoded form fields (S2S) and supports a JSON shape for forward compat.
+    /// Status mapping: <c>success</c>/<c>captured</c> → <see cref="ChargeSucceededEvent"/>,
+    /// <c>failure</c>/<c>failed</c>/<c>dropped</c>/<c>bounced</c> → <see cref="ChargeFailedEvent"/>,
+    /// <c>pending</c>/<c>in progress</c> → <see cref="ChargePendingEvent"/>,
+    /// <c>refunded</c>/<c>queued_for_refund</c> → <see cref="RefundSucceededEvent"/>.
+    /// </remarks>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
 
+        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
         try
         {
             // PayU India S2S callbacks are typically application/x-www-form-urlencoded.
             // We handle both URL-encoded form bodies and JSON for forward compatibility.
-            PayUIndiaWebhookPayload? webhookEvent = null;
+            PayUIndiaWebhookPayload? webhookEvent;
 
             var trimmed = payload.TrimStart();
             if (trimmed.StartsWith('{'))
@@ -257,20 +357,70 @@ public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutP
                 webhookEvent = ParseFormUrlEncoded(payload);
             }
 
-            if (webhookEvent is null) return Task.FromResult<WebhookEvent?>(null);
+            if (webhookEvent is null || string.IsNullOrEmpty(webhookEvent.Txnid))
+                return Task.FromResult<WebhookEvent?>(null);
 
             _logger.LogInformation("Parsed PayU India webhook: status={Status} txnid={Txnid}",
                 webhookEvent.Status, webhookEvent.Txnid);
 
-            if (string.IsNullOrEmpty(webhookEvent.Txnid))
-                return Task.FromResult<WebhookEvent?>(null);
+            var status = webhookEvent.Status?.ToLowerInvariant() ?? "unknown";
+            var mappedStatus = MapStatus(status);
+            var amount = decimal.TryParse(webhookEvent.Amount, NumberStyles.Number, CultureInfo.InvariantCulture, out var a) ? a : 0m;
+            var currency = string.IsNullOrWhiteSpace(_options.Currency) ? "INR" : _options.Currency.ToUpperInvariant();
 
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
+            WebhookEvent? typed = status switch
             {
-                GatewayReference = webhookEvent.Txnid,
-                Status = MapStatus(webhookEvent.Status ?? "pending"),
-                EventType = $"payuindia.{webhookEvent.Status?.ToLowerInvariant() ?? "unknown"}"
-            });
+                "success" or "captured" or "completed" => new ChargeSucceededEvent
+                {
+                    GatewayReference = webhookEvent.Txnid,
+                    Status = PaymentStatus.Completed,
+                    EventType = $"payuindia.{status}",
+                    Category = WebhookEventCategory.ChargeSucceeded,
+                    Amount = amount,
+                    Currency = currency,
+                    PaymentMethodToken = webhookEvent.Mihpayid
+                },
+                "failure" or "failed" or "error" or "dropped" or "bounced" => new ChargeFailedEvent
+                {
+                    GatewayReference = webhookEvent.Txnid,
+                    Status = PaymentStatus.Failed,
+                    EventType = $"payuindia.{status}",
+                    Category = WebhookEventCategory.ChargeFailed,
+                    Amount = amount,
+                    Currency = currency,
+                    FailureCode = status,
+                    FailureMessage = webhookEvent.Error
+                },
+                "pending" or "in progress" or "in_progress" or "initiated" => new ChargePendingEvent
+                {
+                    GatewayReference = webhookEvent.Txnid,
+                    Status = PaymentStatus.Pending,
+                    EventType = $"payuindia.{status}",
+                    Category = WebhookEventCategory.ChargePending,
+                    Amount = amount,
+                    Currency = currency
+                },
+                "refunded" or "queued_for_refund" => new RefundSucceededEvent
+                {
+                    GatewayReference = webhookEvent.Txnid,
+                    Status = PaymentStatus.Refunded,
+                    EventType = $"payuindia.{status}",
+                    Category = WebhookEventCategory.RefundSucceeded,
+                    RefundReference = webhookEvent.Mihpayid ?? webhookEvent.Txnid,
+                    Amount = amount,
+                    Currency = currency,
+                    IsPartial = false
+                },
+                _ => new WebhookEvent
+                {
+                    GatewayReference = webhookEvent.Txnid,
+                    Status = mappedStatus,
+                    EventType = $"payuindia.{status}"
+                }
+            };
+
+            activity?.SetTag("payment.gateway_reference", webhookEvent.Txnid);
+            return Task.FromResult<WebhookEvent?>(typed);
         }
         catch (Exception ex)
         {
@@ -342,7 +492,8 @@ public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutP
             Txnid = dict.GetValueOrDefault("txnid"),
             Mihpayid = dict.GetValueOrDefault("mihpayid"),
             Amount = dict.GetValueOrDefault("amount"),
-            Hash = dict.GetValueOrDefault("hash")
+            Hash = dict.GetValueOrDefault("hash"),
+            Error = dict.GetValueOrDefault("error") ?? dict.GetValueOrDefault("error_Message")
         };
     }
 
@@ -379,5 +530,6 @@ public sealed class PayUIndiaPaymentProvider : IPaymentGatewayProvider, IPayoutP
         [JsonPropertyName("mihpayid")] public string? Mihpayid { get; set; }
         [JsonPropertyName("amount")] public string? Amount { get; set; }
         [JsonPropertyName("hash")] public string? Hash { get; set; }
+        [JsonPropertyName("error_Message")] public string? Error { get; set; }
     }
 }

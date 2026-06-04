@@ -1,5 +1,6 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
@@ -10,7 +11,10 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Interswitch.Configuration;
+using Bhengu.Finance.Payments.Interswitch.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -18,7 +22,8 @@ namespace Bhengu.Finance.Payments.Interswitch.Providers;
 
 /// <summary>
 /// Interswitch (Nigeria/Africa) payment gateway provider. Wraps the Quickteller and Disbursement
-/// REST APIs over Interswitch's OAuth2 Passport endpoint. Supports payments, refunds, and disbursements.
+/// REST APIs over Interswitch's OAuth2 Passport endpoint. Supports payments, refunds, and
+/// disbursements (via <see cref="IPayoutProvider"/>).
 /// </summary>
 public sealed class InterswitchPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
 {
@@ -28,27 +33,43 @@ public sealed class InterswitchPaymentProvider : IPaymentGatewayProvider, IPayou
     private readonly HttpClient _httpClient;
     private readonly InterswitchOptions _options;
     private readonly ILogger<InterswitchPaymentProvider> _logger;
+    private readonly InterswitchIdempotencyCache? _idempotency;
 
     private string? _cachedAccessToken;
     private DateTime _accessTokenExpiresAtUtc = DateTime.MinValue;
 
+    /// <inheritdoc />
     public string ProviderName => ProviderNames.Interswitch;
 
+    /// <inheritdoc />
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
         ProviderCapabilities.Refund |
+        ProviderCapabilities.PartialRefund |
         ProviderCapabilities.Payout |
         ProviderCapabilities.Webhook |
-        ProviderCapabilities.Cards;
+        ProviderCapabilities.Cards |
+        ProviderCapabilities.BankTransfer |
+        ProviderCapabilities.Tokenisation |
+        ProviderCapabilities.Settlement |
+        ProviderCapabilities.Idempotency |
+        ProviderCapabilities.TypedWebhooks;
 
+    /// <summary>
+    /// Construct the provider. <paramref name="idempotency"/> is optional; when supplied
+    /// (default registration via DI) caller-supplied <c>IdempotencyKey</c> values dedupe across
+    /// payments / refunds / payouts.
+    /// </summary>
     public InterswitchPaymentProvider(
         HttpClient httpClient,
         IOptions<InterswitchOptions> options,
-        ILogger<InterswitchPaymentProvider> logger)
+        ILogger<InterswitchPaymentProvider> logger,
+        InterswitchIdempotencyCache? idempotency = null)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _idempotency = idempotency;
 
         if (string.IsNullOrWhiteSpace(_options.ClientId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(InterswitchOptions.ClientId)} is required");
@@ -65,147 +86,254 @@ public sealed class InterswitchPaymentProvider : IPaymentGatewayProvider, IPayou
         }
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc />
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        var amountInKobo = (long)(request.Amount * 100);
-        var requestRef = request.Metadata?.GetValueOrDefault("requestReference") ?? $"isw-{Guid.NewGuid():N}";
-        var customerEmail = request.Metadata?.GetValueOrDefault("customerEmail") ?? "noreply@bhengu.example";
-        var customerId = request.Metadata?.GetValueOrDefault("customerId") ?? "anonymous";
-        var customerMobile = request.Metadata?.GetValueOrDefault("mobileNo") ?? "";
-
-        var requestBody = new
-        {
-            customer = new { id = customerId, mobileNo = customerMobile },
-            paymentCode = _options.ProductId,
-            customerEmail,
-            amount = amountInKobo,
-            currency = request.Currency.ToUpperInvariant(),
-            transferCode = request.PaymentMethodToken,
-            requestReference = requestRef
-        };
-
-        var body = await SendAsync(HttpMethod.Post, "api/v2/quickteller/payments/advices",
-            requestBody, ct, "ProcessPayment").ConfigureAwait(false);
-        var resp = JsonSerializer.Deserialize<InterswitchAdviceResponse>(body);
-
-        _logger.LogInformation("Interswitch advice created: {Ref} status={Status}",
-            resp?.TransactionRef ?? requestRef, resp?.ResponseCode);
-
-        return new PaymentResponse
-        {
-            GatewayReference = resp?.TransactionRef ?? requestRef,
-            Status = MapResponseCode(resp?.ResponseCode),
-            Amount = request.Amount,
-            Currency = request.Currency,
-            ProcessedAt = DateTime.UtcNow,
-            Message = resp?.ResponseDescription
-        };
+        return _idempotency is null
+            ? ProcessPaymentCoreAsync(request, ct)
+            : _idempotency.GetOrAddAsync(request.IdempotencyKey, "charge",
+                () => ProcessPaymentCoreAsync(request, ct), ct);
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
     {
-        ArgumentNullException.ThrowIfNull(request);
-
-        var amountInKobo = (long)(request.Amount * 100);
-        var requestBody = new
+        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
+        try
         {
-            amount = amountInKobo,
-            reason = request.Reason
-        };
+            var amountInKobo = (long)(request.Amount * 100);
+            var requestRef = request.Metadata?.GetValueOrDefault("requestReference")
+                ?? request.IdempotencyKey
+                ?? $"isw-{Guid.NewGuid():N}";
+            var customerEmail = request.Metadata?.GetValueOrDefault("customerEmail") ?? "noreply@bhengu.example";
+            var customerId = request.Metadata?.GetValueOrDefault("customerId") ?? "anonymous";
+            var customerMobile = request.Metadata?.GetValueOrDefault("mobileNo") ?? string.Empty;
 
-        var path = $"api/v2/quickteller/transactions/{Uri.EscapeDataString(request.GatewayReference)}/refund";
-        var body = await SendAsync(HttpMethod.Post, path, requestBody, ct, "ProcessRefund").ConfigureAwait(false);
-        var resp = JsonSerializer.Deserialize<InterswitchRefundResponse>(body);
+            var requestBody = new
+            {
+                customer = new { id = customerId, mobileNo = customerMobile },
+                paymentCode = _options.ProductId,
+                customerEmail,
+                amount = amountInKobo,
+                currency = request.Currency.ToUpperInvariant(),
+                transferCode = request.PaymentMethodToken,
+                requestReference = requestRef
+            };
 
-        _logger.LogInformation("Interswitch refund created: {RefundRef} for txn {TxnRef}",
-            resp?.RefundReference, request.GatewayReference);
+            var body = await SendAsync(HttpMethod.Post, "api/v2/quickteller/payments/advices",
+                requestBody, ct, "ProcessPayment").ConfigureAwait(false);
+            var resp = JsonSerializer.Deserialize<InterswitchAdviceResponse>(body);
 
-        return new RefundResponse
-        {
-            GatewayReference = resp?.RefundReference ?? string.Empty,
-            Amount = request.Amount,
-            Status = MapResponseCode(resp?.ResponseCode),
-            ProcessedAt = DateTime.UtcNow,
-            Message = resp?.ResponseDescription
-        };
-    }
+            _logger.LogInformation("Interswitch advice created: {Ref} status={Status}",
+                resp?.TransactionRef ?? requestRef, resp?.ResponseCode);
 
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(request);
+            var status = MapResponseCode(resp?.ResponseCode);
+            outcome = status switch
+            {
+                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
+                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
+                PaymentStatus.Failed => BhenguPaymentDiagnostics.Outcomes.Declined,
+                _ => BhenguPaymentDiagnostics.Outcomes.Pending
+            };
 
-        var amountInKobo = (long)(request.Amount * 100);
-        // DestinationToken format: "<bankCode>:<accountNumber>" or just "<accountNumber>" (with bank in metadata downstream)
-        string bankCode = string.Empty;
-        string accountNumber = request.DestinationToken;
-        var sep = request.DestinationToken.IndexOf(':');
-        if (sep > 0)
-        {
-            bankCode = request.DestinationToken[..sep];
-            accountNumber = request.DestinationToken[(sep + 1)..];
+            return new PaymentResponse
+            {
+                GatewayReference = resp?.TransactionRef ?? requestRef,
+                Status = status,
+                Amount = request.Amount,
+                Currency = request.Currency,
+                ProcessedAt = DateTime.UtcNow,
+                Message = resp?.ResponseDescription
+            };
         }
-
-        var requestBody = new
+        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
+        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
+        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
+        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
+        finally
         {
-            amount = amountInKobo,
-            beneficiaryAccountNumber = accountNumber,
-            beneficiaryBankCode = bankCode,
-            narration = request.Description,
-            transactionRef = $"disb-{Guid.NewGuid():N}",
-            currencyCode = request.Currency.ToUpperInvariant()
-        };
-
-        var body = await SendAsync(HttpMethod.Post, "api/v2/disbursements/transactions",
-            requestBody, ct, "ProcessPayout").ConfigureAwait(false);
-        var resp = JsonSerializer.Deserialize<InterswitchDisbursementResponse>(body);
-
-        _logger.LogInformation("Interswitch disbursement created: {Ref} status={Status}",
-            resp?.TransactionRef, resp?.ResponseCode);
-
-        return new PayoutResponse
-        {
-            GatewayReference = resp?.TransactionRef ?? string.Empty,
-            Status = MapResponseCode(resp?.ResponseCode),
-            Amount = request.Amount,
-            Currency = request.Currency,
-            ProcessedAt = DateTime.UtcNow
-        };
+            activity?.SetOutcome(outcome);
+            sw.Stop();
+            BhenguPaymentDiagnostics.ChargesTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
+            BhenguPaymentDiagnostics.ChargeDurationMs.Record(sw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
+        }
     }
 
+    /// <inheritdoc />
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        return _idempotency is null
+            ? ProcessRefundCoreAsync(request, ct)
+            : _idempotency.GetOrAddAsync(request.IdempotencyKey, "refund",
+                () => ProcessRefundCoreAsync(request, ct), ct);
+    }
+
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
+        using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
+        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
+        try
+        {
+            var amountInKobo = (long)(request.Amount * 100);
+            var requestBody = new
+            {
+                amount = amountInKobo,
+                reason = request.Reason
+            };
+
+            var path = $"api/v2/quickteller/transactions/{Uri.EscapeDataString(request.GatewayReference)}/refund";
+            var body = await SendAsync(HttpMethod.Post, path, requestBody, ct, "ProcessRefund").ConfigureAwait(false);
+            var resp = JsonSerializer.Deserialize<InterswitchRefundResponse>(body);
+
+            _logger.LogInformation("Interswitch refund created: {RefundRef} for txn {TxnRef}",
+                resp?.RefundReference, request.GatewayReference);
+
+            var status = MapResponseCode(resp?.ResponseCode);
+            outcome = status switch
+            {
+                PaymentStatus.Completed or PaymentStatus.Refunded => BhenguPaymentDiagnostics.Outcomes.Success,
+                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
+                _ => BhenguPaymentDiagnostics.Outcomes.Declined
+            };
+
+            return new RefundResponse
+            {
+                GatewayReference = resp?.RefundReference ?? string.Empty,
+                Amount = request.Amount,
+                Status = status,
+                ProcessedAt = DateTime.UtcNow,
+                Message = resp?.ResponseDescription
+            };
+        }
+        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
+        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
+        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
+        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
+        finally
+        {
+            activity?.SetOutcome(outcome);
+            BhenguPaymentDiagnostics.RefundsTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
+        }
+    }
+
+    /// <inheritdoc />
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        return _idempotency is null
+            ? ProcessPayoutCoreAsync(request, ct)
+            : _idempotency.GetOrAddAsync(request.IdempotencyKey, "payout",
+                () => ProcessPayoutCoreAsync(request, ct), ct);
+    }
+
+    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+    {
+        using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, request.Currency);
+        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
+        try
+        {
+            var amountInKobo = (long)(request.Amount * 100);
+            // DestinationToken format: "<bankCode>:<accountNumber>" or just "<accountNumber>".
+            string bankCode = string.Empty;
+            string accountNumber = request.DestinationToken;
+            var sep = request.DestinationToken.IndexOf(':');
+            if (sep > 0)
+            {
+                bankCode = request.DestinationToken[..sep];
+                accountNumber = request.DestinationToken[(sep + 1)..];
+            }
+
+            var requestBody = new
+            {
+                amount = amountInKobo,
+                beneficiaryAccountNumber = accountNumber,
+                beneficiaryBankCode = bankCode,
+                narration = request.Description,
+                transactionRef = request.IdempotencyKey ?? $"disb-{Guid.NewGuid():N}",
+                currencyCode = request.Currency.ToUpperInvariant()
+            };
+
+            var body = await SendAsync(HttpMethod.Post, "api/v2/disbursements/transactions",
+                requestBody, ct, "ProcessPayout").ConfigureAwait(false);
+            var resp = JsonSerializer.Deserialize<InterswitchDisbursementResponse>(body);
+
+            _logger.LogInformation("Interswitch disbursement created: {Ref} status={Status}",
+                resp?.TransactionRef, resp?.ResponseCode);
+
+            var status = MapResponseCode(resp?.ResponseCode);
+            outcome = status switch
+            {
+                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
+                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
+                _ => BhenguPaymentDiagnostics.Outcomes.Declined
+            };
+
+            return new PayoutResponse
+            {
+                GatewayReference = resp?.TransactionRef ?? string.Empty,
+                Status = status,
+                Amount = request.Amount,
+                Currency = request.Currency,
+                ProcessedAt = DateTime.UtcNow
+            };
+        }
+        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
+        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
+        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
+        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
+        finally
+        {
+            activity?.SetOutcome(outcome);
+            BhenguPaymentDiagnostics.PayoutsTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
+        }
+    }
+
+    /// <inheritdoc />
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
-        {
-            _logger.LogWarning("Interswitch WebhookSecret not configured — signature verification cannot succeed.");
-            return false;
-        }
-
+        var valid = false;
         try
         {
+            if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
+            {
+                _logger.LogWarning("Interswitch WebhookSecret not configured — signature verification cannot succeed.");
+                return false;
+            }
+
             using var hmac = new HMACSHA512(Encoding.UTF8.GetBytes(_options.WebhookSecret));
             var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
             var computedSignature = Convert.ToHexString(computedHash).ToLowerInvariant();
 
-            return CryptographicOperations.FixedTimeEquals(
+            valid = CryptographicOperations.FixedTimeEquals(
                 Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
                 Encoding.UTF8.GetBytes(computedSignature));
+            return valid;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Interswitch webhook signature verification raised");
             return false;
         }
+        finally
+        {
+            BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("valid", valid));
+        }
     }
 
+    /// <inheritdoc />
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
 
+        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
         try
         {
             var evt = JsonSerializer.Deserialize<InterswitchWebhookEvent>(payload);
@@ -213,31 +341,143 @@ public sealed class InterswitchPaymentProvider : IPaymentGatewayProvider, IPayou
 
             _logger.LogInformation("Parsed Interswitch webhook event: {EventType}", evt.EventType);
 
-            var status = evt.EventType?.ToLowerInvariant() switch
-            {
-                "payment.successful" or "transaction.successful" or "disbursement.successful"
-                    => PaymentStatus.Completed,
-                "payment.failed" or "transaction.failed" or "disbursement.failed"
-                    => PaymentStatus.Failed,
-                "refund.successful" or "refund.processed"
-                    => PaymentStatus.Refunded,
-                _ => (PaymentStatus?)null
-            };
-
-            if (status is null || string.IsNullOrEmpty(evt.Data?.TransactionRef))
-                return Task.FromResult<WebhookEvent?>(null);
-
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
-            {
-                GatewayReference = evt.Data.TransactionRef,
-                Status = status.Value,
-                EventType = evt.EventType
-            });
+            var typed = MapWebhookEvent(evt);
+            return Task.FromResult(typed);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to parse Interswitch webhook event");
             return Task.FromResult<WebhookEvent?>(null);
+        }
+    }
+
+    private static WebhookEvent? MapWebhookEvent(InterswitchWebhookEvent webhookEvent)
+    {
+        var eventType = webhookEvent.EventType?.ToLowerInvariant() ?? string.Empty;
+        var data = webhookEvent.Data;
+        var rawReference = data?.TransactionRef;
+        if (string.IsNullOrEmpty(rawReference)) return null;
+
+        var amount = (data?.Amount ?? 0L) / 100m;
+        var currency = data?.Currency ?? "NGN";
+
+        switch (eventType)
+        {
+            case "payment.successful":
+            case "transaction.successful":
+            case "charge.success":
+                return new ChargeSucceededEvent
+                {
+                    GatewayReference = rawReference,
+                    Status = PaymentStatus.Completed,
+                    EventType = webhookEvent.EventType,
+                    Category = WebhookEventCategory.ChargeSucceeded,
+                    Amount = amount,
+                    Currency = currency,
+                    CustomerId = data?.CustomerId,
+                    PaymentMethodToken = data?.PaymentMethod
+                };
+
+            case "payment.failed":
+            case "transaction.failed":
+            case "charge.failed":
+                return new ChargeFailedEvent
+                {
+                    GatewayReference = rawReference,
+                    Status = PaymentStatus.Failed,
+                    EventType = webhookEvent.EventType,
+                    Category = WebhookEventCategory.ChargeFailed,
+                    Amount = amount,
+                    Currency = currency,
+                    FailureCode = data?.Status,
+                    FailureMessage = data?.ResponseDescription
+                };
+
+            case "payment.pending":
+            case "transaction.pending":
+                return new ChargePendingEvent
+                {
+                    GatewayReference = rawReference,
+                    Status = PaymentStatus.Pending,
+                    EventType = webhookEvent.EventType,
+                    Category = WebhookEventCategory.ChargePending,
+                    Amount = amount,
+                    Currency = currency
+                };
+
+            case "refund.successful":
+            case "refund.processed":
+                return new RefundSucceededEvent
+                {
+                    GatewayReference = rawReference,
+                    Status = PaymentStatus.Refunded,
+                    EventType = webhookEvent.EventType,
+                    Category = WebhookEventCategory.RefundSucceeded,
+                    RefundReference = data?.RefundReference ?? rawReference,
+                    Amount = amount,
+                    Currency = currency,
+                    IsPartial = false
+                };
+
+            case "refund.failed":
+                return new RefundFailedEvent
+                {
+                    GatewayReference = rawReference,
+                    Status = PaymentStatus.Failed,
+                    EventType = webhookEvent.EventType,
+                    Category = WebhookEventCategory.RefundFailed,
+                    Amount = amount,
+                    Currency = currency,
+                    FailureCode = data?.Status,
+                    FailureMessage = data?.ResponseDescription
+                };
+
+            case "disbursement.successful":
+            case "transfer.successful":
+            case "payout.successful":
+                return new PayoutCompletedEvent
+                {
+                    GatewayReference = rawReference,
+                    Status = PaymentStatus.Completed,
+                    EventType = webhookEvent.EventType,
+                    Category = WebhookEventCategory.PayoutCompleted,
+                    PayoutReference = rawReference,
+                    Amount = amount,
+                    Currency = currency,
+                    DestinationToken = data?.BeneficiaryAccount
+                };
+
+            case "disbursement.failed":
+            case "transfer.failed":
+            case "payout.failed":
+                return new PayoutFailedEvent
+                {
+                    GatewayReference = rawReference,
+                    Status = PaymentStatus.Failed,
+                    EventType = webhookEvent.EventType,
+                    Category = WebhookEventCategory.PayoutFailed,
+                    PayoutReference = rawReference,
+                    Amount = amount,
+                    Currency = currency,
+                    FailureCode = data?.Status,
+                    FailureMessage = data?.ResponseDescription
+                };
+
+            case "settlement.completed":
+            case "settlement.processed":
+                return new SettlementCompletedEvent
+                {
+                    GatewayReference = rawReference,
+                    Status = PaymentStatus.Completed,
+                    EventType = webhookEvent.EventType,
+                    Category = WebhookEventCategory.SettlementCompleted,
+                    SettlementReference = rawReference,
+                    NetAmount = amount,
+                    Currency = currency
+                };
+
+            default:
+                return null;
         }
     }
 
@@ -251,8 +491,7 @@ public sealed class InterswitchPaymentProvider : IPaymentGatewayProvider, IPayou
             Content = new StringContent(json, Encoding.UTF8, "application/json")
         };
 
-        // Interswitch security headers
-        var timestampMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString();
+        var timestampMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture);
         var nonce = Guid.NewGuid().ToString("N");
         var resourceUrl = path.StartsWith('/') ? path : "/" + path;
         var signature = ComputeRequestSignature(method.Method, resourceUrl, timestampMs, nonce);
@@ -285,7 +524,7 @@ public sealed class InterswitchPaymentProvider : IPaymentGatewayProvider, IPayou
         {
             _logger.LogError("Interswitch {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
-                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
+                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
         }
 
@@ -336,9 +575,7 @@ public sealed class InterswitchPaymentProvider : IPaymentGatewayProvider, IPayou
     {
         // Interswitch documented format: SHA-512 hex of clientId+method+resource+timestamp+nonce+secretKey
         var raw = _options.ClientId + method + resource + timestampMs + nonce + _options.ClientSecret;
-        using var sha = SHA512.Create();
-        var hash = sha.ComputeHash(Encoding.UTF8.GetBytes(raw));
-        return Convert.ToHexString(hash).ToLowerInvariant();
+        return Convert.ToHexString(SHA512.HashData(Encoding.UTF8.GetBytes(raw))).ToLowerInvariant();
     }
 
     private static PaymentStatus MapResponseCode(string? code) => code switch
@@ -390,6 +627,12 @@ public sealed class InterswitchPaymentProvider : IPaymentGatewayProvider, IPayou
     {
         [JsonPropertyName("transactionRef")] public string? TransactionRef { get; set; }
         [JsonPropertyName("amount")] public long Amount { get; set; }
+        [JsonPropertyName("currency")] public string? Currency { get; set; }
         [JsonPropertyName("status")] public string? Status { get; set; }
+        [JsonPropertyName("responseDescription")] public string? ResponseDescription { get; set; }
+        [JsonPropertyName("customerId")] public string? CustomerId { get; set; }
+        [JsonPropertyName("paymentMethod")] public string? PaymentMethod { get; set; }
+        [JsonPropertyName("refundReference")] public string? RefundReference { get; set; }
+        [JsonPropertyName("beneficiaryAccountNumber")] public string? BeneficiaryAccount { get; set; }
     }
 }

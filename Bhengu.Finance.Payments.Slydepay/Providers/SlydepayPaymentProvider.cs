@@ -1,14 +1,18 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using System.Globalization;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Slydepay.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -26,24 +30,32 @@ public sealed class SlydepayPaymentProvider : IPaymentGatewayProvider
     private readonly HttpClient _httpClient;
     private readonly SlydepayOptions _options;
     private readonly ILogger<SlydepayPaymentProvider> _logger;
+    private readonly IBhenguDistributedCache? _idempotencyCache;
 
+    /// <inheritdoc/>
     public string ProviderName => ProviderNames.Slydepay;
 
+    /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
         ProviderCapabilities.Webhook |
         ProviderCapabilities.RedirectFlow |
         ProviderCapabilities.Cards |
-        ProviderCapabilities.MobileMoney;
+        ProviderCapabilities.MobileMoney |
+        ProviderCapabilities.Idempotency |
+        ProviderCapabilities.TypedWebhooks;
 
+    /// <summary>Construct the Slydepay payment provider. <paramref name="idempotencyCache"/> is optional — when omitted, idempotency replay is a no-op.</summary>
     public SlydepayPaymentProvider(
         HttpClient httpClient,
         IOptions<SlydepayOptions> options,
-        ILogger<SlydepayPaymentProvider> logger)
+        ILogger<SlydepayPaymentProvider> logger,
+        IBhenguDistributedCache? idempotencyCache = null)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _idempotencyCache = idempotencyCache;
 
         if (string.IsNullOrWhiteSpace(_options.EmailOrMobile))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(SlydepayOptions.EmailOrMobile)} is required");
@@ -60,44 +72,83 @@ public sealed class SlydepayPaymentProvider : IPaymentGatewayProvider
         }
     }
 
+    /// <inheritdoc/>
     public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        var body = new
+        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
+        var started = DateTime.UtcNow;
+        var cached = await TryGetCachedAsync<PaymentResponse>(request.IdempotencyKey, "charge", ct).ConfigureAwait(false);
+        if (cached is not null)
         {
-            emailOrMobileNumber = _options.EmailOrMobile,
-            merchantKey = _options.MerchantKey,
-            orderCode = request.PaymentMethodToken,
-            description = request.Description,
-            amount = request.Amount,
-            comment1 = request.Metadata?.GetValueOrDefault("comment1") ?? "",
-            comment2 = request.Metadata?.GetValueOrDefault("comment2") ?? "",
-            surcharge = request.Metadata?.GetValueOrDefault("surcharge") ?? "0",
-            currency = request.Currency.ToUpperInvariant(),
-            paymentChannels = _options.PaymentChannels
-        };
+            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+            return cached;
+        }
 
-        var responseBody = await SendAsync(HttpMethod.Post, "webservices/paymentservice.asmx/ProcessPaymentOrder",
-            body, ct, "ProcessPayment").ConfigureAwait(false);
-        var envelope = JsonSerializer.Deserialize<SlydepayEnvelope<SlydepayProcessResult>>(responseBody);
-        var result = envelope?.Result;
-
-        _logger.LogInformation("Slydepay ProcessPaymentOrder: success={Success} payToken={PayToken}",
-            result?.Success, result?.PayToken);
-
-        return new PaymentResponse
+        try
         {
-            GatewayReference = result?.PayToken ?? request.PaymentMethodToken,
-            Status = result?.Success == true ? PaymentStatus.Pending : PaymentStatus.Failed,
-            Amount = request.Amount,
-            Currency = request.Currency,
-            ProcessedAt = DateTime.UtcNow,
-            RedirectUrl = result?.CheckOutUrl,
-            Message = envelope?.ErrorMessage
-        };
+            var body = new
+            {
+                emailOrMobileNumber = _options.EmailOrMobile,
+                merchantKey = _options.MerchantKey,
+                orderCode = request.PaymentMethodToken,
+                description = request.Description,
+                amount = request.Amount,
+                comment1 = request.Metadata?.GetValueOrDefault("comment1") ?? "",
+                comment2 = request.Metadata?.GetValueOrDefault("comment2") ?? "",
+                surcharge = request.Metadata?.GetValueOrDefault("surcharge") ?? "0",
+                currency = request.Currency.ToUpperInvariant(),
+                paymentChannels = _options.PaymentChannels
+            };
+
+            var responseBody = await SendAsync(HttpMethod.Post, "webservices/paymentservice.asmx/ProcessPaymentOrder",
+                body, ct, "ProcessPayment").ConfigureAwait(false);
+            var envelope = JsonSerializer.Deserialize<SlydepayEnvelope<SlydepayProcessResult>>(responseBody);
+            var result = envelope?.Result;
+
+            _logger.LogInformation("Slydepay ProcessPaymentOrder: success={Success} payToken={PayToken}",
+                result?.Success, result?.PayToken);
+
+            var response = new PaymentResponse
+            {
+                GatewayReference = result?.PayToken ?? request.PaymentMethodToken,
+                Status = result?.Success == true ? PaymentStatus.Pending : PaymentStatus.Failed,
+                Amount = request.Amount,
+                Currency = request.Currency,
+                ProcessedAt = DateTime.UtcNow,
+                RedirectUrl = result?.CheckOutUrl,
+                Message = envelope?.ErrorMessage
+            };
+
+            await TrySetCachedAsync(request.IdempotencyKey, "charge", response, ct).ConfigureAwait(false);
+            var outcome = response.Status == PaymentStatus.Pending
+                ? BhenguPaymentDiagnostics.Outcomes.Pending
+                : BhenguPaymentDiagnostics.Outcomes.Declined;
+            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("outcome", outcome));
+            activity.SetOutcome(outcome);
+            return response;
+        }
+        catch (Exception ex)
+        {
+            var outcome = ClassifyOutcome(ex);
+            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("outcome", outcome));
+            activity.SetOutcome(outcome);
+            throw;
+        }
+        finally
+        {
+            BhenguPaymentDiagnostics.ChargeDurationMs.Record(
+                (DateTime.UtcNow - started).TotalMilliseconds,
+                new KeyValuePair<string, object?>("provider", ProviderName));
+        }
     }
 
+    /// <inheritdoc/>
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -146,6 +197,7 @@ public sealed class SlydepayPaymentProvider : IPaymentGatewayProvider
             body, ct, "CancelTransaction").ConfigureAwait(false);
     }
 
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -154,6 +206,9 @@ public sealed class SlydepayPaymentProvider : IPaymentGatewayProvider
         if (string.IsNullOrWhiteSpace(_options.MerchantKey))
         {
             _logger.LogWarning("Slydepay MerchantKey not configured — webhook verification cannot succeed.");
+            BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("valid", false));
             return false;
         }
 
@@ -162,13 +217,19 @@ public sealed class SlydepayPaymentProvider : IPaymentGatewayProvider
         // re-confirm via VerifyTransactionAsync(payToken, orderCode) in production.
         var a = Encoding.UTF8.GetBytes(signature);
         var b = Encoding.UTF8.GetBytes(_options.MerchantKey);
-        if (a.Length != b.Length) return false;
-        return CryptographicOperations.FixedTimeEquals(a, b);
+        var valid = a.Length == b.Length && CryptographicOperations.FixedTimeEquals(a, b);
+        BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
+            new KeyValuePair<string, object?>("provider", ProviderName),
+            new KeyValuePair<string, object?>("valid", valid));
+        return valid;
     }
 
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+
+        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
 
         try
         {
@@ -179,24 +240,60 @@ public sealed class SlydepayPaymentProvider : IPaymentGatewayProvider
             _logger.LogInformation("Parsed Slydepay notification: payToken={PayToken} status={Status}",
                 notif.PayToken, notif.TransactionStatus);
 
-            var status = notif.TransactionStatus?.ToUpperInvariant() switch
+            var statusUpper = notif.TransactionStatus?.ToUpperInvariant();
+            var currency = notif.Currency ?? _options.Currency;
+            WebhookEvent? typed = statusUpper switch
             {
-                "CONFIRMED" or "PAID" or "COMPLETED" or "SUCCESS" => PaymentStatus.Completed,
-                "PENDING" or "PROCESSING" or "ACCEPTED" => PaymentStatus.Pending,
-                "FAILED" or "DECLINED" => PaymentStatus.Failed,
-                "CANCELED" or "CANCELLED" => PaymentStatus.Cancelled,
-                "REFUNDED" => PaymentStatus.Refunded,
-                _ => (PaymentStatus?)null
+                "CONFIRMED" or "PAID" or "COMPLETED" or "SUCCESS" => new ChargeSucceededEvent
+                {
+                    GatewayReference = notif.PayToken,
+                    Status = PaymentStatus.Completed,
+                    EventType = notif.TransactionStatus,
+                    Category = WebhookEventCategory.ChargeSucceeded,
+                    Amount = notif.Amount,
+                    Currency = currency
+                },
+                "PENDING" or "PROCESSING" or "ACCEPTED" => new ChargePendingEvent
+                {
+                    GatewayReference = notif.PayToken,
+                    Status = PaymentStatus.Pending,
+                    EventType = notif.TransactionStatus,
+                    Category = WebhookEventCategory.ChargePending,
+                    Amount = notif.Amount,
+                    Currency = currency
+                },
+                "FAILED" or "DECLINED" => new ChargeFailedEvent
+                {
+                    GatewayReference = notif.PayToken,
+                    Status = PaymentStatus.Failed,
+                    EventType = notif.TransactionStatus,
+                    Category = WebhookEventCategory.ChargeFailed,
+                    Amount = notif.Amount,
+                    Currency = currency,
+                    FailureMessage = notif.TransactionStatus
+                },
+                "CANCELED" or "CANCELLED" => new WebhookEvent
+                {
+                    GatewayReference = notif.PayToken,
+                    Status = PaymentStatus.Cancelled,
+                    EventType = notif.TransactionStatus,
+                    Category = WebhookEventCategory.Unknown
+                },
+                "REFUNDED" => new RefundSucceededEvent
+                {
+                    GatewayReference = notif.PayToken,
+                    Status = PaymentStatus.Refunded,
+                    EventType = notif.TransactionStatus,
+                    Category = WebhookEventCategory.RefundSucceeded,
+                    RefundReference = notif.PayToken,
+                    Amount = notif.Amount,
+                    Currency = currency,
+                    IsPartial = false
+                },
+                _ => null
             };
 
-            if (status is null) return Task.FromResult<WebhookEvent?>(null);
-
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
-            {
-                GatewayReference = notif.PayToken,
-                Status = status.Value,
-                EventType = notif.TransactionStatus
-            });
+            return Task.FromResult(typed);
         }
         catch (Exception ex)
         {
@@ -235,12 +332,36 @@ public sealed class SlydepayPaymentProvider : IPaymentGatewayProvider
         {
             _logger.LogError("Slydepay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
-                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
+                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
         }
 
         return responseBody;
     }
+
+    private async Task<T?> TryGetCachedAsync<T>(string? idempotencyKey, string operation, CancellationToken ct) where T : class
+    {
+        if (_idempotencyCache is null || string.IsNullOrWhiteSpace(idempotencyKey))
+            return null;
+        var key = $"slydepay:{operation}:{idempotencyKey}";
+        return await _idempotencyCache.GetAsync<T>(key, ct).ConfigureAwait(false);
+    }
+
+    private async Task TrySetCachedAsync<T>(string? idempotencyKey, string operation, T value, CancellationToken ct) where T : class
+    {
+        if (_idempotencyCache is null || string.IsNullOrWhiteSpace(idempotencyKey))
+            return;
+        var key = $"slydepay:{operation}:{idempotencyKey}";
+        await _idempotencyCache.SetAsync(key, value, TimeSpan.FromHours(24), ct).ConfigureAwait(false);
+    }
+
+    private static string ClassifyOutcome(Exception ex) => ex switch
+    {
+        PaymentDeclinedException => BhenguPaymentDiagnostics.Outcomes.Declined,
+        ProviderRateLimitException => BhenguPaymentDiagnostics.Outcomes.RateLimited,
+        ProviderUnavailableException => BhenguPaymentDiagnostics.Outcomes.Unavailable,
+        _ => BhenguPaymentDiagnostics.Outcomes.Error
+    };
 
     private sealed class SlydepayEnvelope<T>
     {
@@ -262,5 +383,7 @@ public sealed class SlydepayPaymentProvider : IPaymentGatewayProvider
         [JsonPropertyName("payToken")] public string? PayToken { get; set; }
         [JsonPropertyName("orderCode")] public string? OrderCode { get; set; }
         [JsonPropertyName("transactionStatus")] public string? TransactionStatus { get; set; }
+        [JsonPropertyName("amount")] public decimal Amount { get; set; }
+        [JsonPropertyName("currency")] public string? Currency { get; set; }
     }
 }

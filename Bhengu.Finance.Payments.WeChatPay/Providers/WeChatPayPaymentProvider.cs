@@ -13,6 +13,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.WeChatPay.Configuration;
+using Bhengu.Finance.Payments.WeChatPay.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -65,10 +66,15 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
             _httpClient.BaseAddress = new Uri(_options.BaseUrl ?? "https://api.mch.weixin.qq.com");
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return WeChatPayObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+    }
 
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+    {
         var currency = string.IsNullOrWhiteSpace(request.Currency) ? _options.Currency : request.Currency.ToUpperInvariant();
         // WeChat Pay uses fen (1/100 CNY) as integer.
         var totalFen = (int)Math.Round(request.Amount * 100m, MidpointRounding.AwayFromZero);
@@ -101,10 +107,15 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
         };
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return WeChatPayObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+    }
 
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
         var currency = _options.Currency.ToUpperInvariant();
         var totalFen = (int)Math.Round(request.Amount * 100m, MidpointRounding.AwayFromZero);
         var outRefundNo = $"REFUND_{DateTime.UtcNow:yyyyMMddHHmmss}_{Guid.NewGuid():N}"[..32];
@@ -134,10 +145,15 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
         };
     }
 
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return WeChatPayObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+    }
 
+    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+    {
         var totalFen = (int)Math.Round(request.Amount * 100m, MidpointRounding.AwayFromZero);
         var outBatchNo = $"BATCH_{DateTime.UtcNow:yyyyMMddHHmmss}_{Guid.NewGuid():N}"[..32];
         var outDetailNo = $"D_{Guid.NewGuid():N}"[..30];
@@ -178,6 +194,7 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
         };
     }
 
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -186,18 +203,16 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
         if (string.IsNullOrWhiteSpace(_options.WeChatPayPlatformCertificate))
         {
             _logger.LogWarning("WeChat Pay WeChatPayPlatformCertificate not configured — webhook signature verification cannot succeed.");
+            WeChatPayObservability.RecordWebhookVerification(false);
             return false;
         }
 
+        bool verified;
         try
         {
-            // Webhook signatures are RSA-SHA256 over the raw JSON body, base64-encoded.
-            // The merchant is responsible for combining timestamp + nonce + body upstream when verifying
-            // the canonical string the WeChat docs prescribe. For SDK simplicity we verify the body itself,
-            // and callers that need the full canonical-string mode can supply timestamp.nonce.body as the payload.
             var sigBytes = Convert.FromBase64String(signature);
             using var rsa = LoadPublicKey(_options.WeChatPayPlatformCertificate);
-            return rsa.VerifyData(
+            verified = rsa.VerifyData(
                 Encoding.UTF8.GetBytes(payload),
                 sigBytes,
                 HashAlgorithmName.SHA256,
@@ -206,14 +221,21 @@ public sealed class WeChatPayPaymentProvider : IPaymentGatewayProvider, IPayoutP
         catch (Exception ex)
         {
             _logger.LogError(ex, "WeChat Pay webhook signature verification raised");
-            return false;
+            verified = false;
         }
+        WeChatPayObservability.RecordWebhookVerification(verified);
+        return verified;
     }
 
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+        return WeChatPayObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+    }
 
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
+    {
         try
         {
             var webhook = JsonSerializer.Deserialize<WeChatPayWebhookEvent>(payload);

@@ -50,9 +50,14 @@ public sealed class PaystackDisputeProvider : IDisputeProvider
     }
 
     /// <inheritdoc/>
-    public async Task<Dispute?> GetDisputeAsync(string disputeReference, CancellationToken ct = default)
+    public Task<Dispute?> GetDisputeAsync(string disputeReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(disputeReference);
+        return PaystackObservability.ObserveAsync("get_dispute", () => GetDisputeCoreAsync(disputeReference, ct));
+    }
+
+    private async Task<Dispute?> GetDisputeCoreAsync(string disputeReference, CancellationToken ct)
+    {
         try
         {
             var responseBody = await PaystackHttpClient.SendAsync(
@@ -67,7 +72,10 @@ public sealed class PaystackDisputeProvider : IDisputeProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<Dispute>> ListDisputesAsync(DateTime? fromUtc = null, DateTime? toUtc = null, CancellationToken ct = default)
+    public Task<IReadOnlyList<Dispute>> ListDisputesAsync(DateTime? fromUtc = null, DateTime? toUtc = null, CancellationToken ct = default)
+        => PaystackObservability.ObserveAsync("list_disputes", () => ListDisputesCoreAsync(fromUtc, toUtc, ct));
+
+    private async Task<IReadOnlyList<Dispute>> ListDisputesCoreAsync(DateTime? fromUtc, DateTime? toUtc, CancellationToken ct)
     {
         var qs = new StringBuilder("dispute?perPage=100");
         if (fromUtc.HasValue)
@@ -87,11 +95,15 @@ public sealed class PaystackDisputeProvider : IDisputeProvider
     }
 
     /// <inheritdoc/>
-    public async Task<Dispute> SubmitEvidenceAsync(string disputeReference, DisputeEvidence evidence, CancellationToken ct = default)
+    public Task<Dispute> SubmitEvidenceAsync(string disputeReference, DisputeEvidence evidence, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(disputeReference);
         ArgumentNullException.ThrowIfNull(evidence);
+        return PaystackObservability.ObserveAsync("submit_evidence", () => SubmitEvidenceCoreAsync(disputeReference, evidence, ct));
+    }
 
+    private async Task<Dispute> SubmitEvidenceCoreAsync(string disputeReference, DisputeEvidence evidence, CancellationToken ct)
+    {
         var body = new
         {
             customer_email = evidence.CustomerEmailAddress,
@@ -117,9 +129,14 @@ public sealed class PaystackDisputeProvider : IDisputeProvider
     }
 
     /// <inheritdoc/>
-    public async Task<Dispute> AcceptDisputeAsync(string disputeReference, CancellationToken ct = default)
+    public Task<Dispute> AcceptDisputeAsync(string disputeReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(disputeReference);
+        return PaystackObservability.ObserveAsync("accept_dispute", () => AcceptDisputeCoreAsync(disputeReference, ct));
+    }
+
+    private async Task<Dispute> AcceptDisputeCoreAsync(string disputeReference, CancellationToken ct)
+    {
         // Paystack treats acceptance as a resolve with resolution=merchant-accepted.
         var existing = await GetDisputeAsync(disputeReference, ct).ConfigureAwait(false)
             ?? throw new BhenguPaymentException(ProviderName, $"Dispute {disputeReference} not found", "dispute_not_found");

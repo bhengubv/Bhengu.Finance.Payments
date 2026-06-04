@@ -3,8 +3,10 @@
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Onafriq.Configuration;
 using Bhengu.Finance.Payments.Onafriq.Providers;
 using Bhengu.Finance.Payments.Tests.TestHelpers;
@@ -16,7 +18,7 @@ namespace Bhengu.Finance.Payments.Tests.Onafriq;
 
 public class OnafriqPaymentProviderTests
 {
-    private static OnafriqPaymentProvider Create(StubHttpMessageHandler handler, OnafriqOptions? opts = null)
+    private static OnafriqPaymentProvider Create(StubHttpMessageHandler handler, OnafriqOptions? opts = null, IBhenguDistributedCache? cache = null)
     {
         opts ??= new OnafriqOptions
         {
@@ -27,7 +29,7 @@ public class OnafriqPaymentProviderTests
             UseSandbox = true
         };
         var http = new HttpClient(handler);
-        return new OnafriqPaymentProvider(http, Options.Create(opts), NullLogger<OnafriqPaymentProvider>.Instance);
+        return new OnafriqPaymentProvider(http, Options.Create(opts), NullLogger<OnafriqPaymentProvider>.Instance, cache);
     }
 
     private static PaymentRequest SamplePayment() => new()
@@ -200,5 +202,44 @@ public class OnafriqPaymentProviderTests
     {
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
         Assert.Null(await provider.ParseWebhookAsync("not json"));
+    }
+
+    [Fact]
+    public async Task ParseWebhookAsync_ReturnsTypedPayoutCompletedEvent_ForTransactionCompleted()
+    {
+        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+        var evt = await provider.ParseWebhookAsync("""
+            {"eventType":"transaction.completed","data":{"transactionId":"TX-1","amount":100,"currency":"USD","destination":{"country":"GH","walletNumber":"233244000000"}}}
+            """);
+        var typed = Assert.IsType<PayoutCompletedEvent>(evt);
+        Assert.Equal(WebhookEventCategory.PayoutCompleted, typed.Category);
+        Assert.Equal("233244000000", typed.DestinationToken);
+    }
+
+    [Fact]
+    public async Task ProcessPayoutAsync_DedupesViaIdempotencyKey()
+    {
+        var calls = 0;
+        var handler = new StubHttpMessageHandler((_, _) =>
+        {
+            calls++;
+            return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
+                {"transactionId":"TX-PAY-1","status":"submitted"}
+                """);
+        });
+        var cache = new InMemoryBhenguDistributedCache();
+        var provider = Create(handler, cache: cache);
+        var req = new PayoutRequest
+        {
+            DestinationToken = "GH:233244000000",
+            Amount = 100m,
+            Currency = "USD",
+            Description = "test",
+            IdempotencyKey = "idem-1"
+        };
+        var first = await provider.ProcessPayoutAsync(req);
+        var second = await provider.ProcessPayoutAsync(req);
+        Assert.Equal(first.GatewayReference, second.GatewayReference);
+        Assert.Equal(1, calls);
     }
 }

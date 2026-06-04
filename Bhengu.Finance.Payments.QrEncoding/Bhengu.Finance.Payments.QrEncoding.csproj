@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <IsPackable>true</IsPackable>
+    <Version>2.0.0-preview.5</Version>
+    <PackageId>Bhengu.Finance.Payments.QrEncoding</PackageId>
+    <Authors>T.M. Bengu</Authors>
+    <Company>Bhengu B.V.</Company>
+    <Description>QR code image-encoding helpers for Bhengu Finance Payments — wraps QRCoder so consumers can turn provider-returned payload strings into PNG/SVG bytes without taking the QRCoder dependency directly.</Description>
+    <PackageTags>Payments;QR;QRCode;QRCoder;PNG;SVG;Bhengu;Bengu</PackageTags>
+    <RepositoryUrl>https://github.com/bhengubv/Bhengu.Finance.Payments</RepositoryUrl>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="QRCoder" Version="1.6.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Bhengu.Finance.Payments.Core\Bhengu.Finance.Payments.Core.csproj" />
+  </ItemGroup>
+</Project>

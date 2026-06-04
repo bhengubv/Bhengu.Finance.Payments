@@ -60,8 +60,8 @@ public sealed class PaystackTokenisationProvider : ITokenisationProvider
     public Task<PaymentMethod> TokeniseAsync(TokeniseRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => TokeniseCoreAsync(request, ct));
+        return PaystackObservability.ObserveAsync("tokenise", () =>
+            _idempotency.GetOrAddAsync(request.IdempotencyKey, () => TokeniseCoreAsync(request, ct)));
     }
 
     private async Task<PaymentMethod> TokeniseCoreAsync(TokeniseRequest request, CancellationToken ct)
@@ -135,10 +135,14 @@ public sealed class PaystackTokenisationProvider : ITokenisationProvider
     }
 
     /// <inheritdoc/>
-    public async Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
+    public Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(token);
+        return PaystackObservability.ObserveAsync("get_payment_method", () => GetPaymentMethodCoreAsync(token, ct));
+    }
 
+    private async Task<PaymentMethod?> GetPaymentMethodCoreAsync(string token, CancellationToken ct)
+    {
         // Paystack does not have a single "get authorization" endpoint — but the authorization is
         // surfaced via Customer:fetch. The token itself is opaque; without a customer side reference
         // we attempt the customer endpoint keyed on the token. If the call fails the method is gone.
@@ -167,10 +171,14 @@ public sealed class PaystackTokenisationProvider : ITokenisationProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<PaymentMethod>> ListPaymentMethodsAsync(string customerId, CancellationToken ct = default)
+    public Task<IReadOnlyList<PaymentMethod>> ListPaymentMethodsAsync(string customerId, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(customerId);
+        return PaystackObservability.ObserveAsync("list_payment_methods", () => ListPaymentMethodsCoreAsync(customerId, ct));
+    }
 
+    private async Task<IReadOnlyList<PaymentMethod>> ListPaymentMethodsCoreAsync(string customerId, CancellationToken ct)
+    {
         var responseBody = await PaystackHttpClient.SendAsync(
             _httpClient, _logger, HttpMethod.Get, $"customer/{Uri.EscapeDataString(customerId)}", null, "ListPaymentMethods", ct).ConfigureAwait(false);
         var customer = JsonSerializer.Deserialize<PaystackCustomerResponse>(responseBody, PaystackHttpClient.Json);
@@ -185,10 +193,14 @@ public sealed class PaystackTokenisationProvider : ITokenisationProvider
     }
 
     /// <inheritdoc/>
-    public async Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
+    public Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(token);
+        return PaystackObservability.ObserveAsync("delete_payment_method", () => DeletePaymentMethodCoreAsync(token, ct));
+    }
 
+    private async Task<bool> DeletePaymentMethodCoreAsync(string token, CancellationToken ct)
+    {
         try
         {
             var body = new { authorization_code = token };

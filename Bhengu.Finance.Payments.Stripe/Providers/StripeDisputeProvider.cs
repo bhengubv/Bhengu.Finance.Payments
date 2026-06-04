@@ -5,6 +5,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Dispute;
 using Bhengu.Finance.Payments.Stripe.Configuration;
+using Bhengu.Finance.Payments.Stripe.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Stripe;
@@ -47,10 +48,14 @@ public sealed class StripeDisputeProvider : IDisputeProvider
     }
 
     /// <inheritdoc />
-    public async Task<Dispute?> GetDisputeAsync(string disputeReference, CancellationToken ct = default)
+    public Task<Dispute?> GetDisputeAsync(string disputeReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(disputeReference);
+        return StripeObservability.ObserveAsync("get_dispute", () => GetDisputeCoreAsync(disputeReference, ct));
+    }
 
+    private async Task<Dispute?> GetDisputeCoreAsync(string disputeReference, CancellationToken ct)
+    {
         try
         {
             var service = new DisputeService(_stripeClient);
@@ -72,7 +77,10 @@ public sealed class StripeDisputeProvider : IDisputeProvider
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<Dispute>> ListDisputesAsync(DateTime? fromUtc = null, DateTime? toUtc = null, CancellationToken ct = default)
+    public Task<IReadOnlyList<Dispute>> ListDisputesAsync(DateTime? fromUtc = null, DateTime? toUtc = null, CancellationToken ct = default)
+        => StripeObservability.ObserveAsync("list_disputes", () => ListDisputesCoreAsync(fromUtc, toUtc, ct));
+
+    private async Task<IReadOnlyList<Dispute>> ListDisputesCoreAsync(DateTime? fromUtc, DateTime? toUtc, CancellationToken ct)
     {
         try
         {
@@ -100,11 +108,15 @@ public sealed class StripeDisputeProvider : IDisputeProvider
     }
 
     /// <inheritdoc />
-    public async Task<Dispute> SubmitEvidenceAsync(string disputeReference, DisputeEvidence evidence, CancellationToken ct = default)
+    public Task<Dispute> SubmitEvidenceAsync(string disputeReference, DisputeEvidence evidence, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(disputeReference);
         ArgumentNullException.ThrowIfNull(evidence);
+        return StripeObservability.ObserveAsync("submit_dispute_evidence", () => SubmitEvidenceCoreAsync(disputeReference, evidence, ct));
+    }
 
+    private async Task<Dispute> SubmitEvidenceCoreAsync(string disputeReference, DisputeEvidence evidence, CancellationToken ct)
+    {
         try
         {
             var service = new DisputeService(_stripeClient);
@@ -152,10 +164,14 @@ public sealed class StripeDisputeProvider : IDisputeProvider
     }
 
     /// <inheritdoc />
-    public async Task<Dispute> AcceptDisputeAsync(string disputeReference, CancellationToken ct = default)
+    public Task<Dispute> AcceptDisputeAsync(string disputeReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(disputeReference);
+        return StripeObservability.ObserveAsync("accept_dispute", () => AcceptDisputeCoreAsync(disputeReference, ct));
+    }
 
+    private async Task<Dispute> AcceptDisputeCoreAsync(string disputeReference, CancellationToken ct)
+    {
         try
         {
             var service = new DisputeService(_stripeClient);

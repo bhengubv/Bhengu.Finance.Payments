@@ -12,6 +12,7 @@ using Xunit;
 
 namespace Bhengu.Finance.Payments.Tests.Stripe;
 
+[Collection(StripeConfigurationCollection.Name)]
 public class StripeTokenisationProviderTests
 {
     private static StripeTokenisationProvider Create(StubHttpMessageHandler handler, StripeOptions? opts = null) =>

@@ -24,10 +24,10 @@ public class FlutterwaveIdempotencyTests
     {
         var cache = new FlutterwaveIdempotencyCache();
         var calls = 0;
-        var r1 = await cache.GetOrAddAsync<int>(null, () => { calls++; return Task.FromResult(42); });
-        var r2 = await cache.GetOrAddAsync<int>(null, () => { calls++; return Task.FromResult(42); });
-        Assert.Equal(42, r1);
-        Assert.Equal(42, r2);
+        var r1 = await cache.GetOrAddAsync<Boxed>(null, () => { calls++; return Task.FromResult(new Boxed(42)); });
+        var r2 = await cache.GetOrAddAsync<Boxed>(null, () => { calls++; return Task.FromResult(new Boxed(42)); });
+        Assert.Equal(42, r1.Value);
+        Assert.Equal(42, r2.Value);
         Assert.Equal(2, calls);
     }
 
@@ -36,10 +36,10 @@ public class FlutterwaveIdempotencyTests
     {
         var cache = new FlutterwaveIdempotencyCache();
         var calls = 0;
-        var r1 = await cache.GetOrAddAsync("k1", () => { calls++; return Task.FromResult(99); });
-        var r2 = await cache.GetOrAddAsync("k1", () => { calls++; return Task.FromResult(0); });
-        Assert.Equal(99, r1);
-        Assert.Equal(99, r2);
+        var r1 = await cache.GetOrAddAsync("k1", () => { calls++; return Task.FromResult(new Boxed(99)); });
+        var r2 = await cache.GetOrAddAsync("k1", () => { calls++; return Task.FromResult(new Boxed(0)); });
+        Assert.Equal(99, r1.Value);
+        Assert.Equal(99, r2.Value);
         Assert.Equal(1, calls);
     }
 
@@ -48,8 +48,8 @@ public class FlutterwaveIdempotencyTests
     {
         var cache = new FlutterwaveIdempotencyCache();
         var calls = 0;
-        await cache.GetOrAddAsync("k1", () => { calls++; return Task.FromResult(1); });
-        await cache.GetOrAddAsync("k2", () => { calls++; return Task.FromResult(2); });
+        await cache.GetOrAddAsync("k1", () => { calls++; return Task.FromResult(new Boxed(1)); });
+        await cache.GetOrAddAsync("k2", () => { calls++; return Task.FromResult(new Boxed(2)); });
         Assert.Equal(2, calls);
     }
 
@@ -60,15 +60,17 @@ public class FlutterwaveIdempotencyTests
         var calls = 0;
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            cache.GetOrAddAsync<int>("k", () => { calls++; throw new InvalidOperationException("boom"); }));
+            cache.GetOrAddAsync<Boxed>("k", () => { calls++; throw new InvalidOperationException("boom"); }));
 
         // Give the eviction continuation a tick to run.
         await Task.Delay(50);
 
-        var second = await cache.GetOrAddAsync<int>("k", () => { calls++; return Task.FromResult(7); });
-        Assert.Equal(7, second);
+        var second = await cache.GetOrAddAsync<Boxed>("k", () => { calls++; return Task.FromResult(new Boxed(7)); });
+        Assert.Equal(7, second.Value);
         Assert.Equal(2, calls);
     }
+
+    private sealed record Boxed(int Value);
 
     [Fact]
     public async Task ProcessPaymentAsync_WithIdempotencyKey_DeduplicatesIdenticalRetries()

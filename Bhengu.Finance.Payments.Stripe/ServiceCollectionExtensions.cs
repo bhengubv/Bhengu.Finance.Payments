@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Stripe.Providers;
@@ -29,6 +30,9 @@ public static class ServiceCollectionExtensions
     public static IServiceCollection AddBhenguStripePayments(this IServiceCollection services)
     {
         ArgumentNullException.ThrowIfNull(services);
+
+        // Distributed cache backing the in-process split cache used by StripeMarketplaceProvider.
+        services.AddBhenguInMemoryCache();
 
         // Each typed HttpClient gives us per-provider connection pooling and lets consumers
         // wire Polly / Logging handlers per-provider without crosstalk.

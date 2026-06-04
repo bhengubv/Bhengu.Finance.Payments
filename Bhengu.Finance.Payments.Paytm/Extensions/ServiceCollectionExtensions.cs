@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Validation;
@@ -11,11 +12,15 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace Bhengu.Finance.Payments.Paytm.Extensions;
 
+/// <summary>
+/// DI registration helpers for the Paytm provider family.
+/// </summary>
 public static class ServiceCollectionExtensions
 {
     /// <summary>
-    /// Register the Paytm provider. Reads configuration from <c>Bhengu:Finance:Payments:Paytm</c>.
-    /// Fails fast at startup if required options (MerchantId, MerchantKey) are missing.
+    /// Register the Paytm payment + payout + tokenisation + subscription + QR + settlement
+    /// providers. Reads configuration from <c>Bhengu:Finance:Payments:Paytm</c>. Fails fast at
+    /// startup if required options (MerchantId, MerchantKey) are missing.
     /// </summary>
     public static IServiceCollection AddPaytmPayments(this IServiceCollection services, IConfiguration configuration)
     {
@@ -31,6 +36,8 @@ public static class ServiceCollectionExtensions
         if (string.IsNullOrWhiteSpace(probe.MerchantKey))
             throw new ProviderConfigurationException("paytm", $"{PaytmOptions.ConfigSection}:MerchantKey is required");
 
+        services.AddBhenguInMemoryCache();
+
         services.AddHttpClient<PaytmPaymentProvider>();
         services.AddTransient<IPaymentGatewayProvider, PaytmPaymentProvider>(sp =>
             sp.GetRequiredService<PaytmPaymentProvider>());
@@ -38,6 +45,24 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<PaytmPaymentProvider>());
 
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Paytm, (sp, _) => sp.GetRequiredService<PaytmPaymentProvider>());
+        services.AddKeyedTransient<IPayoutProvider>(ProviderNames.Paytm, (sp, _) => sp.GetRequiredService<PaytmPaymentProvider>());
+
+        // Optional contracts.
+        services.AddHttpClient<PaytmTokenisationProvider>();
+        services.AddHttpClient<PaytmSubscriptionProvider>();
+        services.AddHttpClient<PaytmQrCodeProvider>();
+        services.AddHttpClient<PaytmSettlementProvider>();
+
+        services.AddTransient<ITokenisationProvider>(sp => sp.GetRequiredService<PaytmTokenisationProvider>());
+        services.AddTransient<ISubscriptionProvider>(sp => sp.GetRequiredService<PaytmSubscriptionProvider>());
+        services.AddTransient<IQrCodeProvider>(sp => sp.GetRequiredService<PaytmQrCodeProvider>());
+        services.AddTransient<ISettlementProvider>(sp => sp.GetRequiredService<PaytmSettlementProvider>());
+
+        services.AddKeyedTransient<ITokenisationProvider>(ProviderNames.Paytm, (sp, _) => sp.GetRequiredService<PaytmTokenisationProvider>());
+        services.AddKeyedTransient<ISubscriptionProvider>(ProviderNames.Paytm, (sp, _) => sp.GetRequiredService<PaytmSubscriptionProvider>());
+        services.AddKeyedTransient<IQrCodeProvider>(ProviderNames.Paytm, (sp, _) => sp.GetRequiredService<PaytmQrCodeProvider>());
+        services.AddKeyedTransient<ISettlementProvider>(ProviderNames.Paytm, (sp, _) => sp.GetRequiredService<PaytmSettlementProvider>());
+
         services.AddBhenguPaymentStartupValidation();
 
         return services;

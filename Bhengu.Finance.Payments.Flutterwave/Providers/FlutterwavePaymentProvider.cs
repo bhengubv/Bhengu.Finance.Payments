@@ -51,7 +51,8 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
         ProviderCapabilities.Subscriptions |
         ProviderCapabilities.Settlement |
         ProviderCapabilities.Marketplace |
-        ProviderCapabilities.Idempotency;
+        ProviderCapabilities.Idempotency |
+        ProviderCapabilities.Disputes;
 
     /// <summary>
     /// Construct a Flutterwave provider bound to the supplied <paramref name="httpClient"/>.
@@ -81,8 +82,8 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        return _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, () => ProcessPaymentCoreAsync(request, ct));
+        return FlutterwaveObservability.ObserveChargeAsync(request.Currency, () =>
+            _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, () => ProcessPaymentCoreAsync(request, ct)));
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
@@ -140,8 +141,8 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        return _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, () => ProcessPayoutCoreAsync(request, ct));
+        return FlutterwaveObservability.ObservePayoutAsync(request.Currency, () =>
+            _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, () => ProcessPayoutCoreAsync(request, ct)));
     }
 
     private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
@@ -187,8 +188,8 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        return _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, () => ProcessRefundCoreAsync(request, ct));
+        return FlutterwaveObservability.ObserveRefundAsync(request.GatewayReference, () =>
+            _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, () => ProcessRefundCoreAsync(request, ct)));
     }
 
     private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
@@ -216,6 +217,7 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
         };
     }
 
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -224,22 +226,26 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
             _logger.LogWarning("Flutterwave WebhookSecret not configured — signature verification cannot succeed.");
+            FlutterwaveObservability.RecordWebhookVerification(false);
             return false;
         }
 
+        bool verified;
         try
         {
             // Flutterwave does NOT HMAC the body; it sends the configured secret verbatim in the
             // verif-hash header. Constant-time compare to defeat timing-based equality leaks.
-            return CryptographicOperations.FixedTimeEquals(
+            verified = CryptographicOperations.FixedTimeEquals(
                 Encoding.UTF8.GetBytes(signature),
                 Encoding.UTF8.GetBytes(_options.WebhookSecret));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Flutterwave webhook signature verification raised");
-            return false;
+            verified = false;
         }
+        FlutterwaveObservability.RecordWebhookVerification(verified);
+        return verified;
     }
 
     /// <inheritdoc/>
@@ -259,7 +265,11 @@ public sealed class FlutterwavePaymentProvider : IPaymentGatewayProvider, IPayou
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+        return FlutterwaveObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+    }
 
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
+    {
         try
         {
             var webhookEvent = JsonSerializer.Deserialize<FlutterwaveWebhookEvent>(payload);

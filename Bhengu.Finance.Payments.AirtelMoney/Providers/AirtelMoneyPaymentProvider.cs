@@ -8,6 +8,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.AirtelMoney.Configuration;
+using Bhengu.Finance.Payments.AirtelMoney.Internals;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
@@ -68,10 +69,15 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
             _httpClient.BaseAddress = new Uri(_baseUrl);
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return AirtelMoneyObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+    }
 
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+    {
         var msisdn = request.PaymentMethodToken;
         if (string.IsNullOrWhiteSpace(msisdn))
             throw new PaymentDeclinedException(ProviderName, "missing_msisdn",
@@ -119,10 +125,15 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
         };
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return AirtelMoneyObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+    }
 
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
         var body = new { transaction = new { airtel_money_id = request.GatewayReference } };
 
         var (responseBody, _) = await SendAsync(
@@ -145,10 +156,15 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
         };
     }
 
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return AirtelMoneyObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+    }
 
+    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+    {
         if (string.IsNullOrWhiteSpace(request.DestinationToken))
             throw new PaymentDeclinedException(ProviderName, "invalid_msisdn",
                 "Airtel Money Disbursement requires the recipient MSISDN in PayoutRequest.DestinationToken.");
@@ -189,6 +205,7 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
         };
     }
 
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -197,30 +214,39 @@ public sealed class AirtelMoneyPaymentProvider : IPaymentGatewayProvider, IPayou
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
             _logger.LogWarning("Airtel Money WebhookSecret not configured — signature verification cannot succeed.");
+            AirtelMoneyObservability.RecordWebhookVerification(false);
             return false;
         }
 
+        bool verified;
         try
         {
             using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
             var hash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
             var expected = Convert.ToBase64String(hash);
 
-            return CryptographicOperations.FixedTimeEquals(
+            verified = CryptographicOperations.FixedTimeEquals(
                 Encoding.UTF8.GetBytes(signature),
                 Encoding.UTF8.GetBytes(expected));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Airtel Money webhook signature verification raised");
-            return false;
+            verified = false;
         }
+        AirtelMoneyObservability.RecordWebhookVerification(verified);
+        return verified;
     }
 
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+        return AirtelMoneyObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+    }
 
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
+    {
         try
         {
             var evt = JsonSerializer.Deserialize<AirtelWebhookPayload>(payload);

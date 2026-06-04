@@ -1,8 +1,10 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Net;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.EcoCash.Configuration;
 using Bhengu.Finance.Payments.EcoCash.Providers;
 using Bhengu.Finance.Payments.Tests.TestHelpers;
@@ -14,7 +16,7 @@ namespace Bhengu.Finance.Payments.Tests.EcoCash;
 
 public class EcoCashPaymentProviderTests
 {
-    private static EcoCashPaymentProvider Create(StubHttpMessageHandler handler, EcoCashOptions? opts = null)
+    private static EcoCashPaymentProvider Create(StubHttpMessageHandler handler, EcoCashOptions? opts = null, IBhenguDistributedCache? cache = null)
     {
         opts ??= new EcoCashOptions
         {
@@ -28,7 +30,7 @@ public class EcoCashPaymentProviderTests
             UseSandbox = true
         };
         var http = new HttpClient(handler);
-        return new EcoCashPaymentProvider(http, Options.Create(opts), NullLogger<EcoCashPaymentProvider>.Instance);
+        return new EcoCashPaymentProvider(http, Options.Create(opts), NullLogger<EcoCashPaymentProvider>.Instance, cache);
     }
 
     private static PaymentRequest SamplePayment() => new()
@@ -181,5 +183,77 @@ public class EcoCashPaymentProviderTests
     {
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
         Assert.Null(await provider.ParseWebhookAsync("not json"));
+    }
+
+    [Fact]
+    public async Task ParseWebhookAsync_ReturnsTypedChargeSucceededEvent()
+    {
+        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+        var evt = await provider.ParseWebhookAsync("""
+            {"clientCorrelator":"cc-1","ecocashReference":"EC-1","transactionOperationStatus":"Completed","tranType":"MER","amount":{"charging":{"amount":10,"currency":"USD"}},"endUserId":"263772111222"}
+            """);
+        var typed = Assert.IsType<ChargeSucceededEvent>(evt);
+        Assert.Equal(WebhookEventCategory.ChargeSucceeded, typed.Category);
+        Assert.Equal(10m, typed.Amount);
+    }
+
+    [Fact]
+    public async Task ParseWebhookAsync_ReturnsTypedPayoutCompletedEvent_ForDisbursement()
+    {
+        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+        var evt = await provider.ParseWebhookAsync("""
+            {"clientCorrelator":"cc-2","ecocashReference":"EC-D-1","transactionOperationStatus":"Completed","tranType":"DIS","amount":{"charging":{"amount":50,"currency":"USD"}},"endUserId":"263772111222"}
+            """);
+        var typed = Assert.IsType<PayoutCompletedEvent>(evt);
+        Assert.Equal(WebhookEventCategory.PayoutCompleted, typed.Category);
+    }
+
+    [Fact]
+    public async Task ProcessPayoutAsync_ReturnsResponse_OnSuccess()
+    {
+        var handler = new StubHttpMessageHandler((req, _) =>
+        {
+            Assert.Contains("merchanttosubscriber", req.RequestUri!.PathAndQuery);
+            return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
+                {"clientCorrelator":"cc-1","ecocashReference":"EC-D-1","transactionOperationStatus":"Completed"}
+                """);
+        });
+        var provider = Create(handler);
+        var payout = await provider.ProcessPayoutAsync(new PayoutRequest
+        {
+            DestinationToken = "263772111222",
+            Amount = 10m,
+            Currency = "USD",
+            Description = "Vendor payout"
+        });
+        Assert.Equal("EC-D-1", payout.GatewayReference);
+        Assert.Equal(PaymentStatus.Completed, payout.Status);
+    }
+
+    [Fact]
+    public async Task ProcessPaymentAsync_DedupesViaIdempotencyKey()
+    {
+        var calls = 0;
+        var handler = new StubHttpMessageHandler((_, _) =>
+        {
+            calls++;
+            return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
+                {"clientCorrelator":"cc","ecocashReference":"EC-1","transactionOperationStatus":"Completed"}
+                """);
+        });
+        var cache = new InMemoryBhenguDistributedCache();
+        var provider = Create(handler, cache: cache);
+        var req = new PaymentRequest
+        {
+            PaymentMethodToken = "263772111222",
+            Amount = 1m,
+            Currency = "USD",
+            Description = "x",
+            IdempotencyKey = "idem-1"
+        };
+        var first = await provider.ProcessPaymentAsync(req);
+        var second = await provider.ProcessPaymentAsync(req);
+        Assert.Equal(first.GatewayReference, second.GatewayReference);
+        Assert.Equal(1, calls);
     }
 }

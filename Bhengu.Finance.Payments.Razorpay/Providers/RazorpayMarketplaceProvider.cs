@@ -2,11 +2,13 @@
 
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Marketplace;
 using Bhengu.Finance.Payments.Razorpay.Configuration;
+using Bhengu.Finance.Payments.Razorpay.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -27,33 +29,47 @@ namespace Bhengu.Finance.Payments.Razorpay.Providers;
 /// </remarks>
 public sealed class RazorpayMarketplaceProvider : IMarketplaceProvider
 {
+    private const string SplitKeyPrefix = "razorpay:split:";
+    private static readonly TimeSpan SplitTtl = TimeSpan.FromDays(365);
+
     private readonly RazorpayHttpClient _http;
     private readonly ILogger<RazorpayMarketplaceProvider> _logger;
-
-    // Razorpay has no "named split definition" object. We cache rules so the SDK contract still works.
-    // Lifetime is tied to the singleton/transient lifetime of this provider; callers persist their own.
-    private readonly Dictionary<string, SplitDefinition> _splitCache = new(StringComparer.Ordinal);
-    private readonly object _splitCacheLock = new();
+    private readonly IBhenguDistributedCache _cache;
 
     /// <inheritdoc />
     public string ProviderName => ProviderNames.Razorpay;
 
-    /// <summary>Create a new marketplace provider bound to the supplied HTTP client and options.</summary>
+    /// <summary>Create a new marketplace provider bound to the supplied HTTP client, options, and distributed cache for split definitions.</summary>
+    public RazorpayMarketplaceProvider(
+        HttpClient httpClient,
+        IOptions<RazorpayOptions> options,
+        ILogger<RazorpayMarketplaceProvider> logger,
+        IBhenguDistributedCache cache)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _cache = cache ?? throw new ArgumentNullException(nameof(cache));
+        _http = new RazorpayHttpClient(httpClient, options.Value, ProviderName, logger);
+    }
+
+    /// <summary>Back-compat constructor that uses the process-local in-memory cache.</summary>
     public RazorpayMarketplaceProvider(
         HttpClient httpClient,
         IOptions<RazorpayOptions> options,
         ILogger<RazorpayMarketplaceProvider> logger)
+        : this(httpClient, options, logger, new InMemoryBhenguDistributedCache())
     {
-        ArgumentNullException.ThrowIfNull(options);
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        _http = new RazorpayHttpClient(httpClient, options.Value, ProviderName, logger);
     }
 
     /// <inheritdoc />
-    public async Task<SubAccount> CreateSubAccountAsync(SubAccountRequest request, CancellationToken ct = default)
+    public Task<SubAccount> CreateSubAccountAsync(SubAccountRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return RazorpayObservability.ObserveAsync("create_sub_account", () => CreateSubAccountCoreAsync(request, ct));
+    }
 
+    private async Task<SubAccount> CreateSubAccountCoreAsync(SubAccountRequest request, CancellationToken ct)
+    {
         var body = new
         {
             email = request.ContactEmail,
@@ -97,10 +113,14 @@ public sealed class RazorpayMarketplaceProvider : IMarketplaceProvider
     }
 
     /// <inheritdoc />
-    public async Task<SubAccount?> GetSubAccountAsync(string subAccountReference, CancellationToken ct = default)
+    public Task<SubAccount?> GetSubAccountAsync(string subAccountReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(subAccountReference);
+        return RazorpayObservability.ObserveAsync("get_sub_account", () => GetSubAccountCoreAsync(subAccountReference, ct));
+    }
 
+    private async Task<SubAccount?> GetSubAccountCoreAsync(string subAccountReference, CancellationToken ct)
+    {
         try
         {
             var raw = await _http.GetAsync($"v2/accounts/{Uri.EscapeDataString(subAccountReference)}", ct, "GetAccount").ConfigureAwait(false);
@@ -125,17 +145,24 @@ public sealed class RazorpayMarketplaceProvider : IMarketplaceProvider
     /// <inheritdoc />
     public Task<IReadOnlyList<SubAccount>> ListSubAccountsAsync(CancellationToken ct = default)
     {
-        // Razorpay's v2 Accounts API doesn't expose a public list endpoint — accounts are looked up
-        // by id. Consumers that need a roster should mirror it in their own DB on creation.
-        _logger.LogDebug("Razorpay does not expose a public account-list endpoint; returning empty");
-        return Task.FromResult<IReadOnlyList<SubAccount>>(Array.Empty<SubAccount>());
+        return RazorpayObservability.ObserveAsync("list_sub_accounts", () =>
+        {
+            // Razorpay's v2 Accounts API doesn't expose a public list endpoint — accounts are looked up
+            // by id. Consumers that need a roster should mirror it in their own DB on creation.
+            _logger.LogDebug("Razorpay does not expose a public account-list endpoint; returning empty");
+            return Task.FromResult<IReadOnlyList<SubAccount>>(Array.Empty<SubAccount>());
+        });
     }
 
     /// <inheritdoc />
     public Task<SplitDefinition> CreateSplitAsync(SplitDefinitionRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return RazorpayObservability.ObserveAsync("create_split", () => CreateSplitCoreAsync(request, ct));
+    }
 
+    private async Task<SplitDefinition> CreateSplitCoreAsync(SplitDefinitionRequest request, CancellationToken ct)
+    {
         // Razorpay has no persisted split entity — we cache the rules and synthesise an opaque id.
         var reference = $"split_local_{Guid.NewGuid():N}";
         var split = new SplitDefinition
@@ -146,25 +173,29 @@ public sealed class RazorpayMarketplaceProvider : IMarketplaceProvider
             Rules = request.Rules
         };
 
-        lock (_splitCacheLock)
-            _splitCache[reference] = split;
+        await _cache.SetAsync(SplitKeyPrefix + reference, split, SplitTtl, ct).ConfigureAwait(false);
 
-        _logger.LogInformation("Razorpay split cached locally as {SplitId} ({RuleCount} beneficiaries)", reference, request.Rules.Count);
-        return Task.FromResult(split);
+        _logger.LogInformation("Razorpay split cached as {SplitId} ({RuleCount} beneficiaries)", reference, request.Rules.Count);
+        return split;
     }
 
     /// <inheritdoc />
     public Task<SplitDefinition?> GetSplitAsync(string splitReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(splitReference);
-        lock (_splitCacheLock)
-            return Task.FromResult(_splitCache.TryGetValue(splitReference, out var s) ? s : null);
+        return RazorpayObservability.ObserveAsync("get_split", () =>
+            _cache.GetAsync<SplitDefinition>(SplitKeyPrefix + splitReference, ct));
     }
 
     /// <inheritdoc />
-    public async Task<PaymentResponse> ChargeWithSplitAsync(ChargeWithSplitRequest request, CancellationToken ct = default)
+    public Task<PaymentResponse> ChargeWithSplitAsync(ChargeWithSplitRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return RazorpayObservability.ObserveChargeAsync(request.Payment.Currency, () => ChargeWithSplitCoreAsync(request, ct));
+    }
+
+    private async Task<PaymentResponse> ChargeWithSplitCoreAsync(ChargeWithSplitRequest request, CancellationToken ct)
+    {
         if (request.SplitReference is null && (request.InlineRules is null || request.InlineRules.Count == 0))
             throw new BhenguPaymentException(ProviderName, "Either SplitReference or InlineRules must be supplied");
 
@@ -172,8 +203,8 @@ public sealed class RazorpayMarketplaceProvider : IMarketplaceProvider
         IReadOnlyList<SplitRule>? rules = request.InlineRules;
         if (rules is null && request.SplitReference is not null)
         {
-            lock (_splitCacheLock)
-                rules = _splitCache.TryGetValue(request.SplitReference, out var def) ? def.Rules : null;
+            var cached = await _cache.GetAsync<SplitDefinition>(SplitKeyPrefix + request.SplitReference, ct).ConfigureAwait(false);
+            rules = cached?.Rules;
         }
         if (rules is null || rules.Count == 0)
             throw new BhenguPaymentException(ProviderName, $"Split {request.SplitReference} not found and no inline rules supplied");

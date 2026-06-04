@@ -7,6 +7,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Alipay.Configuration;
+using Bhengu.Finance.Payments.Alipay.Internals;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
@@ -65,10 +66,15 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
             _httpClient.BaseAddress = new Uri(_baseUrl, UriKind.Absolute);
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return AlipayObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+    }
 
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+    {
         var currency = string.IsNullOrWhiteSpace(request.Currency) ? _options.Currency : request.Currency.ToUpperInvariant();
         // Alipay+ uses minor units (cents) as a string.
         var minorUnits = ((long)Math.Round(request.Amount * 100m, MidpointRounding.AwayFromZero)).ToString(CultureInfo.InvariantCulture);
@@ -114,10 +120,15 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         };
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return AlipayObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+    }
 
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
         var currency = _options.Currency.ToUpperInvariant();
         var minorUnits = ((long)Math.Round(request.Amount * 100m, MidpointRounding.AwayFromZero)).ToString(CultureInfo.InvariantCulture);
         var refundRequestId = $"RF_{DateTime.UtcNow:yyyyMMddHHmmss}_{Guid.NewGuid():N}"[..32];
@@ -147,10 +158,15 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         };
     }
 
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return AlipayObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+    }
 
+    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+    {
         var currency = string.IsNullOrWhiteSpace(request.Currency) ? _options.Currency : request.Currency.ToUpperInvariant();
         var minorUnits = ((long)Math.Round(request.Amount * 100m, MidpointRounding.AwayFromZero)).ToString(CultureInfo.InvariantCulture);
         var payoutRequestId = $"PO_{DateTime.UtcNow:yyyyMMddHHmmss}_{Guid.NewGuid():N}"[..32];
@@ -183,6 +199,7 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         };
     }
 
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -191,15 +208,16 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         if (string.IsNullOrWhiteSpace(_options.AlipayPublicKey))
         {
             _logger.LogWarning("Alipay AlipayPublicKey not configured — webhook signature verification cannot succeed.");
+            AlipayObservability.RecordWebhookVerification(false);
             return false;
         }
 
+        bool verified;
         try
         {
-            // Webhook signatures from Alipay+ are RSA-SHA256 over the raw JSON payload, base64-encoded.
             var sigBytes = Convert.FromBase64String(signature);
             using var rsa = LoadPublicKey(_options.AlipayPublicKey);
-            return rsa.VerifyData(
+            verified = rsa.VerifyData(
                 Encoding.UTF8.GetBytes(payload),
                 sigBytes,
                 HashAlgorithmName.SHA256,
@@ -208,14 +226,21 @@ public sealed class AlipayPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         catch (Exception ex)
         {
             _logger.LogError(ex, "Alipay webhook signature verification raised");
-            return false;
+            verified = false;
         }
+        AlipayObservability.RecordWebhookVerification(verified);
+        return verified;
     }
 
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+        return AlipayObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+    }
 
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
+    {
         try
         {
             var webhook = JsonSerializer.Deserialize<AlipayWebhookEvent>(payload);

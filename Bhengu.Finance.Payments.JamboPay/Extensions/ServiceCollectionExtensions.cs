@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Validation;
@@ -11,6 +12,7 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace Bhengu.Finance.Payments.JamboPay.Extensions;
 
+/// <summary>DI registration helpers for the JamboPay provider.</summary>
 public static class ServiceCollectionExtensions
 {
     /// <summary>
@@ -35,14 +37,17 @@ public static class ServiceCollectionExtensions
         if (string.IsNullOrWhiteSpace(probe.MerchantCode))
             throw new ProviderConfigurationException("jambopay", $"{JamboPayOptions.ConfigSection}:MerchantCode is required");
 
+        services.AddBhenguInMemoryCache();
+
         services.AddHttpClient<JamboPayPaymentProvider>();
         services.AddTransient<IPaymentGatewayProvider, JamboPayPaymentProvider>(sp =>
             sp.GetRequiredService<JamboPayPaymentProvider>());
         services.AddTransient<IPayoutProvider, JamboPayPaymentProvider>(sp =>
             sp.GetRequiredService<JamboPayPaymentProvider>());
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.JamboPay, (sp, _) => sp.GetRequiredService<JamboPayPaymentProvider>());
-        services.AddBhenguPaymentStartupValidation();
+        services.AddKeyedTransient<IPayoutProvider>(ProviderNames.JamboPay, (sp, _) => sp.GetRequiredService<JamboPayPaymentProvider>());
 
+        services.AddBhenguPaymentStartupValidation();
         return services;
     }
 }

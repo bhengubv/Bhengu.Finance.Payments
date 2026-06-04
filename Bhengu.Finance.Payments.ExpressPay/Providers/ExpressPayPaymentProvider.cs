@@ -1,15 +1,20 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using System.Globalization;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.ExpressPay.Configuration;
+using Bhengu.Finance.Payments.ExpressPay.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -17,35 +22,44 @@ namespace Bhengu.Finance.Payments.ExpressPay.Providers;
 
 /// <summary>
 /// ExpressPay (Ghana, Gambia, Sierra Leone, Liberia, Nigeria) payment gateway provider.
-/// Wraps the form-encoded submit.php / query.php API. ExpressPay does NOT issue HMAC on
+/// Wraps the form-encoded submit.php / query.php / payout.php API. ExpressPay does NOT issue HMAC on
 /// the post-url callback; <see cref="VerifyWebhookSignature"/> performs a constant-time
 /// equality check between the supplied signature and the configured ApiKey, requiring
-/// the caller to forward the api-key in a trusted reverse-proxy header. Refund and payout
-/// are not exposed by the standard API.
+/// the caller to forward the api-key in a trusted reverse-proxy header.
 /// </summary>
-public sealed class ExpressPayPaymentProvider : IPaymentGatewayProvider
+public sealed class ExpressPayPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly ExpressPayOptions _options;
     private readonly ILogger<ExpressPayPaymentProvider> _logger;
+    private readonly IBhenguDistributedCache? _idempotencyCache;
 
+    /// <inheritdoc/>
     public string ProviderName => ProviderNames.ExpressPay;
 
+    /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
+        ProviderCapabilities.Payout |
         ProviderCapabilities.Webhook |
         ProviderCapabilities.RedirectFlow |
         ProviderCapabilities.Cards |
-        ProviderCapabilities.MobileMoney;
+        ProviderCapabilities.MobileMoney |
+        ProviderCapabilities.Settlement |
+        ProviderCapabilities.Idempotency |
+        ProviderCapabilities.TypedWebhooks;
 
+    /// <summary>Construct the ExpressPay payment provider. <paramref name="idempotencyCache"/> is optional — when omitted, idempotency replay is a no-op.</summary>
     public ExpressPayPaymentProvider(
         HttpClient httpClient,
         IOptions<ExpressPayOptions> options,
-        ILogger<ExpressPayPaymentProvider> logger)
+        ILogger<ExpressPayPaymentProvider> logger,
+        IBhenguDistributedCache? idempotencyCache = null)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _idempotencyCache = idempotencyCache;
 
         if (string.IsNullOrWhiteSpace(_options.MerchantId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(ExpressPayOptions.MerchantId)} is required");
@@ -62,45 +76,85 @@ public sealed class ExpressPayPaymentProvider : IPaymentGatewayProvider
         }
     }
 
+    /// <inheritdoc/>
     public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        var form = new Dictionary<string, string>
+        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
+        var started = DateTime.UtcNow;
+        var cached = await TryGetCachedAsync<PaymentResponse>(request.IdempotencyKey, "charge", ct).ConfigureAwait(false);
+        if (cached is not null)
         {
-            ["merchant-id"] = _options.MerchantId,
-            ["api-key"] = _options.ApiKey,
-            ["currency"] = request.Currency.ToUpperInvariant(),
-            ["amount"] = request.Amount.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture),
-            ["order-id"] = request.PaymentMethodToken,
-            ["order-desc"] = request.Description,
-            ["redirect-url"] = _options.RedirectUrl,
-            ["post-url"] = _options.PostUrl,
-            ["accountnumber"] = request.Metadata?.GetValueOrDefault("accountnumber") ?? "",
-            ["username"] = request.Metadata?.GetValueOrDefault("username") ?? "",
-            ["email"] = request.Metadata?.GetValueOrDefault("email") ?? "",
-            ["firstname"] = request.Metadata?.GetValueOrDefault("firstname") ?? "",
-            ["lastname"] = request.Metadata?.GetValueOrDefault("lastname") ?? ""
-        };
+            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+            return cached;
+        }
 
-        var responseBody = await SendFormAsync(HttpMethod.Post, "submit.php", form, ct, "ProcessPayment").ConfigureAwait(false);
-        var submit = JsonSerializer.Deserialize<ExpressPaySubmitResponse>(responseBody);
-
-        _logger.LogInformation("ExpressPay submit: status={Status} token={Token} url={Url}",
-            submit?.Status, submit?.Token, submit?.PaymentUrl);
-
-        return new PaymentResponse
+        try
         {
-            GatewayReference = submit?.Token ?? request.PaymentMethodToken,
-            Status = submit?.Status == 1 ? PaymentStatus.Pending : PaymentStatus.Failed,
-            Amount = request.Amount,
-            Currency = request.Currency,
-            ProcessedAt = DateTime.UtcNow,
-            RedirectUrl = submit?.PaymentUrl,
-            Message = submit?.Message
-        };
+            var form = new Dictionary<string, string>
+            {
+                ["merchant-id"] = _options.MerchantId,
+                ["api-key"] = _options.ApiKey,
+                ["currency"] = request.Currency.ToUpperInvariant(),
+                ["amount"] = request.Amount.ToString("0.00", CultureInfo.InvariantCulture),
+                ["order-id"] = request.PaymentMethodToken,
+                ["order-desc"] = request.Description,
+                ["redirect-url"] = _options.RedirectUrl,
+                ["post-url"] = _options.PostUrl,
+                ["accountnumber"] = request.Metadata?.GetValueOrDefault("accountnumber") ?? "",
+                ["username"] = request.Metadata?.GetValueOrDefault("username") ?? "",
+                ["email"] = request.Metadata?.GetValueOrDefault("email") ?? "",
+                ["firstname"] = request.Metadata?.GetValueOrDefault("firstname") ?? "",
+                ["lastname"] = request.Metadata?.GetValueOrDefault("lastname") ?? ""
+            };
+
+            var responseBody = await ExpressPayHttpClient.SendFormAsync(_httpClient, _logger, HttpMethod.Post, "submit.php", form, ct, "ProcessPayment").ConfigureAwait(false);
+            var submit = JsonSerializer.Deserialize<ExpressPaySubmitResponse>(responseBody);
+
+            _logger.LogInformation("ExpressPay submit: status={Status} token={Token} url={Url}",
+                submit?.Status, submit?.Token, submit?.PaymentUrl);
+
+            var response = new PaymentResponse
+            {
+                GatewayReference = submit?.Token ?? request.PaymentMethodToken,
+                Status = submit?.Status == 1 ? PaymentStatus.Pending : PaymentStatus.Failed,
+                Amount = request.Amount,
+                Currency = request.Currency,
+                ProcessedAt = DateTime.UtcNow,
+                RedirectUrl = submit?.PaymentUrl,
+                Message = submit?.Message
+            };
+
+            await TrySetCachedAsync(request.IdempotencyKey, "charge", response, ct).ConfigureAwait(false);
+            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("outcome", response.Status == PaymentStatus.Pending
+                    ? BhenguPaymentDiagnostics.Outcomes.Pending
+                    : BhenguPaymentDiagnostics.Outcomes.Declined));
+            activity.SetOutcome(response.Status == PaymentStatus.Pending
+                ? BhenguPaymentDiagnostics.Outcomes.Pending
+                : BhenguPaymentDiagnostics.Outcomes.Declined);
+            return response;
+        }
+        catch (Exception ex)
+        {
+            var outcome = ClassifyOutcome(ex);
+            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("outcome", outcome));
+            activity.SetOutcome(outcome);
+            throw;
+        }
+        finally
+        {
+            BhenguPaymentDiagnostics.ChargeDurationMs.Record(
+                (DateTime.UtcNow - started).TotalMilliseconds,
+                new KeyValuePair<string, object?>("provider", ProviderName));
+        }
     }
 
+    /// <inheritdoc/>
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -108,6 +162,89 @@ public sealed class ExpressPayPaymentProvider : IPaymentGatewayProvider
             ProviderName,
             "ExpressPay does not expose a refund API — issue refunds via the ExpressPay merchant portal.",
             providerErrorCode: "not_supported");
+    }
+
+    /// <summary>
+    /// Pay funds out to an ExpressPay-supported beneficiary (mobile money or bank). The
+    /// <see cref="PayoutRequest.DestinationToken"/> must take the form <c>"<account_type>:<account_number>"</c>
+    /// where <c>account_type</c> is one of <c>mtn|airteltigo|vodafone|bank</c> and <c>account_number</c> is the
+    /// destination msisdn or NUBAN.
+    /// </summary>
+    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, request.Currency);
+        var cached = await TryGetCachedAsync<PayoutResponse>(request.IdempotencyKey, "payout", ct).ConfigureAwait(false);
+        if (cached is not null)
+        {
+            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+            return cached;
+        }
+
+        try
+        {
+            var colon = request.DestinationToken.IndexOf(':');
+            if (colon <= 0)
+                throw new BhenguPaymentException(ProviderName,
+                    "ExpressPay PayoutRequest.DestinationToken must be '<account_type>:<account_number>' (account_type one of mtn|airteltigo|vodafone|bank)");
+            var accountType = request.DestinationToken[..colon];
+            var accountNumber = request.DestinationToken[(colon + 1)..];
+            var batchRef = request.IdempotencyKey ?? $"po-{Guid.NewGuid():N}";
+
+            var form = new Dictionary<string, string>
+            {
+                ["merchant-id"] = _options.MerchantId,
+                ["api-key"] = _options.ApiKey,
+                ["account-type"] = accountType,
+                ["account-number"] = accountNumber,
+                ["amount"] = request.Amount.ToString("0.00", CultureInfo.InvariantCulture),
+                ["currency"] = request.Currency.ToUpperInvariant(),
+                ["description"] = request.Description,
+                ["batch-reference"] = batchRef
+            };
+
+            var responseBody = await ExpressPayHttpClient.SendFormAsync(_httpClient, _logger, HttpMethod.Post, "payout.php", form, ct, "ProcessPayout").ConfigureAwait(false);
+            var payout = JsonSerializer.Deserialize<ExpressPayPayoutResponse>(responseBody);
+
+            _logger.LogInformation("ExpressPay payout: status={Status} txn={Txn} ref={Ref}",
+                payout?.Status, payout?.TransactionId, batchRef);
+
+            var status = payout?.Status switch
+            {
+                1 => PaymentStatus.Pending,
+                2 => PaymentStatus.Completed,
+                3 => PaymentStatus.Failed,
+                _ => PaymentStatus.Pending
+            };
+
+            var response = new PayoutResponse
+            {
+                GatewayReference = payout?.TransactionId ?? batchRef,
+                Status = status,
+                Amount = request.Amount,
+                Currency = request.Currency,
+                ProcessedAt = DateTime.UtcNow
+            };
+
+            await TrySetCachedAsync(request.IdempotencyKey, "payout", response, ct).ConfigureAwait(false);
+            BhenguPaymentDiagnostics.PayoutsTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("outcome", status == PaymentStatus.Failed
+                    ? BhenguPaymentDiagnostics.Outcomes.Declined
+                    : BhenguPaymentDiagnostics.Outcomes.Success));
+            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
+            return response;
+        }
+        catch (Exception ex)
+        {
+            var outcome = ClassifyOutcome(ex);
+            BhenguPaymentDiagnostics.PayoutsTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("outcome", outcome));
+            activity.SetOutcome(outcome);
+            throw;
+        }
     }
 
     /// <summary>
@@ -122,9 +259,10 @@ public sealed class ExpressPayPaymentProvider : IPaymentGatewayProvider
             ["api-key"] = _options.ApiKey,
             ["token"] = token
         };
-        return await SendFormAsync(HttpMethod.Post, "query.php", form, ct, "QueryStatus").ConfigureAwait(false);
+        return await ExpressPayHttpClient.SendFormAsync(_httpClient, _logger, HttpMethod.Post, "query.php", form, ct, "QueryStatus").ConfigureAwait(false);
     }
 
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -133,6 +271,9 @@ public sealed class ExpressPayPaymentProvider : IPaymentGatewayProvider
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
         {
             _logger.LogWarning("ExpressPay ApiKey not configured — webhook verification cannot succeed.");
+            BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("valid", false));
             return false;
         }
 
@@ -141,13 +282,19 @@ public sealed class ExpressPayPaymentProvider : IPaymentGatewayProvider
         // configured ApiKey. Production callers SHOULD additionally call QueryStatusAsync(token).
         var a = Encoding.UTF8.GetBytes(signature);
         var b = Encoding.UTF8.GetBytes(_options.ApiKey);
-        if (a.Length != b.Length) return false;
-        return CryptographicOperations.FixedTimeEquals(a, b);
+        var valid = a.Length == b.Length && CryptographicOperations.FixedTimeEquals(a, b);
+        BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
+            new KeyValuePair<string, object?>("provider", ProviderName),
+            new KeyValuePair<string, object?>("valid", valid));
+        return valid;
     }
 
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+
+        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
 
         try
         {
@@ -159,36 +306,84 @@ public sealed class ExpressPayPaymentProvider : IPaymentGatewayProvider
             else
             {
                 var bag = ParseForm(payload);
-                int.TryParse(bag.GetValueOrDefault("status"), out var sint);
+                int.TryParse(bag.GetValueOrDefault("status"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var sint);
                 cb = new ExpressPayCallback
                 {
                     Token = bag.GetValueOrDefault("token"),
                     Status = sint,
                     Currency = bag.GetValueOrDefault("currency"),
-                    Amount = bag.GetValueOrDefault("amount")
+                    Amount = bag.GetValueOrDefault("amount"),
+                    EventType = bag.GetValueOrDefault("event")
                 };
             }
 
             if (cb is null || string.IsNullOrEmpty(cb.Token))
                 return Task.FromResult<WebhookEvent?>(null);
 
-            var status = cb.Status switch
+            decimal.TryParse(cb.Amount, NumberStyles.Number, CultureInfo.InvariantCulture, out var amount);
+            var currency = cb.Currency ?? _options.Currency;
+            var eventLower = cb.EventType?.ToLowerInvariant();
+
+            WebhookEvent? typed = (eventLower, cb.Status) switch
             {
-                1 => PaymentStatus.Completed,
-                2 => PaymentStatus.Pending,
-                3 => PaymentStatus.Failed,
-                4 => PaymentStatus.Cancelled,
-                _ => (PaymentStatus?)null
+                ("payout.completed", _) => new PayoutCompletedEvent
+                {
+                    GatewayReference = cb.Token!,
+                    Status = PaymentStatus.Completed,
+                    EventType = cb.EventType,
+                    Category = WebhookEventCategory.PayoutCompleted,
+                    PayoutReference = cb.Token!,
+                    Amount = amount,
+                    Currency = currency
+                },
+                ("payout.failed", _) => new PayoutFailedEvent
+                {
+                    GatewayReference = cb.Token!,
+                    Status = PaymentStatus.Failed,
+                    EventType = cb.EventType,
+                    Category = WebhookEventCategory.PayoutFailed,
+                    PayoutReference = cb.Token!,
+                    Amount = amount,
+                    Currency = currency
+                },
+                (_, 1) => new ChargeSucceededEvent
+                {
+                    GatewayReference = cb.Token!,
+                    Status = PaymentStatus.Completed,
+                    EventType = cb.EventType ?? "1",
+                    Category = WebhookEventCategory.ChargeSucceeded,
+                    Amount = amount,
+                    Currency = currency
+                },
+                (_, 2) => new ChargePendingEvent
+                {
+                    GatewayReference = cb.Token!,
+                    Status = PaymentStatus.Pending,
+                    EventType = cb.EventType ?? "2",
+                    Category = WebhookEventCategory.ChargePending,
+                    Amount = amount,
+                    Currency = currency
+                },
+                (_, 3) => new ChargeFailedEvent
+                {
+                    GatewayReference = cb.Token!,
+                    Status = PaymentStatus.Failed,
+                    EventType = cb.EventType ?? "3",
+                    Category = WebhookEventCategory.ChargeFailed,
+                    Amount = amount,
+                    Currency = currency
+                },
+                (_, 4) => new WebhookEvent
+                {
+                    GatewayReference = cb.Token!,
+                    Status = PaymentStatus.Cancelled,
+                    EventType = cb.EventType ?? "4",
+                    Category = WebhookEventCategory.Unknown
+                },
+                _ => null
             };
 
-            if (status is null) return Task.FromResult<WebhookEvent?>(null);
-
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
-            {
-                GatewayReference = cb.Token!,
-                Status = status.Value,
-                EventType = cb.Status.ToString(System.Globalization.CultureInfo.InvariantCulture)
-            });
+            return Task.FromResult(typed);
         }
         catch (Exception ex)
         {
@@ -197,41 +392,29 @@ public sealed class ExpressPayPaymentProvider : IPaymentGatewayProvider
         }
     }
 
-    private async Task<string> SendFormAsync(HttpMethod method, string path, Dictionary<string, string> form, CancellationToken ct, string operation)
+    private async Task<T?> TryGetCachedAsync<T>(string? idempotencyKey, string operation, CancellationToken ct) where T : class
     {
-        using var req = new HttpRequestMessage(method, path)
-        {
-            Content = new FormUrlEncodedContent(form)
-        };
-
-        HttpResponseMessage response;
-        try
-        {
-            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to ExpressPay failed", ex);
-        }
-
-        var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-
-        if (response.StatusCode == HttpStatusCode.TooManyRequests)
-        {
-            var retryAfter = response.Headers.RetryAfter?.Delta?.TotalSeconds is double d ? (int)d : (int?)null;
-            throw new ProviderRateLimitException(ProviderName, retryAfter, responseBody);
-        }
-
-        if (!response.IsSuccessStatusCode)
-        {
-            _logger.LogError("ExpressPay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
-            if ((int)response.StatusCode is >= 400 and < 500)
-                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
-            throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
-        }
-
-        return responseBody;
+        if (_idempotencyCache is null || string.IsNullOrWhiteSpace(idempotencyKey))
+            return null;
+        var key = $"expresspay:{operation}:{idempotencyKey}";
+        return await _idempotencyCache.GetAsync<T>(key, ct).ConfigureAwait(false);
     }
+
+    private async Task TrySetCachedAsync<T>(string? idempotencyKey, string operation, T value, CancellationToken ct) where T : class
+    {
+        if (_idempotencyCache is null || string.IsNullOrWhiteSpace(idempotencyKey))
+            return;
+        var key = $"expresspay:{operation}:{idempotencyKey}";
+        await _idempotencyCache.SetAsync(key, value, TimeSpan.FromHours(24), ct).ConfigureAwait(false);
+    }
+
+    private static string ClassifyOutcome(Exception ex) => ex switch
+    {
+        PaymentDeclinedException => BhenguPaymentDiagnostics.Outcomes.Declined,
+        ProviderRateLimitException => BhenguPaymentDiagnostics.Outcomes.RateLimited,
+        ProviderUnavailableException => BhenguPaymentDiagnostics.Outcomes.Unavailable,
+        _ => BhenguPaymentDiagnostics.Outcomes.Error
+    };
 
     private static Dictionary<string, string> ParseForm(string raw)
     {
@@ -254,11 +437,19 @@ public sealed class ExpressPayPaymentProvider : IPaymentGatewayProvider
         [JsonPropertyName("message")] public string? Message { get; set; }
     }
 
+    private sealed class ExpressPayPayoutResponse
+    {
+        [JsonPropertyName("status")] public int Status { get; set; }
+        [JsonPropertyName("transaction-id")] public string? TransactionId { get; set; }
+        [JsonPropertyName("message")] public string? Message { get; set; }
+    }
+
     private sealed class ExpressPayCallback
     {
         [JsonPropertyName("token")] public string? Token { get; set; }
         [JsonPropertyName("status")] public int Status { get; set; }
         [JsonPropertyName("currency")] public string? Currency { get; set; }
         [JsonPropertyName("amount")] public string? Amount { get; set; }
+        [JsonPropertyName("event")] public string? EventType { get; set; }
     }
 }

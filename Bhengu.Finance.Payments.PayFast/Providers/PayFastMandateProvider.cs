@@ -1,6 +1,5 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
-using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net;
 using System.Text.Json;
@@ -342,33 +341,56 @@ public sealed class PayFastMandateProvider : IMandateProvider
 }
 
 /// <summary>
-/// Process-local cache of per-mandate amount limits and currencies. PayFast doesn't expose a
-/// mandate-side amount cap, so the SDK enforces it client-side using the limit captured at
-/// <see cref="PayFastMandateProvider.CreateMandateAsync"/> time.
+/// Distributed-cache-backed registry of per-mandate amount limits and currencies. PayFast
+/// doesn't expose a mandate-side amount cap, so the SDK enforces it client-side using the limit
+/// captured at <see cref="PayFastMandateProvider.CreateMandateAsync"/> time.
 /// </summary>
+/// <remarks>
+/// Entries are written to <see cref="Bhengu.Finance.Payments.Core.Caching.IBhenguDistributedCache"/>
+/// with a 365-day TTL so mandate limits survive restarts and remain consistent across replicas
+/// when Redis is wired up via the optional <c>Bhengu.Finance.Payments.Redis</c> package.
+/// </remarks>
 public sealed class PayFastMandateAmountCache
 {
-    private readonly ConcurrentDictionary<string, (decimal Limit, string Currency)> _limits = new(StringComparer.Ordinal);
+    private const string KeyPrefix = "payfast:mandate-amount:";
+    private static readonly TimeSpan TimeToLive = TimeSpan.FromDays(365);
+
+    private readonly Bhengu.Finance.Payments.Core.Caching.IBhenguDistributedCache _cache;
+
+    /// <summary>Construct with an injected distributed cache. Used in DI-driven scenarios.</summary>
+    public PayFastMandateAmountCache(Bhengu.Finance.Payments.Core.Caching.IBhenguDistributedCache cache)
+    {
+        _cache = cache ?? throw new ArgumentNullException(nameof(cache));
+    }
+
+    /// <summary>Default-constructor convenience for tests and back-compat callers.</summary>
+    public PayFastMandateAmountCache() : this(new Bhengu.Finance.Payments.Core.Caching.InMemoryBhenguDistributedCache()) { }
 
     /// <summary>Store the limit / currency for a mandate.</summary>
     public void Set(string mandateReference, decimal amountLimit, string currency)
     {
         ArgumentException.ThrowIfNullOrEmpty(mandateReference);
         ArgumentException.ThrowIfNullOrEmpty(currency);
-        _limits[mandateReference] = (amountLimit, currency);
+        _cache.SetAsync(KeyPrefix + mandateReference, new MandateLimitEntry(amountLimit, currency), TimeToLive).GetAwaiter().GetResult();
     }
 
     /// <summary>Retrieve the cached limit / currency for a mandate, or (null, null) if not present.</summary>
     public (decimal? Limit, string? Currency) TryGet(string mandateReference)
     {
         ArgumentException.ThrowIfNullOrEmpty(mandateReference);
-        return _limits.TryGetValue(mandateReference, out var v) ? (v.Limit, v.Currency) : (null, null);
+        var entry = _cache.GetAsync<MandateLimitEntry>(KeyPrefix + mandateReference).GetAwaiter().GetResult();
+        return entry is null ? (null, null) : (entry.Limit, entry.Currency);
     }
 
-    /// <summary>Remove a mandate's cached limit.</summary>
+    /// <summary>Remove a mandate's cached limit. Returns true if a value was previously cached.</summary>
     public bool Remove(string mandateReference)
     {
         ArgumentException.ThrowIfNullOrEmpty(mandateReference);
-        return _limits.TryRemove(mandateReference, out _);
+        var existed = _cache.GetAsync<MandateLimitEntry>(KeyPrefix + mandateReference).GetAwaiter().GetResult() is not null;
+        _cache.RemoveAsync(KeyPrefix + mandateReference).GetAwaiter().GetResult();
+        return existed;
     }
+
+    /// <summary>Serialisable record persisted in the distributed cache.</summary>
+    public sealed record MandateLimitEntry(decimal Limit, string Currency);
 }

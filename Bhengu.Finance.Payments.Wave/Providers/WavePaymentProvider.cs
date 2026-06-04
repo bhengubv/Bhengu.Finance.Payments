@@ -11,6 +11,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Wave.Configuration;
+using Bhengu.Finance.Payments.Wave.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -55,10 +56,15 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
         _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _options.ApiKey);
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return WaveObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+    }
 
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+    {
         var requestBody = new
         {
             amount = request.Amount.ToString("F0", System.Globalization.CultureInfo.InvariantCulture),
@@ -85,10 +91,15 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
         };
     }
 
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return WaveObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+    }
 
+    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+    {
         if (string.IsNullOrWhiteSpace(request.DestinationToken))
             throw new PaymentDeclinedException(ProviderName, "invalid_msisdn",
                 "Wave Payout requires the recipient MSISDN in PayoutRequest.DestinationToken.");
@@ -140,10 +151,15 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
         };
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return WaveObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+    }
 
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
         var path = $"v1/checkout/sessions/{Uri.EscapeDataString(request.GatewayReference)}/refund";
         var body = await SendAsync(HttpMethod.Post, path, new { }, ct, "ProcessRefund").ConfigureAwait(false);
         var refundResponse = JsonSerializer.Deserialize<WaveCheckoutResponse>(body);
@@ -160,6 +176,7 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
         };
     }
 
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -168,9 +185,11 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
             _logger.LogWarning("Wave WebhookSecret not configured — signature verification cannot succeed.");
+            WaveObservability.RecordWebhookVerification(false);
             return false;
         }
 
+        bool verified;
         try
         {
             // Wave-Signature header: "t=<timestamp>,v1=<signature>"
@@ -187,28 +206,38 @@ public sealed class WavePaymentProvider : IPaymentGatewayProvider, IPayoutProvid
             }
 
             if (string.IsNullOrEmpty(timestamp) || string.IsNullOrEmpty(sentSig))
+            {
+                WaveObservability.RecordWebhookVerification(false);
                 return false;
+            }
 
             var signedPayload = $"{timestamp}.{payload}";
             using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
             var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(signedPayload));
             var computedSignature = Convert.ToHexString(computedHash).ToLowerInvariant();
 
-            return CryptographicOperations.FixedTimeEquals(
+            verified = CryptographicOperations.FixedTimeEquals(
                 Encoding.UTF8.GetBytes(sentSig.ToLowerInvariant()),
                 Encoding.UTF8.GetBytes(computedSignature));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Wave webhook signature verification raised");
-            return false;
+            verified = false;
         }
+        WaveObservability.RecordWebhookVerification(verified);
+        return verified;
     }
 
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+        return WaveObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+    }
 
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
+    {
         try
         {
             var webhookEvent = JsonSerializer.Deserialize<WaveWebhookEvent>(payload);

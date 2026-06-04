@@ -2,7 +2,6 @@
 
 using System.Globalization;
 using System.Net;
-using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -11,7 +10,10 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Remita.Configuration;
+using Bhengu.Finance.Payments.Remita.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -36,24 +38,35 @@ public sealed class RemitaPaymentProvider : IPaymentGatewayProvider, IPayoutProv
     private readonly HttpClient _httpClient;
     private readonly RemitaOptions _options;
     private readonly ILogger<RemitaPaymentProvider> _logger;
+    private readonly RemitaIdempotencyCache? _idempotency;
 
+    /// <inheritdoc />
     public string ProviderName => ProviderNames.Remita;
 
+    /// <inheritdoc />
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
         ProviderCapabilities.Refund |
+        ProviderCapabilities.PartialRefund |
         ProviderCapabilities.Payout |
         ProviderCapabilities.Webhook |
-        ProviderCapabilities.BankTransfer;
+        ProviderCapabilities.BankTransfer |
+        ProviderCapabilities.Settlement |
+        ProviderCapabilities.Mandates |
+        ProviderCapabilities.Idempotency |
+        ProviderCapabilities.TypedWebhooks;
 
+    /// <summary>Construct the provider. Designed to be registered via DI.</summary>
     public RemitaPaymentProvider(
         HttpClient httpClient,
         IOptions<RemitaOptions> options,
-        ILogger<RemitaPaymentProvider> logger)
+        ILogger<RemitaPaymentProvider> logger,
+        RemitaIdempotencyCache? idempotency = null)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _idempotency = idempotency;
 
         if (string.IsNullOrWhiteSpace(_options.MerchantId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(RemitaOptions.MerchantId)} is required");
@@ -72,136 +85,229 @@ public sealed class RemitaPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         }
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc />
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        var orderId = request.PaymentMethodToken;
-        var amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture);
-
-        // Remita payment-init hash = SHA512(merchantId + serviceTypeId + orderId + total + apiKey).
-        var hash = Sha512Hex(
-            _options.MerchantId + _options.ServiceTypeId + orderId + amount + _options.ApiKey);
-
-        var requestBody = new
-        {
-            serviceTypeId = _options.ServiceTypeId,
-            amount,
-            orderId,
-            payerName = request.Metadata?.GetValueOrDefault("payerName") ?? "Bhengu Customer",
-            payerEmail = request.Metadata?.GetValueOrDefault("payerEmail") ?? "noreply@bhengu.local",
-            payerPhone = request.Metadata?.GetValueOrDefault("payerPhone") ?? string.Empty,
-            description = request.Description,
-            responseurl = _options.CallbackUrl
-        };
-
-        var authHeader = $"remitaConsumerKey={_options.MerchantId},remitaConsumerToken={hash}";
-        var body = await SendAsync(HttpMethod.Post, PaymentInitPath, requestBody, ct, "ProcessPayment", authHeader)
-            .ConfigureAwait(false);
-
-        var remitaResponse = JsonSerializer.Deserialize<RemitaPaymentInitResponse>(body);
-
-        _logger.LogInformation("Remita payment init: orderId={OrderId} rrr={Rrr} statusCode={StatusCode}",
-            orderId, remitaResponse?.Rrr, remitaResponse?.StatusCode);
-
-        return new PaymentResponse
-        {
-            GatewayReference = remitaResponse?.Rrr ?? string.Empty,
-            Status = MapStatusCode(remitaResponse?.StatusCode),
-            Amount = request.Amount,
-            Currency = request.Currency,
-            ProcessedAt = DateTime.UtcNow,
-            Message = remitaResponse?.Status
-        };
+        return _idempotency is null
+            ? ProcessPaymentCoreAsync(request, ct)
+            : _idempotency.GetOrAddAsync(request.IdempotencyKey, "charge",
+                () => ProcessPaymentCoreAsync(request, ct), ct);
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
     {
-        ArgumentNullException.ThrowIfNull(request);
-
-        var amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture);
-        var hash = Sha512Hex(_options.MerchantId + request.GatewayReference + amount + _options.ApiKey);
-
-        var requestBody = new
+        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
+        try
         {
-            merchantId = _options.MerchantId,
-            rrr = request.GatewayReference,
-            amount,
-            reason = request.Reason,
-            hash
-        };
+            var orderId = request.PaymentMethodToken;
+            var amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture);
 
-        var authHeader = $"remitaConsumerKey={_options.MerchantId},remitaConsumerToken={hash}";
-        var body = await SendAsync(HttpMethod.Post, RefundPath, requestBody, ct, "ProcessRefund", authHeader)
-            .ConfigureAwait(false);
+            // Remita payment-init hash = SHA512(merchantId + serviceTypeId + orderId + total + apiKey).
+            var hash = Sha512Hex(
+                _options.MerchantId + _options.ServiceTypeId + orderId + amount + _options.ApiKey);
 
-        var refundResponse = JsonSerializer.Deserialize<RemitaRefundResponse>(body);
+            var requestBody = new
+            {
+                serviceTypeId = _options.ServiceTypeId,
+                amount,
+                orderId,
+                payerName = request.Metadata?.GetValueOrDefault("payerName") ?? "Bhengu Customer",
+                payerEmail = request.Metadata?.GetValueOrDefault("payerEmail") ?? "noreply@bhengu.local",
+                payerPhone = request.Metadata?.GetValueOrDefault("payerPhone") ?? string.Empty,
+                description = request.Description,
+                responseurl = _options.CallbackUrl
+            };
 
-        _logger.LogInformation("Remita refund initiated: refundRef={RefundRef} rrr={Rrr}",
-            refundResponse?.RefundReference, request.GatewayReference);
+            var authHeader = $"remitaConsumerKey={_options.MerchantId},remitaConsumerToken={hash}";
+            var body = await SendAsync(HttpMethod.Post, PaymentInitPath, requestBody, ct, "ProcessPayment", authHeader)
+                .ConfigureAwait(false);
 
-        return new RefundResponse
+            var remitaResponse = JsonSerializer.Deserialize<RemitaPaymentInitResponse>(body);
+
+            _logger.LogInformation("Remita payment init: orderId={OrderId} rrr={Rrr} statusCode={StatusCode}",
+                orderId, remitaResponse?.Rrr, remitaResponse?.StatusCode);
+
+            var status = MapStatusCode(remitaResponse?.StatusCode);
+            outcome = status switch
+            {
+                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
+                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
+                _ => BhenguPaymentDiagnostics.Outcomes.Declined
+            };
+
+            return new PaymentResponse
+            {
+                GatewayReference = remitaResponse?.Rrr ?? string.Empty,
+                Status = status,
+                Amount = request.Amount,
+                Currency = request.Currency,
+                ProcessedAt = DateTime.UtcNow,
+                Message = remitaResponse?.Status
+            };
+        }
+        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
+        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
+        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
+        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
+        finally
         {
-            GatewayReference = refundResponse?.RefundReference ?? request.GatewayReference,
-            Amount = request.Amount,
-            Status = MapStatusCode(refundResponse?.StatusCode),
-            ProcessedAt = DateTime.UtcNow,
-            Message = refundResponse?.Status
-        };
+            activity?.SetOutcome(outcome);
+            sw.Stop();
+            BhenguPaymentDiagnostics.ChargesTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
+            BhenguPaymentDiagnostics.ChargeDurationMs.Record(sw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
+        }
     }
 
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    /// <inheritdoc />
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return _idempotency is null
+            ? ProcessRefundCoreAsync(request, ct)
+            : _idempotency.GetOrAddAsync(request.IdempotencyKey, "refund",
+                () => ProcessRefundCoreAsync(request, ct), ct);
+    }
 
-        if (string.IsNullOrWhiteSpace(_options.FromBank) || string.IsNullOrWhiteSpace(_options.DebitAccount))
-            throw new ProviderConfigurationException(ProviderName,
-                "Remita payouts require FromBank and DebitAccount to be configured.");
-
-        // DestinationToken format: "<creditBank>:<creditAccount>" (e.g. "058:0123456789").
-        var colon = request.DestinationToken.IndexOf(':');
-        if (colon <= 0)
-            throw new BhenguPaymentException(ProviderName,
-                "Remita PayoutRequest.DestinationToken must be 'creditBankCode:creditAccountNumber'.",
-                providerErrorCode: "invalid_destination");
-
-        var creditBank = request.DestinationToken[..colon];
-        var creditAccount = request.DestinationToken[(colon + 1)..];
-        var transRef = $"sm-{Guid.NewGuid():N}";
-        var amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture);
-
-        var hash = Sha512Hex(
-            _options.MerchantId + creditAccount + amount + _options.ApiKey);
-
-        var requestBody = new
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
+        using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
+        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
+        try
         {
-            fromBank = _options.FromBank,
-            debitAccount = _options.DebitAccount,
-            creditAccount,
-            creditBank,
-            narration = request.Description,
-            amount,
-            transRef,
-            custName = request.Description
-        };
+            var amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture);
+            var hash = Sha512Hex(_options.MerchantId + request.GatewayReference + amount + _options.ApiKey);
 
-        var authHeader = $"remitaConsumerKey={_options.MerchantId},remitaConsumerToken={hash}";
-        var body = await SendAsync(HttpMethod.Post, SendMoneyPath, requestBody, ct, "ProcessPayout", authHeader)
-            .ConfigureAwait(false);
+            var requestBody = new
+            {
+                merchantId = _options.MerchantId,
+                rrr = request.GatewayReference,
+                amount,
+                reason = request.Reason,
+                hash
+            };
 
-        var payoutResponse = JsonSerializer.Deserialize<RemitaSendMoneyResponse>(body);
+            var authHeader = $"remitaConsumerKey={_options.MerchantId},remitaConsumerToken={hash}";
+            var body = await SendAsync(HttpMethod.Post, RefundPath, requestBody, ct, "ProcessRefund", authHeader)
+                .ConfigureAwait(false);
 
-        _logger.LogInformation("Remita Single Send Money queued: transRef={TransRef} statusCode={StatusCode}",
-            transRef, payoutResponse?.StatusCode);
+            var refundResponse = JsonSerializer.Deserialize<RemitaRefundResponse>(body);
 
-        return new PayoutResponse
+            _logger.LogInformation("Remita refund initiated: refundRef={RefundRef} rrr={Rrr}",
+                refundResponse?.RefundReference, request.GatewayReference);
+
+            var status = MapStatusCode(refundResponse?.StatusCode);
+            outcome = status switch
+            {
+                PaymentStatus.Completed or PaymentStatus.Refunded => BhenguPaymentDiagnostics.Outcomes.Success,
+                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
+                _ => BhenguPaymentDiagnostics.Outcomes.Declined
+            };
+
+            return new RefundResponse
+            {
+                GatewayReference = refundResponse?.RefundReference ?? request.GatewayReference,
+                Amount = request.Amount,
+                Status = status,
+                ProcessedAt = DateTime.UtcNow,
+                Message = refundResponse?.Status
+            };
+        }
+        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
+        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
+        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
+        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
+        finally
         {
-            GatewayReference = payoutResponse?.TransRef ?? transRef,
-            Status = MapStatusCode(payoutResponse?.StatusCode),
-            Amount = request.Amount,
-            Currency = request.Currency,
-            ProcessedAt = DateTime.UtcNow
-        };
+            activity?.SetOutcome(outcome);
+            BhenguPaymentDiagnostics.RefundsTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
+        }
+    }
+
+    /// <inheritdoc />
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        return _idempotency is null
+            ? ProcessPayoutCoreAsync(request, ct)
+            : _idempotency.GetOrAddAsync(request.IdempotencyKey, "payout",
+                () => ProcessPayoutCoreAsync(request, ct), ct);
+    }
+
+    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+    {
+        using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, request.Currency);
+        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
+        try
+        {
+            if (string.IsNullOrWhiteSpace(_options.FromBank) || string.IsNullOrWhiteSpace(_options.DebitAccount))
+                throw new ProviderConfigurationException(ProviderName,
+                    "Remita payouts require FromBank and DebitAccount to be configured.");
+
+            // DestinationToken format: "<creditBank>:<creditAccount>" (e.g. "058:0123456789").
+            var colon = request.DestinationToken.IndexOf(':');
+            if (colon <= 0)
+                throw new BhenguPaymentException(ProviderName,
+                    "Remita PayoutRequest.DestinationToken must be 'creditBankCode:creditAccountNumber'.",
+                    providerErrorCode: "invalid_destination");
+
+            var creditBank = request.DestinationToken[..colon];
+            var creditAccount = request.DestinationToken[(colon + 1)..];
+            var transRef = request.IdempotencyKey ?? $"sm-{Guid.NewGuid():N}";
+            var amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture);
+
+            var hash = Sha512Hex(
+                _options.MerchantId + creditAccount + amount + _options.ApiKey);
+
+            var requestBody = new
+            {
+                fromBank = _options.FromBank,
+                debitAccount = _options.DebitAccount,
+                creditAccount,
+                creditBank,
+                narration = request.Description,
+                amount,
+                transRef,
+                custName = request.Description
+            };
+
+            var authHeader = $"remitaConsumerKey={_options.MerchantId},remitaConsumerToken={hash}";
+            var body = await SendAsync(HttpMethod.Post, SendMoneyPath, requestBody, ct, "ProcessPayout", authHeader)
+                .ConfigureAwait(false);
+
+            var payoutResponse = JsonSerializer.Deserialize<RemitaSendMoneyResponse>(body);
+
+            _logger.LogInformation("Remita Single Send Money queued: transRef={TransRef} statusCode={StatusCode}",
+                transRef, payoutResponse?.StatusCode);
+
+            var status = MapStatusCode(payoutResponse?.StatusCode);
+            outcome = status switch
+            {
+                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
+                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
+                _ => BhenguPaymentDiagnostics.Outcomes.Declined
+            };
+
+            return new PayoutResponse
+            {
+                GatewayReference = payoutResponse?.TransRef ?? transRef,
+                Status = status,
+                Amount = request.Amount,
+                Currency = request.Currency,
+                ProcessedAt = DateTime.UtcNow
+            };
+        }
+        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
+        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
+        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
+        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
+        finally
+        {
+            activity?.SetOutcome(outcome);
+            BhenguPaymentDiagnostics.PayoutsTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
+        }
     }
 
     /// <summary>
@@ -215,65 +321,206 @@ public sealed class RemitaPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        if (string.IsNullOrWhiteSpace(_options.ApiKey))
-        {
-            _logger.LogWarning("Remita ApiKey not configured — signature verification cannot succeed.");
-            return false;
-        }
-
+        var valid = false;
         try
         {
+            if (string.IsNullOrWhiteSpace(_options.ApiKey))
+            {
+                _logger.LogWarning("Remita ApiKey not configured — signature verification cannot succeed.");
+                return false;
+            }
+
             var callback = JsonSerializer.Deserialize<RemitaWebhookEvent>(payload, s_caseInsensitive);
             if (callback is null || string.IsNullOrEmpty(callback.Rrr) || string.IsNullOrEmpty(callback.Status))
                 return false;
 
             var expected = Sha512Hex(callback.Rrr + callback.Status + _options.ApiKey);
-            return CryptographicOperations.FixedTimeEquals(
+            valid = CryptographicOperations.FixedTimeEquals(
                 Encoding.UTF8.GetBytes(signature),
                 Encoding.UTF8.GetBytes(expected));
+            return valid;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Remita webhook signature verification raised");
             return false;
         }
+        finally
+        {
+            BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("valid", valid));
+        }
     }
 
+    /// <inheritdoc />
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
 
+        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
         try
         {
             var callback = JsonSerializer.Deserialize<RemitaWebhookEvent>(payload, s_caseInsensitive);
             if (callback is null) return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed Remita webhook: rrr={Rrr} status={Status}",
-                callback.Rrr, callback.Status);
+            _logger.LogInformation("Parsed Remita webhook: rrr={Rrr} status={Status} type={Type}",
+                callback.Rrr, callback.Status, callback.NotificationType);
 
-            var status = callback.Status?.ToLowerInvariant() switch
-            {
-                "00" or "01" or "success" or "successful" or "completed" => PaymentStatus.Completed,
-                "021" or "025" or "pending" => PaymentStatus.Pending,
-                "020" or "failed" or "declined" => PaymentStatus.Failed,
-                "refunded" => PaymentStatus.Refunded,
-                _ => (PaymentStatus?)null
-            };
-
-            if (status is null || string.IsNullOrEmpty(callback.Rrr))
-                return Task.FromResult<WebhookEvent?>(null);
-
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
-            {
-                GatewayReference = callback.Rrr,
-                Status = status.Value,
-                EventType = callback.Status
-            });
+            return Task.FromResult(MapWebhookEvent(callback));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to parse Remita webhook event");
             return Task.FromResult<WebhookEvent?>(null);
+        }
+    }
+
+    private static WebhookEvent? MapWebhookEvent(RemitaWebhookEvent callback)
+    {
+        var rrr = callback.Rrr ?? callback.OrderId ?? string.Empty;
+        if (string.IsNullOrEmpty(rrr)) return null;
+
+        var rawStatus = callback.Status?.ToLowerInvariant();
+        var notificationType = callback.NotificationType?.ToLowerInvariant();
+        var amount = callback.Amount;
+        var currency = callback.Currency ?? "NGN";
+
+        // Mandate notifications carry an explicit notificationType prefix.
+        if (notificationType is not null)
+        {
+            switch (notificationType)
+            {
+                case "mandate.activated":
+                case "mandate.active":
+                    return new MandateActivatedEvent
+                    {
+                        GatewayReference = rrr,
+                        Status = PaymentStatus.Completed,
+                        EventType = callback.NotificationType,
+                        Category = WebhookEventCategory.MandateActivated,
+                        MandateReference = callback.MandateId ?? rrr,
+                        AmountLimit = amount > 0 ? amount : null,
+                        Currency = currency
+                    };
+
+                case "mandate.cancelled":
+                case "mandate.canceled":
+                case "mandate.terminated":
+                    return new MandateCancelledEvent
+                    {
+                        GatewayReference = rrr,
+                        Status = PaymentStatus.Cancelled,
+                        EventType = callback.NotificationType,
+                        Category = WebhookEventCategory.MandateCancelled,
+                        MandateReference = callback.MandateId ?? rrr,
+                        CancellationReason = callback.CancellationReason
+                    };
+
+                case "payout.successful":
+                case "transfer.successful":
+                    return new PayoutCompletedEvent
+                    {
+                        GatewayReference = rrr,
+                        Status = PaymentStatus.Completed,
+                        EventType = callback.NotificationType,
+                        Category = WebhookEventCategory.PayoutCompleted,
+                        PayoutReference = callback.TransRef ?? rrr,
+                        Amount = amount,
+                        Currency = currency,
+                        DestinationToken = callback.CreditAccount
+                    };
+
+                case "payout.failed":
+                case "transfer.failed":
+                    return new PayoutFailedEvent
+                    {
+                        GatewayReference = rrr,
+                        Status = PaymentStatus.Failed,
+                        EventType = callback.NotificationType,
+                        Category = WebhookEventCategory.PayoutFailed,
+                        PayoutReference = callback.TransRef ?? rrr,
+                        Amount = amount,
+                        Currency = currency,
+                        FailureCode = callback.Status,
+                        FailureMessage = callback.Message
+                    };
+
+                case "settlement.completed":
+                    return new SettlementCompletedEvent
+                    {
+                        GatewayReference = rrr,
+                        Status = PaymentStatus.Completed,
+                        EventType = callback.NotificationType,
+                        Category = WebhookEventCategory.SettlementCompleted,
+                        SettlementReference = rrr,
+                        NetAmount = amount,
+                        Currency = currency
+                    };
+            }
+        }
+
+        // Otherwise fall through to status-based mapping (Remita's classic e-collection callback).
+        switch (rawStatus)
+        {
+            case "00":
+            case "01":
+            case "success":
+            case "successful":
+            case "completed":
+                return new ChargeSucceededEvent
+                {
+                    GatewayReference = rrr,
+                    Status = PaymentStatus.Completed,
+                    EventType = callback.Status,
+                    Category = WebhookEventCategory.ChargeSucceeded,
+                    Amount = amount,
+                    Currency = currency
+                };
+
+            case "021":
+            case "025":
+            case "pending":
+                return new ChargePendingEvent
+                {
+                    GatewayReference = rrr,
+                    Status = PaymentStatus.Pending,
+                    EventType = callback.Status,
+                    Category = WebhookEventCategory.ChargePending,
+                    Amount = amount,
+                    Currency = currency
+                };
+
+            case "020":
+            case "failed":
+            case "declined":
+                return new ChargeFailedEvent
+                {
+                    GatewayReference = rrr,
+                    Status = PaymentStatus.Failed,
+                    EventType = callback.Status,
+                    Category = WebhookEventCategory.ChargeFailed,
+                    Amount = amount,
+                    Currency = currency,
+                    FailureCode = callback.Status,
+                    FailureMessage = callback.Message
+                };
+
+            case "refunded":
+                return new RefundSucceededEvent
+                {
+                    GatewayReference = rrr,
+                    Status = PaymentStatus.Refunded,
+                    EventType = callback.Status,
+                    Category = WebhookEventCategory.RefundSucceeded,
+                    RefundReference = rrr,
+                    Amount = amount,
+                    Currency = currency,
+                    IsPartial = false
+                };
+
+            default:
+                return null;
         }
     }
 
@@ -309,7 +556,7 @@ public sealed class RemitaPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         {
             _logger.LogError("Remita {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
-                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
+                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
         }
 
@@ -359,11 +606,17 @@ public sealed class RemitaPaymentProvider : IPaymentGatewayProvider, IPayoutProv
 
     private sealed class RemitaWebhookEvent
     {
-        // Remita callbacks supply RRR — we use a case-insensitive deserializer in ParseWebhook/VerifySignature
-        // to handle both "rrr" and "RRR" naming.
         [JsonPropertyName("rrr")] public string? Rrr { get; set; }
         [JsonPropertyName("status")] public string? Status { get; set; }
         [JsonPropertyName("orderId")] public string? OrderId { get; set; }
+        [JsonPropertyName("amount")] public decimal Amount { get; set; }
+        [JsonPropertyName("currency")] public string? Currency { get; set; }
+        [JsonPropertyName("notificationType")] public string? NotificationType { get; set; }
+        [JsonPropertyName("mandateId")] public string? MandateId { get; set; }
+        [JsonPropertyName("transRef")] public string? TransRef { get; set; }
+        [JsonPropertyName("creditAccount")] public string? CreditAccount { get; set; }
+        [JsonPropertyName("cancellationReason")] public string? CancellationReason { get; set; }
+        [JsonPropertyName("message")] public string? Message { get; set; }
     }
 
     private static readonly JsonSerializerOptions s_caseInsensitive = new()

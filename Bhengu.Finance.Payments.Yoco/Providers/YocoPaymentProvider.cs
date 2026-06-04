@@ -12,6 +12,7 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Yoco.Configuration;
+using Bhengu.Finance.Payments.Yoco.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -41,7 +42,8 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
         ProviderCapabilities.Cards |
         ProviderCapabilities.Tokenisation |
         ProviderCapabilities.Payout |
-        ProviderCapabilities.Settlement;
+        ProviderCapabilities.Settlement |
+        ProviderCapabilities.ThreeDSecure;
 
     public YocoPaymentProvider(
         HttpClient httpClient,
@@ -61,10 +63,15 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
         _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _options.SecretKey);
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return YocoObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+    }
 
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+    {
         var amountInCents = (int)(request.Amount * 100);
 
         var requestBody = new
@@ -92,10 +99,15 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
         };
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return YocoObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+    }
 
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
         var amountInCents = (int)(request.Amount * 100);
         var requestBody = new
         {
@@ -119,6 +131,7 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
         };
     }
 
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -127,24 +140,28 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
             _logger.LogWarning("Yoco WebhookSecret not configured — signature verification cannot succeed.");
+            YocoObservability.RecordWebhookVerification(false);
             return false;
         }
 
+        bool verified;
         try
         {
             using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
             var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
             var computedSignature = Convert.ToBase64String(computedHash);
 
-            return CryptographicOperations.FixedTimeEquals(
+            verified = CryptographicOperations.FixedTimeEquals(
                 Encoding.UTF8.GetBytes(signature),
                 Encoding.UTF8.GetBytes(computedSignature));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Yoco webhook signature verification raised");
-            return false;
+            verified = false;
         }
+        YocoObservability.RecordWebhookVerification(verified);
+        return verified;
     }
 
     /// <summary>
@@ -161,10 +178,15 @@ public sealed class YocoPaymentProvider : IPaymentGatewayProvider
     /// <item><description><c>payout.failed</c> → <see cref="PayoutFailedEvent"/>.</description></item>
     /// </list>
     /// </remarks>
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+        return YocoObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+    }
 
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
+    {
         try
         {
             var webhookEvent = JsonSerializer.Deserialize<YocoWebhookEvent>(payload);

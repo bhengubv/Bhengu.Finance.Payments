@@ -18,6 +18,7 @@ namespace Bhengu.Finance.Payments.Tests.Stripe;
 /// injected <see cref="HttpClient"/>. Mocked <see cref="HttpMessageHandler"/> responses
 /// intercept all outbound calls.
 /// </summary>
+[Collection(StripeConfigurationCollection.Name)]
 public class StripePaymentProviderTests
 {
     private static StripePaymentProvider Create(StubHttpMessageHandler handler, StripeOptions? opts = null)
@@ -50,9 +51,24 @@ public class StripePaymentProviderTests
     [Fact]
     public void Constructor_SetsStripeConfigurationApiKey()
     {
-        _ = Create(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")),
-                   new StripeOptions { SecretKey = "sk_test_BHENGU_TEST_KEY" });
-        Assert.Equal("sk_test_BHENGU_TEST_KEY", global::Stripe.StripeConfiguration.ApiKey);
+        // StripeConfiguration.ApiKey is process-wide mutable state shared by every Stripe provider
+        // in this assembly. This test is in the StripeConfiguration xunit collection
+        // (DisableParallelization = true), so every other Stripe-constructor-mutating test in that
+        // collection serialises against this one — eliminating the read-modify-read race that made
+        // this test flaky. We still snapshot+restore so we don't leak the fake key into the next
+        // test that happens to run in the same serial slot.
+        var snapshot = global::Stripe.StripeConfiguration.ApiKey;
+        try
+        {
+            const string testKey = "sk_test_BHENGU_TEST_KEY";
+            _ = Create(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")),
+                       new StripeOptions { SecretKey = testKey, WebhookSecret = "whsec_test_fake" });
+            Assert.Equal(testKey, global::Stripe.StripeConfiguration.ApiKey);
+        }
+        finally
+        {
+            global::Stripe.StripeConfiguration.ApiKey = snapshot;
+        }
     }
 
     [Fact]

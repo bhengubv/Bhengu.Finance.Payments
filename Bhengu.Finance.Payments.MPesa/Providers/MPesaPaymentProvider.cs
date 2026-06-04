@@ -11,6 +11,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.MPesa.Configuration;
+using Bhengu.Finance.Payments.MPesa.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -74,10 +75,15 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
             _httpClient.BaseAddress = new Uri(_baseUrl);
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return MPesaObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+    }
 
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+    {
         var phoneNumber = request.PaymentMethodToken;
         if (string.IsNullOrWhiteSpace(phoneNumber))
             throw new PaymentDeclinedException(ProviderName, "missing_phone",
@@ -128,10 +134,15 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
         };
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return MPesaObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+    }
 
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
         if (string.IsNullOrWhiteSpace(_options.InitiatorName) || string.IsNullOrWhiteSpace(_options.SecurityCredential))
             throw new ProviderConfigurationException(ProviderName,
                 $"M-Pesa Transaction Reversal requires {nameof(MPesaOptions.InitiatorName)} and {nameof(MPesaOptions.SecurityCredential)}");
@@ -173,10 +184,15 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
         };
     }
 
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return MPesaObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+    }
 
+    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+    {
         if (string.IsNullOrWhiteSpace(_options.InitiatorName) || string.IsNullOrWhiteSpace(_options.SecurityCredential))
             throw new ProviderConfigurationException(ProviderName,
                 $"M-Pesa B2C requires {nameof(MPesaOptions.InitiatorName)} and {nameof(MPesaOptions.SecurityCredential)}");
@@ -230,6 +246,7 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
     /// M-Pesa does NOT sign webhook payloads. Verification is by callback-URL token comparison.
     /// Pass the token extracted from the URL path as <paramref name="signature"/>.
     /// </summary>
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -238,18 +255,26 @@ public sealed class MPesaPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
         if (string.IsNullOrWhiteSpace(_options.CallbackUrlToken))
         {
             _logger.LogWarning("M-Pesa CallbackUrlToken not configured — webhook source cannot be authenticated.");
+            MPesaObservability.RecordWebhookVerification(false);
             return false;
         }
 
-        return System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
+        var verified = System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
             Encoding.UTF8.GetBytes(signature),
             Encoding.UTF8.GetBytes(_options.CallbackUrlToken));
+        MPesaObservability.RecordWebhookVerification(verified);
+        return verified;
     }
 
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+        return MPesaObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+    }
 
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
+    {
         try
         {
             var envelope = JsonSerializer.Deserialize<MPesaCallbackEnvelope>(payload);

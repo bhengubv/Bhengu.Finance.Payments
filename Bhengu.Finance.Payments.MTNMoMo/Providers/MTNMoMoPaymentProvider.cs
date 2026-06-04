@@ -11,6 +11,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.MTNMoMo.Configuration;
+using Bhengu.Finance.Payments.MTNMoMo.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -73,10 +74,15 @@ public sealed class MTNMoMoPaymentProvider : IPaymentGatewayProvider, IPayoutPro
             _httpClient.BaseAddress = new Uri(_baseUrl);
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return MTNMoMoObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+    }
 
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+    {
         var msisdn = request.PaymentMethodToken;
         if (string.IsNullOrWhiteSpace(msisdn))
             throw new PaymentDeclinedException(ProviderName, "missing_msisdn",
@@ -121,18 +127,25 @@ public sealed class MTNMoMoPaymentProvider : IPaymentGatewayProvider, IPayoutPro
     /// MTN MoMo has no native refund API. Reverse a collection by issuing a new disbursement Transfer in
     /// the opposite direction via <see cref="ProcessPayoutAsync"/>.
     /// </summary>
+    /// <inheritdoc/>
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        throw new BhenguPaymentException(
-            ProviderName,
-            "MTN MoMo has no refund API. To reverse a collection, issue a Disbursement Transfer to the original payer's MSISDN via ProcessPayoutAsync.");
+        return MTNMoMoObservability.ObserveRefundAsync<RefundResponse>(request.GatewayReference, () =>
+            throw new BhenguPaymentException(
+                ProviderName,
+                "MTN MoMo has no refund API. To reverse a collection, issue a Disbursement Transfer to the original payer's MSISDN via ProcessPayoutAsync."));
     }
 
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return MTNMoMoObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+    }
 
+    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+    {
         if (string.IsNullOrWhiteSpace(request.DestinationToken))
             throw new PaymentDeclinedException(ProviderName, "invalid_msisdn",
                 "MTN MoMo Transfer requires the payee MSISDN in PayoutRequest.DestinationToken.");
@@ -176,19 +189,26 @@ public sealed class MTNMoMoPaymentProvider : IPaymentGatewayProvider, IPayoutPro
     /// MoMo does NOT sign webhook payloads. Verification relies on URL secrecy + externalId matching.
     /// Returns false to signal no cryptographic verification is possible.
     /// </summary>
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
         _logger.LogWarning("MTN MoMo callbacks are NOT cryptographically signed. Verify externalId against a known transaction instead.");
+        MTNMoMoObservability.RecordWebhookVerification(false);
         return false;
     }
 
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+        return MTNMoMoObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+    }
 
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
+    {
         try
         {
             var evt = JsonSerializer.Deserialize<MTNMoMoCallback>(payload);

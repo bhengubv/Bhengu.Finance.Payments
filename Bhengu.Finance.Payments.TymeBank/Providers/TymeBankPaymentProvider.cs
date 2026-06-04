@@ -13,6 +13,7 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.TymeBank.Configuration;
+using Bhengu.Finance.Payments.TymeBank.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -70,10 +71,15 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         }
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return TymeBankObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+    }
 
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+    {
         // Mode-switch: "qr" generates a Scan-to-Pay QR; otherwise initiate a pay-by-bank transfer.
         var mode = request.Metadata?.GetValueOrDefault("mode")?.ToLowerInvariant() ?? "instant";
 
@@ -148,10 +154,15 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         };
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return TymeBankObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+    }
 
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
         var requestBody = new
         {
             amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture),
@@ -175,10 +186,15 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         };
     }
 
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return TymeBankObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+    }
 
+    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+    {
         // DestinationToken format: "<bankCode>:<accountNumber>:<beneficiaryName>"
         var parts = request.DestinationToken.Split(':');
         if (parts.Length < 2)
@@ -215,6 +231,7 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         };
     }
 
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -223,9 +240,11 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
             _logger.LogWarning("TymeBank WebhookSecret not configured — signature verification cannot succeed.");
+            TymeBankObservability.RecordWebhookVerification(false);
             return false;
         }
 
+        bool verified;
         try
         {
             using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
@@ -233,21 +252,28 @@ public sealed class TymeBankPaymentProvider : IPaymentGatewayProvider, IPayoutPr
             var supplied = signature.StartsWith("sha256=", StringComparison.OrdinalIgnoreCase)
                 ? signature["sha256=".Length..]
                 : signature;
-            return CryptographicOperations.FixedTimeEquals(
+            verified = CryptographicOperations.FixedTimeEquals(
                 Encoding.UTF8.GetBytes(computed),
                 Encoding.UTF8.GetBytes(supplied.ToLowerInvariant()));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "TymeBank webhook signature verification raised");
-            return false;
+            verified = false;
         }
+        TymeBankObservability.RecordWebhookVerification(verified);
+        return verified;
     }
 
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+        return TymeBankObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+    }
 
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
+    {
         try
         {
             var webhookEvent = JsonSerializer.Deserialize<TymeBankWebhookEvent>(payload);

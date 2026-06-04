@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Validation;
@@ -11,11 +12,13 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace Bhengu.Finance.Payments.EcoCash.Extensions;
 
+/// <summary>DI registration helpers for the EcoCash (Zimbabwe) provider.</summary>
 public static class ServiceCollectionExtensions
 {
     /// <summary>
-    /// Register the EcoCash provider. Reads configuration from <c>Bhengu:Finance:Payments:EcoCash</c>.
-    /// Fails fast at startup if required options (ApiKey, MerchantCode) are missing.
+    /// Register the EcoCash provider (payment + payout). Reads configuration from
+    /// <c>Bhengu:Finance:Payments:EcoCash</c>. Fails fast at startup if required options
+    /// (ApiKey, MerchantCode) are missing.
     /// </summary>
     public static IServiceCollection AddEcoCashPayments(this IServiceCollection services, IConfiguration configuration)
     {
@@ -31,11 +34,19 @@ public static class ServiceCollectionExtensions
         if (string.IsNullOrWhiteSpace(probe.MerchantCode))
             throw new ProviderConfigurationException("ecocash", $"{EcoCashOptions.ConfigSection}:MerchantCode is required");
 
+        services.AddBhenguInMemoryCache();
         services.AddHttpClient<EcoCashPaymentProvider>();
+
         services.AddTransient<IPaymentGatewayProvider, EcoCashPaymentProvider>(sp =>
             sp.GetRequiredService<EcoCashPaymentProvider>());
+        services.AddTransient<IPayoutProvider, EcoCashPaymentProvider>(sp =>
+            sp.GetRequiredService<EcoCashPaymentProvider>());
 
-        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.EcoCash, (sp, _) => sp.GetRequiredService<EcoCashPaymentProvider>());
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.EcoCash,
+            (sp, _) => sp.GetRequiredService<EcoCashPaymentProvider>());
+        services.AddKeyedTransient<IPayoutProvider>(ProviderNames.EcoCash,
+            (sp, _) => sp.GetRequiredService<EcoCashPaymentProvider>());
+
         services.AddBhenguPaymentStartupValidation();
 
         return services;

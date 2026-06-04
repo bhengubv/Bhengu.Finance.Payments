@@ -7,10 +7,14 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Paytm.Configuration;
+using Bhengu.Finance.Payments.Paytm.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -36,25 +40,40 @@ public sealed class PaytmPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
     private readonly HttpClient _httpClient;
     private readonly PaytmOptions _options;
     private readonly ILogger<PaytmPaymentProvider> _logger;
+    private readonly PaytmIdempotencyCache _idempotencyCache;
 
+    /// <inheritdoc />
     public string ProviderName => ProviderNames.Paytm;
 
+    /// <inheritdoc />
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
         ProviderCapabilities.Refund |
         ProviderCapabilities.Payout |
         ProviderCapabilities.Webhook |
+        ProviderCapabilities.TypedWebhooks |
         ProviderCapabilities.RedirectFlow |
-        ProviderCapabilities.Cards;
+        ProviderCapabilities.Cards |
+        ProviderCapabilities.BankTransfer |
+        ProviderCapabilities.MobileMoney |
+        ProviderCapabilities.Tokenisation |
+        ProviderCapabilities.Subscriptions |
+        ProviderCapabilities.Settlement |
+        ProviderCapabilities.QrCode |
+        ProviderCapabilities.Idempotency |
+        ProviderCapabilities.PartialRefund;
 
+    /// <summary>Create a new Paytm provider bound to the supplied HTTP client, options, and (optionally) a distributed cache for client-side idempotency dedupe.</summary>
     public PaytmPaymentProvider(
         HttpClient httpClient,
         IOptions<PaytmOptions> options,
-        ILogger<PaytmPaymentProvider> logger)
+        ILogger<PaytmPaymentProvider> logger,
+        IBhenguDistributedCache? cache = null)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _idempotencyCache = new PaytmIdempotencyCache(cache ?? new InMemoryBhenguDistributedCache());
 
         if (string.IsNullOrWhiteSpace(_options.MerchantId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PaytmOptions.MerchantId)} is required");
@@ -69,13 +88,31 @@ public sealed class PaytmPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
         }
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc />
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
 
+        var currency = string.IsNullOrWhiteSpace(request.Currency) ? _options.Currency : request.Currency.ToUpperInvariant();
+        return _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, async () =>
+        {
+            using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, currency);
+            try
+            {
+                return await ProcessPaymentInnerAsync(request, currency, ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
+                throw;
+            }
+        });
+    }
+
+    private async Task<PaymentResponse> ProcessPaymentInnerAsync(PaymentRequest request, string currency, CancellationToken ct)
+    {
         var orderId = request.Metadata?.GetValueOrDefault("orderId") ?? $"ORDER_{Guid.NewGuid():N}";
         var amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture);
-        var currency = string.IsNullOrWhiteSpace(request.Currency) ? _options.Currency : request.Currency.ToUpperInvariant();
 
         var bodyPayload = new
         {
@@ -132,10 +169,28 @@ public sealed class PaytmPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
         };
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    /// <inheritdoc />
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
 
+        return _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, async () =>
+        {
+            using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
+            try
+            {
+                return await ProcessRefundInnerAsync(request, ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
+                throw;
+            }
+        });
+    }
+
+    private async Task<RefundResponse> ProcessRefundInnerAsync(RefundRequest request, CancellationToken ct)
+    {
         var refId = $"REFUNDID_{Guid.NewGuid():N}";
         var amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture);
 
@@ -184,10 +239,28 @@ public sealed class PaytmPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
         };
     }
 
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    /// <inheritdoc />
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        var currency = string.IsNullOrWhiteSpace(request.Currency) ? _options.Currency : request.Currency.ToUpperInvariant();
+        return _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, async () =>
+        {
+            using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, currency);
+            try
+            {
+                return await ProcessPayoutInnerAsync(request, currency, ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
+                throw;
+            }
+        });
+    }
 
+    private async Task<PayoutResponse> ProcessPayoutInnerAsync(PayoutRequest request, string currency, CancellationToken ct)
+    {
         var orderId = $"PAYOUT_{Guid.NewGuid():N}";
         var amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture);
 
@@ -219,11 +292,12 @@ public sealed class PaytmPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
             GatewayReference = resp?.Body?.TxnId ?? orderId,
             Status = MapStatus(resp?.Body?.ResultInfo?.ResultStatus ?? "pending"),
             Amount = request.Amount,
-            Currency = string.IsNullOrWhiteSpace(request.Currency) ? _options.Currency : request.Currency.ToUpperInvariant(),
+            Currency = currency,
             ProcessedAt = DateTime.UtcNow
         };
     }
 
+    /// <inheritdoc />
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -232,16 +306,22 @@ public sealed class PaytmPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
         if (string.IsNullOrWhiteSpace(_options.MerchantKey))
         {
             _logger.LogWarning("Paytm MerchantKey not configured — signature verification cannot succeed.");
+            BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("valid", false));
             return false;
         }
 
         try
         {
             var computed = ComputeChecksum(payload);
-
-            return CryptographicOperations.FixedTimeEquals(
+            var valid = CryptographicOperations.FixedTimeEquals(
                 Encoding.UTF8.GetBytes(signature),
                 Encoding.UTF8.GetBytes(computed));
+            BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("valid", valid));
+            return valid;
         }
         catch (Exception ex)
         {
@@ -250,31 +330,97 @@ public sealed class PaytmPaymentProvider : IPaymentGatewayProvider, IPayoutProvi
         }
     }
 
+    /// <summary>
+    /// Parse a Paytm webhook payload into a typed <see cref="WebhookEvent"/> sub-record where possible.
+    /// </summary>
+    /// <remarks>
+    /// Paytm S2S callbacks ship two parallel naming schemes (legacy UPPERCASE: ORDERID/STATUS and
+    /// newer camelCase: orderId/status). Both are probed. Status mapping:
+    /// <c>TXN_SUCCESS</c>/<c>success</c>/<c>captured</c> → <see cref="ChargeSucceededEvent"/>,
+    /// <c>TXN_FAILURE</c>/<c>failure</c>/<c>failed</c> → <see cref="ChargeFailedEvent"/>,
+    /// <c>PENDING</c> → <see cref="ChargePendingEvent"/>,
+    /// <c>REFUND_SUCCESS</c>/<c>refunded</c> → <see cref="RefundSucceededEvent"/>.
+    /// </remarks>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
 
+        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
         try
         {
-            // Paytm S2S callbacks ship two parallel naming schemes (legacy UPPERCASE: ORDERID/STATUS
-            // and newer camelCase: orderId/status). We parse via JsonDocument and probe both.
             using var doc = JsonDocument.Parse(payload);
             var root = doc.RootElement;
 
             var orderId = ReadStringProperty(root, "ORDERID") ?? ReadStringProperty(root, "orderId");
             var status = ReadStringProperty(root, "STATUS") ?? ReadStringProperty(root, "status");
+            var txnId = ReadStringProperty(root, "TXNID") ?? ReadStringProperty(root, "txnId");
+            var refundId = ReadStringProperty(root, "REFUNDID") ?? ReadStringProperty(root, "refundId");
+            var amountStr = ReadStringProperty(root, "TXNAMOUNT") ?? ReadStringProperty(root, "txnAmount");
+            var failureCode = ReadStringProperty(root, "RESPCODE") ?? ReadStringProperty(root, "respCode");
+            var failureMessage = ReadStringProperty(root, "RESPMSG") ?? ReadStringProperty(root, "respMsg");
+            var currency = ReadStringProperty(root, "CURRENCY") ?? ReadStringProperty(root, "currency") ?? _options.Currency;
 
             _logger.LogInformation("Parsed Paytm webhook: orderId={OrderId} status={Status}", orderId, status);
 
             if (string.IsNullOrEmpty(orderId))
                 return Task.FromResult<WebhookEvent?>(null);
 
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
+            var amount = decimal.TryParse(amountStr, NumberStyles.Number, CultureInfo.InvariantCulture, out var a) ? a : 0m;
+            var normalised = status?.ToLowerInvariant() ?? "unknown";
+
+            WebhookEvent? typed = normalised switch
             {
-                GatewayReference = orderId,
-                Status = MapStatus(status ?? "pending"),
-                EventType = $"paytm.{status?.ToLowerInvariant() ?? "unknown"}"
-            });
+                "txn_success" or "success" or "completed" or "captured" or "s" => new ChargeSucceededEvent
+                {
+                    GatewayReference = orderId,
+                    Status = PaymentStatus.Completed,
+                    EventType = $"paytm.{normalised}",
+                    Category = WebhookEventCategory.ChargeSucceeded,
+                    Amount = amount,
+                    Currency = currency,
+                    PaymentMethodToken = txnId
+                },
+                "txn_failure" or "failure" or "failed" or "f" => new ChargeFailedEvent
+                {
+                    GatewayReference = orderId,
+                    Status = PaymentStatus.Failed,
+                    EventType = $"paytm.{normalised}",
+                    Category = WebhookEventCategory.ChargeFailed,
+                    Amount = amount,
+                    Currency = currency,
+                    FailureCode = failureCode,
+                    FailureMessage = failureMessage
+                },
+                "txn_pending" or "pending" or "p" or "initiated" => new ChargePendingEvent
+                {
+                    GatewayReference = orderId,
+                    Status = PaymentStatus.Pending,
+                    EventType = $"paytm.{normalised}",
+                    Category = WebhookEventCategory.ChargePending,
+                    Amount = amount,
+                    Currency = currency
+                },
+                "refund_success" or "refunded" => new RefundSucceededEvent
+                {
+                    GatewayReference = orderId,
+                    Status = PaymentStatus.Refunded,
+                    EventType = $"paytm.{normalised}",
+                    Category = WebhookEventCategory.RefundSucceeded,
+                    RefundReference = refundId ?? orderId,
+                    Amount = amount,
+                    Currency = currency,
+                    IsPartial = false
+                },
+                _ => new WebhookEvent
+                {
+                    GatewayReference = orderId,
+                    Status = MapStatus(status ?? "pending"),
+                    EventType = $"paytm.{normalised}"
+                }
+            };
+
+            activity?.SetTag("payment.gateway_reference", orderId);
+            return Task.FromResult<WebhookEvent?>(typed);
         }
         catch (Exception ex)
         {

@@ -3,9 +3,12 @@
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Mukuru.Configuration;
+using Bhengu.Finance.Payments.Mukuru.Internals;
 using Bhengu.Finance.Payments.Mukuru.Providers;
 using Bhengu.Finance.Payments.Tests.TestHelpers;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -29,7 +32,8 @@ public class MukuruPaymentProviderTests
             CallbackUrl = "https://example.com/mukuru-callback"
         };
         var http = new HttpClient(handler);
-        return new MukuruPaymentProvider(http, Options.Create(opts), NullLogger<MukuruPaymentProvider>.Instance);
+        return new MukuruPaymentProvider(http, Options.Create(opts), NullLogger<MukuruPaymentProvider>.Instance,
+            new MukuruIdempotencyCache(new InMemoryBhenguDistributedCache()));
     }
 
     private static StubHttpMessageHandler HandlerWithTokenAnd(
@@ -54,7 +58,8 @@ public class MukuruPaymentProviderTests
         var http = new HttpClient(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
         Assert.Throws<ProviderConfigurationException>(() =>
             new MukuruPaymentProvider(http, Options.Create(new MukuruOptions { ClientSecret = "x" }),
-                NullLogger<MukuruPaymentProvider>.Instance));
+                NullLogger<MukuruPaymentProvider>.Instance,
+                new MukuruIdempotencyCache(new InMemoryBhenguDistributedCache())));
     }
 
     [Fact]
@@ -63,7 +68,8 @@ public class MukuruPaymentProviderTests
         var http = new HttpClient(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
         Assert.Throws<ProviderConfigurationException>(() =>
             new MukuruPaymentProvider(http, Options.Create(new MukuruOptions { ClientId = "x" }),
-                NullLogger<MukuruPaymentProvider>.Instance));
+                NullLogger<MukuruPaymentProvider>.Instance,
+                new MukuruIdempotencyCache(new InMemoryBhenguDistributedCache())));
     }
 
     [Fact]
@@ -71,6 +77,19 @@ public class MukuruPaymentProviderTests
     {
         var provider = Create(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
         Assert.Equal("mukuru", provider.ProviderName);
+    }
+
+    [Fact]
+    public void Capabilities_IncludeMandatesAndTypedWebhooks()
+    {
+        var provider = Create(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
+        Assert.True(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.Mandates));
+        Assert.True(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.TypedWebhooks));
+        Assert.True(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.Idempotency));
+        Assert.True(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.Payout));
+        Assert.True(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.CrossBorder));
+        Assert.False(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.ThreeDSecure));
+        Assert.False(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.Tokenisation));
     }
 
     [Fact]
@@ -121,6 +140,23 @@ public class MukuruPaymentProviderTests
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("net"));
         var provider = Create(handler);
         await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.ProcessPaymentAsync(SamplePayment()));
+    }
+
+    [Fact]
+    public async Task ProcessPaymentAsync_DedupesOnSameIdempotencyKey()
+    {
+        var calls = 0;
+        var handler = HandlerWithTokenAnd(_ =>
+        {
+            calls++;
+            return StubHttpMessageHandler.Json(HttpStatusCode.OK,
+                $$"""{"transaction_id":"topup_{{calls}}","status":"completed"}""");
+        });
+        var provider = Create(handler);
+        var r1 = await provider.ProcessPaymentAsync(SamplePayment() with { IdempotencyKey = "k1" });
+        var r2 = await provider.ProcessPaymentAsync(SamplePayment() with { IdempotencyKey = "k1" });
+        Assert.Equal(r1.GatewayReference, r2.GatewayReference);
+        Assert.Equal(1, calls);
     }
 
     [Fact]
@@ -213,15 +249,29 @@ public class MukuruPaymentProviderTests
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsEvent_ForTransactionCompleted()
+    public async Task ParseWebhookAsync_ReturnsTypedPayoutCompleted_ForTransactionCompleted()
     {
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
         var evt = await provider.ParseWebhookAsync("""
-            {"event_type":"transaction.completed","data":{"transaction_id":"tx_42","status":"collected"}}
+            {"event_type":"transaction.completed","data":{"transaction_id":"tx_42","status":"collected","amount":"1500.00","currency":"USD","destination":"ZW:CASH:"}}
             """);
         Assert.NotNull(evt);
-        Assert.Equal("tx_42", evt!.GatewayReference);
-        Assert.Equal(PaymentStatus.Completed, evt.Status);
+        var typed = Assert.IsType<PayoutCompletedEvent>(evt);
+        Assert.Equal("tx_42", typed.GatewayReference);
+        Assert.Equal(WebhookEventCategory.PayoutCompleted, typed.Category);
+        Assert.Equal("ZW:CASH:", typed.DestinationToken);
+    }
+
+    [Fact]
+    public async Task ParseWebhookAsync_ReturnsTypedMandateActivated()
+    {
+        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+        var evt = await provider.ParseWebhookAsync("""
+            {"event_type":"mandate.activated","data":{"transaction_id":"man_1","amount":"5000.00","currency":"ZAR"}}
+            """);
+        Assert.NotNull(evt);
+        var typed = Assert.IsType<MandateActivatedEvent>(evt);
+        Assert.Equal("man_1", typed.MandateReference);
     }
 
     [Fact]

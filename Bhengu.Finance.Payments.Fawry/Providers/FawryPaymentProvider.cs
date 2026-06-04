@@ -10,7 +10,10 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Fawry.Configuration;
+using Bhengu.Finance.Payments.Fawry.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -30,24 +33,35 @@ public sealed class FawryPaymentProvider : IPaymentGatewayProvider
     private readonly HttpClient _httpClient;
     private readonly FawryOptions _options;
     private readonly ILogger<FawryPaymentProvider> _logger;
+    private readonly FawryIdempotencyCache? _idempotency;
 
+    /// <inheritdoc />
     public string ProviderName => ProviderNames.Fawry;
 
+    /// <inheritdoc />
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
         ProviderCapabilities.Refund |
+        ProviderCapabilities.PartialRefund |
         ProviderCapabilities.Webhook |
         ProviderCapabilities.RedirectFlow |
-        ProviderCapabilities.Cards;
+        ProviderCapabilities.Cards |
+        ProviderCapabilities.MobileMoney |
+        ProviderCapabilities.Settlement |
+        ProviderCapabilities.Idempotency |
+        ProviderCapabilities.TypedWebhooks;
 
+    /// <summary>Construct the provider. Designed to be registered via DI.</summary>
     public FawryPaymentProvider(
         HttpClient httpClient,
         IOptions<FawryOptions> options,
-        ILogger<FawryPaymentProvider> logger)
+        ILogger<FawryPaymentProvider> logger,
+        FawryIdempotencyCache? idempotency = null)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _idempotency = idempotency;
 
         if (string.IsNullOrWhiteSpace(_options.MerchantCode))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(FawryOptions.MerchantCode)} is required");
@@ -63,108 +77,171 @@ public sealed class FawryPaymentProvider : IPaymentGatewayProvider
         }
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc />
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        var merchantRefNum = request.Metadata?.GetValueOrDefault("merchantRefNum")
-            ?? $"fawry-{Guid.NewGuid():N}";
-        var customerProfileId = request.Metadata?.GetValueOrDefault("customerProfileId") ?? string.Empty;
-        var customerName = request.Metadata?.GetValueOrDefault("customerName") ?? string.Empty;
-        var customerMobile = request.Metadata?.GetValueOrDefault("customerMobile") ?? string.Empty;
-        var customerEmail = request.Metadata?.GetValueOrDefault("customerEmail") ?? string.Empty;
-        var paymentMethod = request.Metadata?.GetValueOrDefault("paymentMethod") ?? _options.DefaultPaymentMethod;
-        var amount = request.Amount.ToString("0.00", CultureInfo.InvariantCulture);
-
-        var signature = ComputeChargeSignature(
-            _options.MerchantCode, merchantRefNum, customerProfileId, paymentMethod, amount, _options.SecurityKey);
-
-        var requestBody = new
-        {
-            merchantCode = _options.MerchantCode,
-            merchantRefNum,
-            customerName,
-            customerMobile,
-            customerEmail,
-            customerProfileId,
-            paymentMethod,
-            amount,
-            currencyCode = request.Currency.ToUpperInvariant(),
-            description = request.Description,
-            returnUrl = _options.ReturnUrl,
-            chargeItems = Array.Empty<object>(),
-            signature
-        };
-
-        var body = await SendAsync(HttpMethod.Post, "payments/charge", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
-        var fawryResponse = JsonSerializer.Deserialize<FawryChargeResponse>(body);
-
-        _logger.LogInformation("Fawry charge created: ref={Ref} status={Status} code={Code}",
-            fawryResponse?.ReferenceNumber, fawryResponse?.OrderStatus, fawryResponse?.StatusCode);
-
-        // Fawry returns "12000" in statusCode for accepted requests; the actual payment state
-        // lives in orderStatus and arrives asynchronously by webhook for PAYATFAWRY/MWALLET flows.
-        var gatewayRef = fawryResponse?.ReferenceNumber
-            ?? fawryResponse?.MerchantRefNumber
-            ?? merchantRefNum;
-
-        return new PaymentResponse
-        {
-            GatewayReference = gatewayRef,
-            Status = MapStatus(fawryResponse?.OrderStatus, fawryResponse?.StatusCode),
-            Amount = request.Amount,
-            Currency = request.Currency,
-            ProcessedAt = DateTime.UtcNow,
-            Message = fawryResponse?.StatusDescription ?? fawryResponse?.OrderStatus
-        };
+        return _idempotency is null
+            ? ProcessPaymentCoreAsync(request, ct)
+            : _idempotency.GetOrAddAsync(request.IdempotencyKey, "charge",
+                () => ProcessPaymentCoreAsync(request, ct), ct);
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+    {
+        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
+        try
+        {
+            var merchantRefNum = request.Metadata?.GetValueOrDefault("merchantRefNum")
+                ?? request.IdempotencyKey
+                ?? $"fawry-{Guid.NewGuid():N}";
+            var customerProfileId = request.Metadata?.GetValueOrDefault("customerProfileId") ?? string.Empty;
+            var customerName = request.Metadata?.GetValueOrDefault("customerName") ?? string.Empty;
+            var customerMobile = request.Metadata?.GetValueOrDefault("customerMobile") ?? string.Empty;
+            var customerEmail = request.Metadata?.GetValueOrDefault("customerEmail") ?? string.Empty;
+            var paymentMethod = request.Metadata?.GetValueOrDefault("paymentMethod") ?? _options.DefaultPaymentMethod;
+            var amount = request.Amount.ToString("0.00", CultureInfo.InvariantCulture);
+
+            var signature = ComputeChargeSignature(
+                _options.MerchantCode, merchantRefNum, customerProfileId, paymentMethod, amount, _options.SecurityKey);
+
+            var requestBody = new
+            {
+                merchantCode = _options.MerchantCode,
+                merchantRefNum,
+                customerName,
+                customerMobile,
+                customerEmail,
+                customerProfileId,
+                paymentMethod,
+                amount,
+                currencyCode = request.Currency.ToUpperInvariant(),
+                description = request.Description,
+                returnUrl = _options.ReturnUrl,
+                chargeItems = Array.Empty<object>(),
+                signature
+            };
+
+            var body = await SendAsync(HttpMethod.Post, "payments/charge", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
+            var fawryResponse = JsonSerializer.Deserialize<FawryChargeResponse>(body);
+
+            _logger.LogInformation("Fawry charge created: ref={Ref} status={Status} code={Code}",
+                fawryResponse?.ReferenceNumber, fawryResponse?.OrderStatus, fawryResponse?.StatusCode);
+
+            var gatewayRef = fawryResponse?.ReferenceNumber
+                ?? fawryResponse?.MerchantRefNumber
+                ?? merchantRefNum;
+            var status = MapStatus(fawryResponse?.OrderStatus, fawryResponse?.StatusCode);
+            outcome = status switch
+            {
+                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
+                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
+                _ => BhenguPaymentDiagnostics.Outcomes.Declined
+            };
+
+            return new PaymentResponse
+            {
+                GatewayReference = gatewayRef,
+                Status = status,
+                Amount = request.Amount,
+                Currency = request.Currency,
+                ProcessedAt = DateTime.UtcNow,
+                Message = fawryResponse?.StatusDescription ?? fawryResponse?.OrderStatus
+            };
+        }
+        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
+        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
+        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
+        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
+        finally
+        {
+            activity?.SetOutcome(outcome);
+            sw.Stop();
+            BhenguPaymentDiagnostics.ChargesTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
+            BhenguPaymentDiagnostics.ChargeDurationMs.Record(sw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
+        }
+    }
+
+    /// <inheritdoc />
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        var refundAmount = request.Amount.ToString("0.00", CultureInfo.InvariantCulture);
-        var signature = ComputeRefundSignature(
-            _options.MerchantCode, request.GatewayReference, refundAmount, request.Reason, _options.SecurityKey);
-
-        var requestBody = new
-        {
-            merchantCode = _options.MerchantCode,
-            referenceNumber = request.GatewayReference,
-            refundAmount,
-            reason = request.Reason,
-            signature
-        };
-
-        var body = await SendAsync(HttpMethod.Post, "payments/refund", requestBody, ct, "ProcessRefund").ConfigureAwait(false);
-        var refundResponse = JsonSerializer.Deserialize<FawryRefundResponse>(body);
-
-        _logger.LogInformation("Fawry refund created for ref={Ref} status={Status}",
-            request.GatewayReference, refundResponse?.StatusCode);
-
-        return new RefundResponse
-        {
-            GatewayReference = request.GatewayReference,
-            Amount = request.Amount,
-            Status = MapRefundStatus(refundResponse?.StatusCode),
-            ProcessedAt = DateTime.UtcNow,
-            Message = refundResponse?.StatusDescription
-        };
+        return _idempotency is null
+            ? ProcessRefundCoreAsync(request, ct)
+            : _idempotency.GetOrAddAsync(request.IdempotencyKey, "refund",
+                () => ProcessRefundCoreAsync(request, ct), ct);
     }
 
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
+        using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
+        var outcome = BhenguPaymentDiagnostics.Outcomes.Pending;
+        try
+        {
+            var refundAmount = request.Amount.ToString("0.00", CultureInfo.InvariantCulture);
+            var signature = ComputeRefundSignature(
+                _options.MerchantCode, request.GatewayReference, refundAmount, request.Reason, _options.SecurityKey);
+
+            var requestBody = new
+            {
+                merchantCode = _options.MerchantCode,
+                referenceNumber = request.GatewayReference,
+                refundAmount,
+                reason = request.Reason,
+                signature
+            };
+
+            var body = await SendAsync(HttpMethod.Post, "payments/refund", requestBody, ct, "ProcessRefund").ConfigureAwait(false);
+            var refundResponse = JsonSerializer.Deserialize<FawryRefundResponse>(body);
+
+            _logger.LogInformation("Fawry refund created for ref={Ref} status={Status}",
+                request.GatewayReference, refundResponse?.StatusCode);
+
+            var status = MapRefundStatus(refundResponse?.StatusCode);
+            outcome = status switch
+            {
+                PaymentStatus.Refunded or PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
+                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
+                _ => BhenguPaymentDiagnostics.Outcomes.Declined
+            };
+
+            return new RefundResponse
+            {
+                GatewayReference = request.GatewayReference,
+                Amount = request.Amount,
+                Status = status,
+                ProcessedAt = DateTime.UtcNow,
+                Message = refundResponse?.StatusDescription
+            };
+        }
+        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
+        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
+        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
+        catch (Exception) { outcome = BhenguPaymentDiagnostics.Outcomes.Error; throw; }
+        finally
+        {
+            activity?.SetOutcome(outcome);
+            BhenguPaymentDiagnostics.RefundsTotal.Add(1, new KeyValuePair<string, object?>("provider", ProviderName), new KeyValuePair<string, object?>("outcome", outcome));
+        }
+    }
+
+    /// <inheritdoc />
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        if (string.IsNullOrWhiteSpace(_options.SecurityKey))
-        {
-            _logger.LogWarning("Fawry SecurityKey not configured — webhook signature verification cannot succeed.");
-            return false;
-        }
-
+        var valid = false;
         try
         {
+            if (string.IsNullOrWhiteSpace(_options.SecurityKey))
+            {
+                _logger.LogWarning("Fawry SecurityKey not configured — webhook signature verification cannot succeed.");
+                return false;
+            }
+
             // Fawry concatenates webhook fields in a documented order then SHA-256 hex-lowercase.
             // The caller is responsible for supplying the already-concatenated payload that matches
             // Fawry's notification spec: fawryRefNumber + merchantRefNum + paymentAmount + orderAmount +
@@ -173,21 +250,30 @@ public sealed class FawryPaymentProvider : IPaymentGatewayProvider
             var canonical = payload + _options.SecurityKey;
             var computed = Sha256Hex(canonical);
 
-            return CryptographicOperations.FixedTimeEquals(
+            valid = CryptographicOperations.FixedTimeEquals(
                 Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
                 Encoding.UTF8.GetBytes(computed));
+            return valid;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Fawry webhook signature verification raised");
             return false;
         }
+        finally
+        {
+            BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("valid", valid));
+        }
     }
 
+    /// <inheritdoc />
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
 
+        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
         try
         {
             var notification = JsonSerializer.Deserialize<FawryNotification>(payload);
@@ -196,38 +282,108 @@ public sealed class FawryPaymentProvider : IPaymentGatewayProvider
             _logger.LogInformation("Parsed Fawry notification: status={Status} ref={Ref}",
                 notification.OrderStatus, notification.FawryRefNumber);
 
-            var status = notification.OrderStatus?.ToUpperInvariant() switch
-            {
-                "NEW" or "PENDING" => PaymentStatus.Pending,
-                "PAID" => PaymentStatus.Completed,
-                "DELIVERED" => PaymentStatus.Completed,
-                "REFUNDED" => PaymentStatus.Refunded,
-                "EXPIRED" => PaymentStatus.Failed,
-                "CANCELED" or "CANCELLED" => PaymentStatus.Cancelled,
-                "FAILED" => PaymentStatus.Failed,
-                _ => (PaymentStatus?)null
-            };
-
-            if (status is null)
-                return Task.FromResult<WebhookEvent?>(null);
-
-            var gatewayRef = notification.FawryRefNumber
-                ?? notification.MerchantRefNumber
-                ?? notification.ReferenceNumber;
-            if (string.IsNullOrEmpty(gatewayRef))
-                return Task.FromResult<WebhookEvent?>(null);
-
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
-            {
-                GatewayReference = gatewayRef,
-                Status = status.Value,
-                EventType = notification.OrderStatus
-            });
+            return Task.FromResult(MapWebhookEvent(notification));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to parse Fawry notification");
             return Task.FromResult<WebhookEvent?>(null);
+        }
+    }
+
+    private static WebhookEvent? MapWebhookEvent(FawryNotification n)
+    {
+        var rawReference = n.FawryRefNumber ?? n.MerchantRefNumber ?? n.ReferenceNumber;
+        if (string.IsNullOrEmpty(rawReference)) return null;
+
+        var amount = decimal.TryParse(n.PaymentAmount, NumberStyles.Any, CultureInfo.InvariantCulture, out var a)
+            ? a
+            : (decimal.TryParse(n.OrderAmount, NumberStyles.Any, CultureInfo.InvariantCulture, out var oa) ? oa : 0m);
+        var currency = n.Currency ?? "EGP";
+
+        switch (n.OrderStatus?.ToUpperInvariant())
+        {
+            case "PAID":
+            case "DELIVERED":
+                return new ChargeSucceededEvent
+                {
+                    GatewayReference = rawReference,
+                    Status = PaymentStatus.Completed,
+                    EventType = n.OrderStatus,
+                    Category = WebhookEventCategory.ChargeSucceeded,
+                    Amount = amount,
+                    Currency = currency,
+                    CustomerId = n.CustomerProfileId,
+                    PaymentMethodToken = n.PaymentMethod
+                };
+
+            case "NEW":
+            case "PENDING":
+                return new ChargePendingEvent
+                {
+                    GatewayReference = rawReference,
+                    Status = PaymentStatus.Pending,
+                    EventType = n.OrderStatus,
+                    Category = WebhookEventCategory.ChargePending,
+                    Amount = amount,
+                    Currency = currency
+                };
+
+            case "EXPIRED":
+            case "FAILED":
+                return new ChargeFailedEvent
+                {
+                    GatewayReference = rawReference,
+                    Status = PaymentStatus.Failed,
+                    EventType = n.OrderStatus,
+                    Category = WebhookEventCategory.ChargeFailed,
+                    Amount = amount,
+                    Currency = currency,
+                    FailureCode = n.FailureErrorCode,
+                    FailureMessage = n.FailureReason
+                };
+
+            case "REFUNDED":
+                return new RefundSucceededEvent
+                {
+                    GatewayReference = rawReference,
+                    Status = PaymentStatus.Refunded,
+                    EventType = n.OrderStatus,
+                    Category = WebhookEventCategory.RefundSucceeded,
+                    RefundReference = n.RefundReference ?? rawReference,
+                    Amount = amount,
+                    Currency = currency,
+                    IsPartial = false
+                };
+
+            case "REFUND_FAILED":
+                return new RefundFailedEvent
+                {
+                    GatewayReference = rawReference,
+                    Status = PaymentStatus.Failed,
+                    EventType = n.OrderStatus,
+                    Category = WebhookEventCategory.RefundFailed,
+                    Amount = amount,
+                    Currency = currency,
+                    FailureCode = n.FailureErrorCode,
+                    FailureMessage = n.FailureReason
+                };
+
+            case "SETTLED":
+            case "SETTLEMENT_COMPLETED":
+                return new SettlementCompletedEvent
+                {
+                    GatewayReference = rawReference,
+                    Status = PaymentStatus.Completed,
+                    EventType = n.OrderStatus,
+                    Category = WebhookEventCategory.SettlementCompleted,
+                    SettlementReference = rawReference,
+                    NetAmount = amount,
+                    Currency = currency
+                };
+
+            default:
+                return null;
         }
     }
 
@@ -261,7 +417,7 @@ public sealed class FawryPaymentProvider : IPaymentGatewayProvider
         {
             _logger.LogError("Fawry {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
-                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
+                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
         }
 
@@ -337,6 +493,12 @@ public sealed class FawryPaymentProvider : IPaymentGatewayProvider
         [JsonPropertyName("referenceNumber")] public string? ReferenceNumber { get; set; }
         [JsonPropertyName("orderStatus")] public string? OrderStatus { get; set; }
         [JsonPropertyName("paymentAmount")] public string? PaymentAmount { get; set; }
+        [JsonPropertyName("orderAmount")] public string? OrderAmount { get; set; }
         [JsonPropertyName("paymentMethod")] public string? PaymentMethod { get; set; }
+        [JsonPropertyName("currencyCode")] public string? Currency { get; set; }
+        [JsonPropertyName("customerProfileId")] public string? CustomerProfileId { get; set; }
+        [JsonPropertyName("failureErrorCode")] public string? FailureErrorCode { get; set; }
+        [JsonPropertyName("failureReason")] public string? FailureReason { get; set; }
+        [JsonPropertyName("refundReference")] public string? RefundReference { get; set; }
     }
 }

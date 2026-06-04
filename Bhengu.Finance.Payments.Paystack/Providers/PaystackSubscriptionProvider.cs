@@ -55,7 +55,8 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
     public Task<Plan> CreatePlanAsync(PlanRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreatePlanCoreAsync(request, ct));
+        return PaystackObservability.ObserveAsync("create_plan", () =>
+            _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreatePlanCoreAsync(request, ct)));
     }
 
     private async Task<Plan> CreatePlanCoreAsync(PlanRequest request, CancellationToken ct)
@@ -80,9 +81,14 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
     }
 
     /// <inheritdoc/>
-    public async Task<Plan?> GetPlanAsync(string planReference, CancellationToken ct = default)
+    public Task<Plan?> GetPlanAsync(string planReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(planReference);
+        return PaystackObservability.ObserveAsync("get_plan", () => GetPlanCoreAsync(planReference, ct));
+    }
+
+    private async Task<Plan?> GetPlanCoreAsync(string planReference, CancellationToken ct)
+    {
         try
         {
             var responseBody = await PaystackHttpClient.SendAsync(
@@ -100,7 +106,8 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
     public Task<Subscription> CreateSubscriptionAsync(SubscriptionRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreateSubscriptionCoreAsync(request, ct));
+        return PaystackObservability.ObserveAsync("create_subscription", () =>
+            _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreateSubscriptionCoreAsync(request, ct)));
     }
 
     private async Task<Subscription> CreateSubscriptionCoreAsync(SubscriptionRequest request, CancellationToken ct)
@@ -123,9 +130,14 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
     }
 
     /// <inheritdoc/>
-    public async Task<Subscription?> GetSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
+    public Task<Subscription?> GetSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
+        return PaystackObservability.ObserveAsync("get_subscription", () => GetSubscriptionCoreAsync(subscriptionReference, ct));
+    }
+
+    private async Task<Subscription?> GetSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
+    {
         try
         {
             var responseBody = await PaystackHttpClient.SendAsync(
@@ -140,9 +152,14 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
     }
 
     /// <inheritdoc/>
-    public async Task<Subscription> CancelSubscriptionAsync(string subscriptionReference, bool immediately = false, CancellationToken ct = default)
+    public Task<Subscription> CancelSubscriptionAsync(string subscriptionReference, bool immediately = false, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
+        return PaystackObservability.ObserveAsync("cancel_subscription", () => CancelSubscriptionCoreAsync(subscriptionReference, immediately, ct));
+    }
+
+    private async Task<Subscription> CancelSubscriptionCoreAsync(string subscriptionReference, bool immediately, CancellationToken ct)
+    {
         // Paystack requires both `code` and `token` for disable. The token is emailed to the merchant
         // and must round-trip back via the Disable endpoint. Callers must pre-fetch and pass the token
         // via subscription metadata; if missing, we still report the request was sent.
@@ -178,11 +195,16 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
     }
 
     /// <inheritdoc/>
-    public async Task<Subscription> PauseSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
+    public Task<Subscription> PauseSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
+        return PaystackObservability.ObserveAsync("pause_subscription", () => PauseSubscriptionCoreAsync(subscriptionReference, ct));
+    }
+
+    private async Task<Subscription> PauseSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
     {
         // Paystack treats pause as identical to disable in their API; the difference is intent. Surface
         // a clear status of Paused so callers do not lose the distinction.
-        ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
         var existing = await GetSubscriptionAsync(subscriptionReference, ct).ConfigureAwait(false)
             ?? throw new BhenguPaymentException(ProviderName, $"Subscription {subscriptionReference} not found", "subscription_not_found");
 
@@ -202,9 +224,14 @@ public sealed class PaystackSubscriptionProvider : ISubscriptionProvider
     }
 
     /// <inheritdoc/>
-    public async Task<Subscription> ResumeSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
+    public Task<Subscription> ResumeSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
+        return PaystackObservability.ObserveAsync("resume_subscription", () => ResumeSubscriptionCoreAsync(subscriptionReference, ct));
+    }
+
+    private async Task<Subscription> ResumeSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
+    {
         var existing = await GetSubscriptionAsync(subscriptionReference, ct).ConfigureAwait(false)
             ?? throw new BhenguPaymentException(ProviderName, $"Subscription {subscriptionReference} not found", "subscription_not_found");
 

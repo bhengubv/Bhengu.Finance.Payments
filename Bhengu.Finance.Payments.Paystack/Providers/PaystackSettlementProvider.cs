@@ -45,7 +45,10 @@ public sealed class PaystackSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+    public Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+        => PaystackObservability.ObserveAsync("list_settlements", () => ListSettlementsCoreAsync(fromUtc, toUtc, ct));
+
+    private async Task<IReadOnlyList<Settlement>> ListSettlementsCoreAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct)
     {
         var qs = new StringBuilder("settlement?perPage=100")
             .Append("&from=").Append(Uri.EscapeDataString(fromUtc.ToString("o", CultureInfo.InvariantCulture)))
@@ -62,9 +65,14 @@ public sealed class PaystackSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
+    public Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
+        return PaystackObservability.ObserveAsync("get_settlement", () => GetSettlementCoreAsync(settlementReference, ct));
+    }
+
+    private async Task<Settlement?> GetSettlementCoreAsync(string settlementReference, CancellationToken ct)
+    {
         try
         {
             var responseBody = await PaystackHttpClient.SendAsync(
@@ -79,9 +87,14 @@ public sealed class PaystackSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
+    public Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
+        return PaystackObservability.ObserveAsync("list_settlement_transactions", () => ListTransactionsCoreAsync(settlementReference, ct));
+    }
+
+    private async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsCoreAsync(string settlementReference, CancellationToken ct)
+    {
         var responseBody = await PaystackHttpClient.SendAsync(
             _httpClient, _logger, HttpMethod.Get, $"settlement/{Uri.EscapeDataString(settlementReference)}/transactions?perPage=100", null, "ListSettlementTransactions", ct).ConfigureAwait(false);
         var response = JsonSerializer.Deserialize<PaystackSettlementTransactionListResponse>(responseBody, PaystackHttpClient.Json);

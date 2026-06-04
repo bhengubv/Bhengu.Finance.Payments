@@ -230,4 +230,50 @@ public class BricsPayPaymentProviderTests
         var provider = CreateProvider(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
         Assert.Null(await provider.ParseWebhookAsync("not json"));
     }
+
+    [Fact]
+    public async Task ParseWebhookAsync_ReturnsTypedChargeSucceededEvent()
+    {
+        var provider = CreateProvider(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+        var evt = await provider.ParseWebhookAsync("""
+            {"EventType":"payment.completed","PaymentId":"BRICS-99","Status":"completed","Amount":100,"Currency":"ZAR"}
+            """);
+        var typed = Assert.IsType<Bhengu.Finance.Payments.Core.Models.Webhooks.ChargeSucceededEvent>(evt);
+        Assert.Equal(Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.ChargeSucceeded, typed.Category);
+        Assert.Equal(100m, typed.Amount);
+    }
+
+    [Fact]
+    public async Task ProcessPaymentAsync_DedupesViaIdempotencyKey()
+    {
+        var calls = 0;
+        var handler = new StubHttpMessageHandler((_, _) =>
+        {
+            calls++;
+            return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
+                {"PaymentId":"BRICS-PAY-1","Status":"completed"}
+                """);
+        });
+        var cache = new Bhengu.Finance.Payments.Core.Caching.InMemoryBhenguDistributedCache();
+        var http = new HttpClient(handler);
+        var opts = Options.Create(new BricsPayOptions
+        {
+            MerchantId = "BRICS_TEST",
+            SecretKey = "secret",
+            UseSandbox = true
+        });
+        var provider = new BricsPayPaymentProvider(http, opts, new Mock<ICurrencyExchangeService>().Object, NullLogger<BricsPayPaymentProvider>.Instance, cache);
+        var req = new PaymentRequest
+        {
+            PaymentMethodToken = "token",
+            Amount = 100m,
+            Currency = "ZAR",
+            Description = "test",
+            IdempotencyKey = "idem-1"
+        };
+        var first = await provider.ProcessPaymentAsync(req);
+        var second = await provider.ProcessPaymentAsync(req);
+        Assert.Equal(first.GatewayReference, second.GatewayReference);
+        Assert.Equal(1, calls);
+    }
 }

@@ -1,8 +1,10 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Net;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.DPO.Configuration;
 using Bhengu.Finance.Payments.DPO.Providers;
 using Bhengu.Finance.Payments.Tests.TestHelpers;
@@ -14,7 +16,7 @@ namespace Bhengu.Finance.Payments.Tests.DPO;
 
 public class DPOPaymentProviderTests
 {
-    private static DPOPaymentProvider Create(StubHttpMessageHandler handler, DPOOptions? opts = null)
+    private static DPOPaymentProvider Create(StubHttpMessageHandler handler, DPOOptions? opts = null, IBhenguDistributedCache? cache = null)
     {
         opts ??= new DPOOptions
         {
@@ -26,7 +28,7 @@ public class DPOPaymentProviderTests
             UseSandbox = true
         };
         var http = new HttpClient(handler);
-        return new DPOPaymentProvider(http, Options.Create(opts), NullLogger<DPOPaymentProvider>.Instance);
+        return new DPOPaymentProvider(http, Options.Create(opts), NullLogger<DPOPaymentProvider>.Instance, cache);
     }
 
     private static PaymentRequest SamplePayment() => new()
@@ -192,5 +194,83 @@ public class DPOPaymentProviderTests
     {
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
         Assert.Null(await provider.ParseWebhookAsync("not json"));
+    }
+
+    [Fact]
+    public async Task ParseWebhookAsync_ReturnsTypedChargeSucceededEvent_ForPaid()
+    {
+        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+        var evt = await provider.ParseWebhookAsync("""
+            {"TransID":"100","TransactionToken":"tt-99","TransactionFinalStatus":"Paid","TransactionAmount":"150","TransactionCurrency":"USD","CustomerEmail":"a@b.com","CCDapproval":"ABC123"}
+            """);
+        var typed = Assert.IsType<ChargeSucceededEvent>(evt);
+        Assert.Equal(WebhookEventCategory.ChargeSucceeded, typed.Category);
+        Assert.Equal(150m, typed.Amount);
+    }
+
+    [Fact]
+    public async Task ProcessPayoutAsync_ReturnsPendingResponse_OnSuccess()
+    {
+        var handler = new StubHttpMessageHandler((req, _) =>
+        {
+            Assert.Equal(HttpMethod.Post, req.Method);
+            return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
+                {"Result":"000","TransferToken":"XF-1","ResultExplanation":"queued"}
+                """);
+        });
+        var provider = Create(handler);
+        var payout = await provider.ProcessPayoutAsync(new PayoutRequest
+        {
+            DestinationToken = "1234567890",
+            Amount = 250m,
+            Currency = "USD",
+            Description = "Vendor payout"
+        });
+
+        Assert.Equal("XF-1", payout.GatewayReference);
+        Assert.Equal(PaymentStatus.Pending, payout.Status);
+    }
+
+    [Fact]
+    public async Task ProcessPayoutAsync_ThrowsPaymentDeclined_OnNonZeroResultCode()
+    {
+        var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, """
+            {"Result":"802","ResultExplanation":"Insufficient funds"}
+            """));
+        var provider = Create(handler);
+        await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.ProcessPayoutAsync(new PayoutRequest
+        {
+            DestinationToken = "1",
+            Amount = 1m,
+            Currency = "USD",
+            Description = "x"
+        }));
+    }
+
+    [Fact]
+    public async Task ProcessPaymentAsync_DedupesViaIdempotencyKey()
+    {
+        var calls = 0;
+        var handler = new StubHttpMessageHandler((_, _) =>
+        {
+            calls++;
+            return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
+                {"Result":"000","TransToken":"tt-1"}
+                """);
+        });
+        var cache = new InMemoryBhenguDistributedCache();
+        var provider = Create(handler, cache: cache);
+        var req = new PaymentRequest
+        {
+            PaymentMethodToken = "ORDER",
+            Amount = 1m,
+            Currency = "USD",
+            Description = "x",
+            IdempotencyKey = "idem-1"
+        };
+        var first = await provider.ProcessPaymentAsync(req);
+        var second = await provider.ProcessPaymentAsync(req);
+        Assert.Equal(first.GatewayReference, second.GatewayReference);
+        Assert.Equal(1, calls);
     }
 }

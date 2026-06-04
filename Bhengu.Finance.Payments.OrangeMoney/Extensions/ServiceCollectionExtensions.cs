@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Validation;
@@ -11,6 +12,7 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace Bhengu.Finance.Payments.OrangeMoney.Extensions;
 
+/// <summary>DI registration helpers for the Orange Money provider.</summary>
 public static class ServiceCollectionExtensions
 {
     /// <summary>
@@ -35,13 +37,17 @@ public static class ServiceCollectionExtensions
         if (string.IsNullOrWhiteSpace(probe.Country))
             throw new ProviderConfigurationException("orangemoney", $"{OrangeMoneyOptions.ConfigSection}:Country is required");
 
+        services.AddBhenguInMemoryCache();
+
         services.AddHttpClient<OrangeMoneyPaymentProvider>();
         services.AddTransient<IPaymentGatewayProvider, OrangeMoneyPaymentProvider>(sp =>
             sp.GetRequiredService<OrangeMoneyPaymentProvider>());
-
+        services.AddTransient<IPayoutProvider, OrangeMoneyPaymentProvider>(sp =>
+            sp.GetRequiredService<OrangeMoneyPaymentProvider>());
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.OrangeMoney, (sp, _) => sp.GetRequiredService<OrangeMoneyPaymentProvider>());
-        services.AddBhenguPaymentStartupValidation();
+        services.AddKeyedTransient<IPayoutProvider>(ProviderNames.OrangeMoney, (sp, _) => sp.GetRequiredService<OrangeMoneyPaymentProvider>());
 
+        services.AddBhenguPaymentStartupValidation();
         return services;
     }
 }

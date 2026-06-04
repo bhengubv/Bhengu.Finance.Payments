@@ -5,6 +5,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Subscription;
 using Bhengu.Finance.Payments.Stripe.Configuration;
+using Bhengu.Finance.Payments.Stripe.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Stripe;
@@ -48,10 +49,14 @@ public sealed class StripeSubscriptionProvider : ISubscriptionProvider
     }
 
     /// <inheritdoc />
-    public async Task<Plan> CreatePlanAsync(PlanRequest request, CancellationToken ct = default)
+    public Task<Plan> CreatePlanAsync(PlanRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return StripeObservability.ObserveAsync("create_plan", () => CreatePlanCoreAsync(request, ct));
+    }
 
+    private async Task<Plan> CreatePlanCoreAsync(PlanRequest request, CancellationToken ct)
+    {
         var requestOptions = BuildRequestOptions(request.IdempotencyKey);
 
         try
@@ -88,10 +93,14 @@ public sealed class StripeSubscriptionProvider : ISubscriptionProvider
     }
 
     /// <inheritdoc />
-    public async Task<Plan?> GetPlanAsync(string planReference, CancellationToken ct = default)
+    public Task<Plan?> GetPlanAsync(string planReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(planReference);
+        return StripeObservability.ObserveAsync("get_plan", () => GetPlanCoreAsync(planReference, ct));
+    }
 
+    private async Task<Plan?> GetPlanCoreAsync(string planReference, CancellationToken ct)
+    {
         try
         {
             var service = new PlanService(_stripeClient);
@@ -113,10 +122,14 @@ public sealed class StripeSubscriptionProvider : ISubscriptionProvider
     }
 
     /// <inheritdoc />
-    public async Task<Subscription> CreateSubscriptionAsync(SubscriptionRequest request, CancellationToken ct = default)
+    public Task<Subscription> CreateSubscriptionAsync(SubscriptionRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return StripeObservability.ObserveAsync("create_subscription", () => CreateSubscriptionCoreAsync(request, ct));
+    }
 
+    private async Task<Subscription> CreateSubscriptionCoreAsync(SubscriptionRequest request, CancellationToken ct)
+    {
         var requestOptions = BuildRequestOptions(request.IdempotencyKey);
 
         try
@@ -152,10 +165,14 @@ public sealed class StripeSubscriptionProvider : ISubscriptionProvider
     }
 
     /// <inheritdoc />
-    public async Task<Subscription?> GetSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
+    public Task<Subscription?> GetSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
+        return StripeObservability.ObserveAsync("get_subscription", () => GetSubscriptionCoreAsync(subscriptionReference, ct));
+    }
 
+    private async Task<Subscription?> GetSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
+    {
         try
         {
             var service = new SubscriptionService(_stripeClient);
@@ -177,10 +194,14 @@ public sealed class StripeSubscriptionProvider : ISubscriptionProvider
     }
 
     /// <inheritdoc />
-    public async Task<Subscription> CancelSubscriptionAsync(string subscriptionReference, bool immediately = false, CancellationToken ct = default)
+    public Task<Subscription> CancelSubscriptionAsync(string subscriptionReference, bool immediately = false, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
+        return StripeObservability.ObserveAsync("cancel_subscription", () => CancelSubscriptionCoreAsync(subscriptionReference, immediately, ct));
+    }
 
+    private async Task<Subscription> CancelSubscriptionCoreAsync(string subscriptionReference, bool immediately, CancellationToken ct)
+    {
         try
         {
             var service = new SubscriptionService(_stripeClient);
@@ -224,10 +245,14 @@ public sealed class StripeSubscriptionProvider : ISubscriptionProvider
     }
 
     /// <inheritdoc />
-    public async Task<Subscription> PauseSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
+    public Task<Subscription> PauseSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
+        return StripeObservability.ObserveAsync("pause_subscription", () => PauseSubscriptionCoreAsync(subscriptionReference, ct));
+    }
 
+    private async Task<Subscription> PauseSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
+    {
         try
         {
             var service = new SubscriptionService(_stripeClient);
@@ -248,10 +273,14 @@ public sealed class StripeSubscriptionProvider : ISubscriptionProvider
     }
 
     /// <inheritdoc />
-    public async Task<Subscription> ResumeSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
+    public Task<Subscription> ResumeSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
+        return StripeObservability.ObserveAsync("resume_subscription", () => ResumeSubscriptionCoreAsync(subscriptionReference, ct));
+    }
 
+    private async Task<Subscription> ResumeSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
+    {
         try
         {
             var service = new SubscriptionService(_stripeClient);

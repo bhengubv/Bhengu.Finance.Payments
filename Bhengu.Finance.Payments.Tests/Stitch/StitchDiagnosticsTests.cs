@@ -1,0 +1,46 @@
+// © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
+
+using System.Net;
+using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Stitch.Configuration;
+using Bhengu.Finance.Payments.Stitch.Providers;
+using Bhengu.Finance.Payments.Tests.TestHelpers;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
+using Xunit;
+
+namespace Bhengu.Finance.Payments.Tests.Stitch;
+
+/// <summary>OTel counter assertions for the Stitch provider family.</summary>
+public class StitchDiagnosticsTests
+{
+    [Fact]
+    public async Task ProcessPaymentAsync_IncrementsChargesTotal()
+    {
+        using var recorder = new DiagnosticsCounterRecorder();
+        var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, """
+{"data":{"createPaymentInitiation":{"paymentInitiation":{"id":"stitch-diag"}}}}
+""".Trim()));
+        var provider = new StitchPaymentProvider(
+            new HttpClient(handler),
+            Options.Create(new StitchOptions { ClientId = "cid", ClientSecret = "cs", ApiKey = "ak" }),
+            NullLogger<StitchPaymentProvider>.Instance);
+
+        try
+        {
+            await provider.ProcessPaymentAsync(new PaymentRequest
+            {
+                PaymentMethodToken = "tok_diag",
+                Amount = 10m,
+                Currency = "ZAR",
+                Description = "diag"
+            });
+        }
+        catch
+        {
+            // Provider may need richer responses for full happy-path. We only assert the counter was incremented.
+        }
+
+        Assert.True(recorder.CounterTotalFor("bhengu_payments_charges_total", "stitch") >= 1);
+    }
+}

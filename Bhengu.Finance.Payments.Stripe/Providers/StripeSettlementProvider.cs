@@ -5,6 +5,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Settlement;
 using Bhengu.Finance.Payments.Stripe.Configuration;
+using Bhengu.Finance.Payments.Stripe.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Stripe;
@@ -47,7 +48,10 @@ public sealed class StripeSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+    public Task<IReadOnlyList<Settlement>> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+        => StripeObservability.ObserveAsync("list_settlements", () => ListSettlementsCoreAsync(fromUtc, toUtc, ct));
+
+    private async Task<IReadOnlyList<Settlement>> ListSettlementsCoreAsync(DateTime fromUtc, DateTime toUtc, CancellationToken ct)
     {
         try
         {
@@ -75,10 +79,14 @@ public sealed class StripeSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc />
-    public async Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
+    public Task<Settlement?> GetSettlementAsync(string settlementReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
+        return StripeObservability.ObserveAsync("get_settlement", () => GetSettlementCoreAsync(settlementReference, ct));
+    }
 
+    private async Task<Settlement?> GetSettlementCoreAsync(string settlementReference, CancellationToken ct)
+    {
         try
         {
             var service = new PayoutService(_stripeClient);
@@ -100,10 +108,14 @@ public sealed class StripeSettlementProvider : ISettlementProvider
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
+    public Task<IReadOnlyList<SettlementTransaction>> ListTransactionsAsync(string settlementReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
+        return StripeObservability.ObserveAsync("list_settlement_transactions", () => ListTransactionsCoreAsync(settlementReference, ct));
+    }
 
+    private async Task<IReadOnlyList<SettlementTransaction>> ListTransactionsCoreAsync(string settlementReference, CancellationToken ct)
+    {
         try
         {
             var service = new BalanceTransactionService(_stripeClient);

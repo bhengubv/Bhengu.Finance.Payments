@@ -5,6 +5,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Vault;
 using Bhengu.Finance.Payments.Stripe.Configuration;
+using Bhengu.Finance.Payments.Stripe.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Stripe;
@@ -53,11 +54,15 @@ public sealed class StripeTokenisationProvider : ITokenisationProvider
     }
 
     /// <inheritdoc />
-    public async Task<PaymentMethod> TokeniseAsync(TokeniseRequest request, CancellationToken ct = default)
+    public Task<PaymentMethod> TokeniseAsync(TokeniseRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(request.Card);
+        return StripeObservability.ObserveAsync("tokenise", () => TokeniseCoreAsync(request, ct));
+    }
 
+    private async Task<PaymentMethod> TokeniseCoreAsync(TokeniseRequest request, CancellationToken ct)
+    {
         var pmService = new PaymentMethodService(_stripeClient);
         var requestOptions = BuildRequestOptions(request.IdempotencyKey);
 
@@ -131,10 +136,14 @@ public sealed class StripeTokenisationProvider : ITokenisationProvider
     }
 
     /// <inheritdoc />
-    public async Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
+    public Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(token);
+        return StripeObservability.ObserveAsync("get_payment_method", () => GetPaymentMethodCoreAsync(token, ct));
+    }
 
+    private async Task<PaymentMethod?> GetPaymentMethodCoreAsync(string token, CancellationToken ct)
+    {
         try
         {
             var service = new PaymentMethodService(_stripeClient);
@@ -156,10 +165,14 @@ public sealed class StripeTokenisationProvider : ITokenisationProvider
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<PaymentMethod>> ListPaymentMethodsAsync(string customerId, CancellationToken ct = default)
+    public Task<IReadOnlyList<PaymentMethod>> ListPaymentMethodsAsync(string customerId, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(customerId);
+        return StripeObservability.ObserveAsync("list_payment_methods", () => ListPaymentMethodsCoreAsync(customerId, ct));
+    }
 
+    private async Task<IReadOnlyList<PaymentMethod>> ListPaymentMethodsCoreAsync(string customerId, CancellationToken ct)
+    {
         try
         {
             var service = new PaymentMethodService(_stripeClient);
@@ -193,10 +206,14 @@ public sealed class StripeTokenisationProvider : ITokenisationProvider
     }
 
     /// <inheritdoc />
-    public async Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
+    public Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(token);
+        return StripeObservability.ObserveAsync("delete_payment_method", () => DeletePaymentMethodCoreAsync(token, ct));
+    }
 
+    private async Task<bool> DeletePaymentMethodCoreAsync(string token, CancellationToken ct)
+    {
         try
         {
             var service = new PaymentMethodService(_stripeClient);

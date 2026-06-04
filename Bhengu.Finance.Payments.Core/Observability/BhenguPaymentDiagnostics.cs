@@ -85,6 +85,33 @@ public static class BhenguPaymentDiagnostics
         return activity;
     }
 
+    /// <summary>Start an Activity span for ParseWebhookAsync.</summary>
+    public static Activity? StartWebhookActivity(string providerName)
+    {
+        var activity = s_activitySource.StartActivity("payment.webhook", ActivityKind.Server);
+        activity?.SetTag("payment.provider", providerName);
+        return activity;
+    }
+
+    /// <summary>Start a generic operation Activity span — e.g. CreateSubscription, ChargeMandate, GenerateQr.</summary>
+    public static Activity? StartOperationActivity(string providerName, string operationName)
+    {
+        var activity = s_activitySource.StartActivity($"payment.{operationName}", ActivityKind.Client);
+        activity?.SetTag("payment.provider", providerName);
+        activity?.SetTag("payment.operation", operationName);
+        return activity;
+    }
+
+    /// <summary>Stamp an outcome tag onto the current activity (success / declined / unavailable / ...).</summary>
+    public static void SetOutcome(this Activity? activity, string outcome)
+    {
+        activity?.SetTag("payment.outcome", outcome);
+        if (outcome != Outcomes.Success && outcome != Outcomes.Pending)
+        {
+            activity?.SetStatus(ActivityStatusCode.Error, outcome);
+        }
+    }
+
     /// <summary>
     /// Standard outcome tag values. Use these to keep dashboards consistent across providers.
     /// </summary>

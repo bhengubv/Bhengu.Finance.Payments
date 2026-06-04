@@ -1,5 +1,6 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
@@ -11,7 +12,10 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Mukuru.Configuration;
+using Bhengu.Finance.Payments.Mukuru.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -27,18 +31,25 @@ namespace Bhengu.Finance.Payments.Mukuru.Providers;
 /// (valid only before the recipient collects). Webhook authenticity uses HMAC-SHA256 in
 /// <c>X-Mukuru-Signature</c>.
 /// </summary>
+/// <remarks>
+/// Mukuru also exposes Mukuru Send recurring-transfer authorisations — wrapped via the sibling
+/// <see cref="MukuruMandateProvider"/>.
+/// </remarks>
 public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly MukuruOptions _options;
     private readonly ILogger<MukuruPaymentProvider> _logger;
+    private readonly MukuruIdempotencyCache _idempotency;
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
 
     private string? _cachedToken;
     private DateTimeOffset _cachedTokenExpiresAt = DateTimeOffset.MinValue;
 
+    /// <inheritdoc/>
     public string ProviderName => ProviderNames.Mukuru;
 
+    /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
         ProviderCapabilities.Refund |
@@ -46,16 +57,22 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         ProviderCapabilities.Webhook |
         ProviderCapabilities.CrossBorder |
         ProviderCapabilities.MobileMoney |
-        ProviderCapabilities.BankTransfer;
+        ProviderCapabilities.BankTransfer |
+        ProviderCapabilities.Mandates |
+        ProviderCapabilities.Idempotency |
+        ProviderCapabilities.TypedWebhooks;
 
+    /// <summary>Construct the provider. Designed to be registered via DI.</summary>
     public MukuruPaymentProvider(
         HttpClient httpClient,
         IOptions<MukuruOptions> options,
-        ILogger<MukuruPaymentProvider> logger)
+        ILogger<MukuruPaymentProvider> logger,
+        MukuruIdempotencyCache idempotency)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _idempotency = idempotency ?? throw new ArgumentNullException(nameof(idempotency));
 
         if (string.IsNullOrWhiteSpace(_options.ClientId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(MukuruOptions.ClientId)} is required");
@@ -72,12 +89,18 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         }
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPaymentCoreAsync(request, ct), ct);
+    }
 
-        // Mukuru is one-direction (SA outbound). ProcessPaymentAsync maps to wallet top-up —
-        // i.e. funding the merchant's Mukuru balance from EFT or card so payouts can be drawn.
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+    {
+        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
+        var sw = Stopwatch.StartNew();
+
         var requestBody = new
         {
             amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture),
@@ -86,30 +109,53 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
             reference = request.PaymentMethodToken
         };
 
-        var body = await SendAsync(HttpMethod.Post, "v1/wallet/topup", requestBody, ct, "ProcessPayment")
-            .ConfigureAwait(false);
-        var topupResponse = JsonSerializer.Deserialize<MukuruTopupResponse>(body);
-
-        _logger.LogInformation("Mukuru wallet topup: ref={Ref} status={Status}",
-            topupResponse?.Reference, topupResponse?.Status);
-
-        return new PaymentResponse
+        try
         {
-            GatewayReference = topupResponse?.TransactionId ?? request.PaymentMethodToken,
-            Status = MapStatus(topupResponse?.Status),
-            Amount = request.Amount,
-            Currency = request.Currency,
-            ProcessedAt = DateTime.UtcNow,
-            Message = topupResponse?.Message
-        };
+            var body = await SendAsync(HttpMethod.Post, "v1/wallet/topup", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
+            var topupResponse = JsonSerializer.Deserialize<MukuruTopupResponse>(body);
+
+            _logger.LogInformation("Mukuru wallet topup: ref={Ref} status={Status}",
+                topupResponse?.Reference, topupResponse?.Status);
+
+            var status = MapStatus(topupResponse?.Status);
+            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("outcome", status.ToString().ToLowerInvariant()));
+
+            return new PaymentResponse
+            {
+                GatewayReference = topupResponse?.TransactionId ?? request.PaymentMethodToken,
+                Status = status,
+                Amount = request.Amount,
+                Currency = request.Currency,
+                ProcessedAt = DateTime.UtcNow,
+                Message = topupResponse?.Message
+            };
+        }
+        catch (Exception)
+        {
+            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("outcome", BhenguPaymentDiagnostics.Outcomes.Error));
+            throw;
+        }
+        finally
+        {
+            BhenguPaymentDiagnostics.ChargeDurationMs.Record(sw.Elapsed.TotalMilliseconds,
+                new KeyValuePair<string, object?>("provider", ProviderName));
+        }
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessRefundCoreAsync(request, ct), ct);
+    }
 
-        // Mukuru does not refund collected transactions; cancelling a transaction before
-        // recipient collection is the closest analogue. Mapped here as RefundResponse.
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
+        using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
         var path = $"v1/transactions/{Uri.EscapeDataString(request.GatewayReference)}/cancel";
         var body = await SendAsync(HttpMethod.Get, path, null, ct, "ProcessRefund").ConfigureAwait(false);
         var cancelResponse = JsonSerializer.Deserialize<MukuruCancelResponse>(body);
@@ -117,22 +163,31 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         _logger.LogInformation("Mukuru transaction cancellation: txId={TxId} status={Status}",
             request.GatewayReference, cancelResponse?.Status);
 
+        var status = MapStatus(cancelResponse?.Status);
+        BhenguPaymentDiagnostics.RefundsTotal.Add(1,
+            new KeyValuePair<string, object?>("provider", ProviderName),
+            new KeyValuePair<string, object?>("outcome", status == PaymentStatus.Refunded ? BhenguPaymentDiagnostics.Outcomes.Success : BhenguPaymentDiagnostics.Outcomes.Pending));
+
         return new RefundResponse
         {
             GatewayReference = cancelResponse?.TransactionId ?? request.GatewayReference,
             Amount = request.Amount,
-            Status = MapStatus(cancelResponse?.Status),
+            Status = status,
             ProcessedAt = DateTime.UtcNow,
             Message = cancelResponse?.Message
         };
     }
 
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPayoutCoreAsync(request, ct), ct);
+    }
 
-        // DestinationToken format: "<recipientCountry>:<payoutMethod>:<accountOrMsisdn>[:bankCode]"
-        // e.g. "ZW:CASH_PICKUP:" or "MW:MOBILE_MONEY:265888123456" or "ZM:BANK:0123456789:ZNB".
+    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+    {
+        using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, request.Currency);
         var parts = request.DestinationToken.Split(':');
         if (parts.Length < 3)
             throw new BhenguPaymentException(ProviderName,
@@ -144,7 +199,7 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         var account = parts[2];
         var bankCode = parts.Length > 3 ? parts[3] : string.Empty;
 
-        var reference = $"mukuru-{Guid.NewGuid():N}";
+        var reference = request.IdempotencyKey ?? $"mukuru-{Guid.NewGuid():N}";
 
         var requestBody = new
         {
@@ -178,49 +233,65 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         _logger.LogInformation("Mukuru transaction created: txId={TxId} status={Status}",
             txResponse?.TransactionId, txResponse?.Status);
 
+        var status = MapStatus(txResponse?.Status);
+        BhenguPaymentDiagnostics.PayoutsTotal.Add(1,
+            new KeyValuePair<string, object?>("provider", ProviderName),
+            new KeyValuePair<string, object?>("outcome", status == PaymentStatus.Completed ? BhenguPaymentDiagnostics.Outcomes.Success : BhenguPaymentDiagnostics.Outcomes.Pending));
+
         return new PayoutResponse
         {
             GatewayReference = txResponse?.TransactionId ?? reference,
-            Status = MapStatus(txResponse?.Status),
+            Status = status,
             Amount = request.Amount,
             Currency = request.Currency,
             ProcessedAt = DateTime.UtcNow
         };
     }
 
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
+        bool valid;
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
             _logger.LogWarning("Mukuru WebhookSecret not configured — signature verification cannot succeed.");
-            return false;
+            valid = false;
+        }
+        else
+        {
+            try
+            {
+                using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
+                var computed = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant();
+                var supplied = signature.StartsWith("sha256=", StringComparison.OrdinalIgnoreCase)
+                    ? signature["sha256=".Length..]
+                    : signature;
+                valid = CryptographicOperations.FixedTimeEquals(
+                    Encoding.UTF8.GetBytes(computed),
+                    Encoding.UTF8.GetBytes(supplied.ToLowerInvariant()));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Mukuru webhook signature verification raised");
+                valid = false;
+            }
         }
 
-        try
-        {
-            using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
-            var computed = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant();
-            var supplied = signature.StartsWith("sha256=", StringComparison.OrdinalIgnoreCase)
-                ? signature["sha256=".Length..]
-                : signature;
-            return CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(computed),
-                Encoding.UTF8.GetBytes(supplied.ToLowerInvariant()));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Mukuru webhook signature verification raised");
-            return false;
-        }
+        BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
+            new KeyValuePair<string, object?>("provider", ProviderName),
+            new KeyValuePair<string, object?>("valid", valid));
+        return valid;
     }
 
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
 
+        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
         try
         {
             var webhookEvent = JsonSerializer.Deserialize<MukuruWebhookEvent>(payload);
@@ -229,25 +300,78 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
             _logger.LogInformation("Parsed Mukuru webhook: type={Type} txId={TxId}",
                 webhookEvent.EventType, webhookEvent.Data?.TransactionId);
 
-            var status = webhookEvent.EventType?.ToLowerInvariant() switch
-            {
-                "transaction.completed" or "transaction.paid" or "transaction.collected" => PaymentStatus.Completed,
-                "transaction.pending" or "transaction.created" => PaymentStatus.Pending,
-                "transaction.failed" or "transaction.rejected" => PaymentStatus.Failed,
-                "transaction.cancelled" or "transaction.canceled" => PaymentStatus.Cancelled,
-                "transaction.refunded" => PaymentStatus.Refunded,
-                _ => (PaymentStatus?)null
-            };
-
             var reference = webhookEvent.Data?.TransactionId;
-            if (status is null || string.IsNullOrEmpty(reference))
+            if (string.IsNullOrEmpty(reference))
                 return Task.FromResult<WebhookEvent?>(null);
 
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
+            var amount = decimal.TryParse(webhookEvent.Data?.Amount, NumberStyles.Number, CultureInfo.InvariantCulture, out var a) ? a : 0m;
+            var currency = webhookEvent.Data?.Currency ?? _options.DefaultCurrency;
+
+            return Task.FromResult<WebhookEvent?>(webhookEvent.EventType?.ToLowerInvariant() switch
             {
-                GatewayReference = reference,
-                Status = status.Value,
-                EventType = webhookEvent.EventType
+                "transaction.completed" or "transaction.paid" or "transaction.collected" => new PayoutCompletedEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Completed,
+                    EventType = webhookEvent.EventType,
+                    Category = WebhookEventCategory.PayoutCompleted,
+                    PayoutReference = reference,
+                    Amount = amount,
+                    Currency = currency,
+                    DestinationToken = webhookEvent.Data?.Destination
+                },
+                "transaction.pending" or "transaction.created" => new ChargePendingEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Pending,
+                    EventType = webhookEvent.EventType,
+                    Category = WebhookEventCategory.ChargePending,
+                    Amount = amount,
+                    Currency = currency
+                },
+                "transaction.failed" or "transaction.rejected" => new PayoutFailedEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Failed,
+                    EventType = webhookEvent.EventType,
+                    Category = WebhookEventCategory.PayoutFailed,
+                    PayoutReference = reference,
+                    Amount = amount,
+                    Currency = currency,
+                    FailureCode = webhookEvent.Data?.Status,
+                    FailureMessage = webhookEvent.Data?.Reason
+                },
+                "transaction.refunded" or "transaction.cancelled" or "transaction.canceled" => new RefundSucceededEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Refunded,
+                    EventType = webhookEvent.EventType,
+                    Category = WebhookEventCategory.RefundSucceeded,
+                    RefundReference = reference,
+                    Amount = amount,
+                    Currency = currency,
+                    IsPartial = false
+                },
+                "mandate.activated" or "send.recurring.authorised" => new MandateActivatedEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Pending,
+                    EventType = webhookEvent.EventType,
+                    Category = WebhookEventCategory.MandateActivated,
+                    MandateReference = reference,
+                    AmountLimit = amount,
+                    Currency = currency
+                },
+                "mandate.cancelled" or "send.recurring.cancelled" => new MandateCancelledEvent
+                {
+                    GatewayReference = reference,
+                    Status = PaymentStatus.Cancelled,
+                    EventType = webhookEvent.EventType,
+                    Category = WebhookEventCategory.MandateCancelled,
+                    MandateReference = reference,
+                    CancellationReason = webhookEvent.Data?.Reason
+                },
+                _ => null
             });
         }
         catch (Exception ex)
@@ -257,7 +381,7 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         }
     }
 
-    private async Task<string> SendAsync(HttpMethod method, string path, object? body, CancellationToken ct, string operation)
+    internal async Task<string> SendAsync(HttpMethod method, string path, object? body, CancellationToken ct, string operation)
     {
         await EnsureTokenAsync(ct).ConfigureAwait(false);
 
@@ -276,6 +400,10 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         {
             throw new ProviderUnavailableException(ProviderName, "HTTP request to Mukuru failed", ex);
         }
+        catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            throw new ProviderUnavailableException(ProviderName, "HTTP request to Mukuru timed out", ex);
+        }
 
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
@@ -289,7 +417,7 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         {
             _logger.LogError("Mukuru {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
-                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
+                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
         }
 
@@ -398,5 +526,9 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
     {
         [JsonPropertyName("transaction_id")] public string? TransactionId { get; set; }
         [JsonPropertyName("status")] public string? Status { get; set; }
+        [JsonPropertyName("amount")] public string? Amount { get; set; }
+        [JsonPropertyName("currency")] public string? Currency { get; set; }
+        [JsonPropertyName("destination")] public string? Destination { get; set; }
+        [JsonPropertyName("reason")] public string? Reason { get; set; }
     }
 }

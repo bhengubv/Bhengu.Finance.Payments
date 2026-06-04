@@ -12,6 +12,7 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.PagSeguro.Configuration;
+using Bhengu.Finance.Payments.PagSeguro.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -66,10 +67,15 @@ public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutP
         _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _options.ApiToken);
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return PagSeguroObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+    }
 
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+    {
         var metadata = request.Metadata ?? new Dictionary<string, string>();
         var paymentType = (metadata.TryGetValue("payment_method_type", out var pmt) ? pmt : "CREDIT_CARD").ToUpperInvariant();
         var amountInCents = (long)(request.Amount * 100);
@@ -145,10 +151,15 @@ public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutP
         };
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return PagSeguroObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+    }
 
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
         // PagSeguro: POST /charges/{id}/cancel with the amount to cancel. GatewayReference here is the CHARGE id.
         var amountInCents = (long)(request.Amount * 100);
         var requestBody = new
@@ -178,10 +189,15 @@ public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutP
         };
     }
 
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return PagSeguroObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+    }
 
+    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+    {
         // PagSeguro bank-transfer payout: POST /transfers. DestinationToken is expected to be
         // a serialised "branch|number|check_digit|tax_id|holder|bank_code" account identifier the merchant supplied.
         var parts = request.DestinationToken.Split('|');
@@ -223,6 +239,7 @@ public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutP
         };
     }
 
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -231,30 +248,39 @@ public sealed class PagSeguroPaymentProvider : IPaymentGatewayProvider, IPayoutP
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
             _logger.LogWarning("PagSeguro WebhookSecret not configured — signature verification cannot succeed.");
+            PagSeguroObservability.RecordWebhookVerification(false);
             return false;
         }
 
+        bool verified;
         try
         {
             using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
             var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
             var computedHex = Convert.ToHexString(computedHash).ToLowerInvariant();
 
-            return CryptographicOperations.FixedTimeEquals(
+            verified = CryptographicOperations.FixedTimeEquals(
                 Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
                 Encoding.UTF8.GetBytes(computedHex));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "PagSeguro webhook signature verification raised");
-            return false;
+            verified = false;
         }
+        PagSeguroObservability.RecordWebhookVerification(verified);
+        return verified;
     }
 
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+        return PagSeguroObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+    }
 
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
+    {
         try
         {
             var webhookEvent = JsonSerializer.Deserialize<PagSeguroWebhookEvent>(payload);

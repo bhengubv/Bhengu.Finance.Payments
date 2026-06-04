@@ -1,6 +1,5 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
-using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
@@ -241,32 +240,51 @@ public sealed class YocoTokenisationProvider : ITokenisationProvider
 }
 
 /// <summary>
-/// Process-local cache of Yoco card tokens captured at tokenisation / webhook time.
+/// Distributed-cache-backed registry of Yoco card tokens captured at tokenisation / webhook time.
 /// Yoco has no public GET-by-token endpoint, so the SDK records what it knows here and the
 /// caller is responsible for refreshing the cache on each webhook delivery.
 /// </summary>
+/// <remarks>
+/// Entries are written to <see cref="Bhengu.Finance.Payments.Core.Caching.IBhenguDistributedCache"/>
+/// with a 365-day TTL so tokens survive process restarts and remain consistent across replicas
+/// when Redis is wired up via the optional <c>Bhengu.Finance.Payments.Redis</c> package.
+/// </remarks>
 public sealed class YocoTokenCache
 {
-    private readonly ConcurrentDictionary<string, PaymentMethod> _tokens = new(StringComparer.Ordinal);
+    private const string KeyPrefix = "yoco:token:";
+    private static readonly TimeSpan TimeToLive = TimeSpan.FromDays(365);
+
+    private readonly Bhengu.Finance.Payments.Core.Caching.IBhenguDistributedCache _cache;
+
+    /// <summary>Construct with an injected distributed cache. Used in DI-driven scenarios.</summary>
+    public YocoTokenCache(Bhengu.Finance.Payments.Core.Caching.IBhenguDistributedCache cache)
+    {
+        _cache = cache ?? throw new ArgumentNullException(nameof(cache));
+    }
+
+    /// <summary>Default-constructor convenience for tests and back-compat callers.</summary>
+    public YocoTokenCache() : this(new Bhengu.Finance.Payments.Core.Caching.InMemoryBhenguDistributedCache()) { }
 
     /// <summary>Add or overwrite a payment-method entry keyed by its token.</summary>
     public void Set(PaymentMethod method)
     {
         ArgumentNullException.ThrowIfNull(method);
-        _tokens[method.Token] = method;
+        _cache.SetAsync(KeyPrefix + method.Token, method, TimeToLive).GetAwaiter().GetResult();
     }
 
     /// <summary>Retrieve a cached payment method, or <c>null</c> if not present.</summary>
     public PaymentMethod? TryGet(string token)
     {
         ArgumentException.ThrowIfNullOrEmpty(token);
-        return _tokens.TryGetValue(token, out var method) ? method : null;
+        return _cache.GetAsync<PaymentMethod>(KeyPrefix + token).GetAwaiter().GetResult();
     }
 
-    /// <summary>Remove a payment-method entry.</summary>
+    /// <summary>Remove a payment-method entry. Returns true if the token existed previously.</summary>
     public bool Remove(string token)
     {
         ArgumentException.ThrowIfNullOrEmpty(token);
-        return _tokens.TryRemove(token, out _);
+        var existed = _cache.GetAsync<PaymentMethod>(KeyPrefix + token).GetAwaiter().GetResult() is not null;
+        _cache.RemoveAsync(KeyPrefix + token).GetAwaiter().GetResult();
+        return existed;
     }
 }

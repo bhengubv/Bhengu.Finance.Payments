@@ -5,8 +5,10 @@ using System.Security.Cryptography;
 using System.Text;
 using Bhengu.Finance.Payments.ChipperCash.Configuration;
 using Bhengu.Finance.Payments.ChipperCash.Providers;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Tests.TestHelpers;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -16,7 +18,7 @@ namespace Bhengu.Finance.Payments.Tests.ChipperCash;
 
 public class ChipperCashPaymentProviderTests
 {
-    private static ChipperCashPaymentProvider Create(StubHttpMessageHandler handler, ChipperCashOptions? opts = null)
+    private static ChipperCashPaymentProvider Create(StubHttpMessageHandler handler, ChipperCashOptions? opts = null, IBhenguDistributedCache? cache = null)
     {
         opts ??= new ChipperCashOptions
         {
@@ -28,7 +30,7 @@ public class ChipperCashPaymentProviderTests
             Currency = "NGN"
         };
         var http = new HttpClient(handler);
-        return new ChipperCashPaymentProvider(http, Options.Create(opts), NullLogger<ChipperCashPaymentProvider>.Instance);
+        return new ChipperCashPaymentProvider(http, Options.Create(opts), NullLogger<ChipperCashPaymentProvider>.Instance, cache);
     }
 
     private static PaymentRequest SamplePayment() => new()
@@ -210,5 +212,57 @@ public class ChipperCashPaymentProviderTests
     {
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
         Assert.Null(await provider.ParseWebhookAsync("not json"));
+    }
+
+    [Fact]
+    public async Task ParseWebhookAsync_ReturnsChargeSucceededEvent_WithCategory()
+    {
+        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+        var evt = await provider.ParseWebhookAsync("""
+            {"event":"collection.successful","data":{"id":"CHP-99","status":"successful","amount":100,"currency":"NGN","mobile":{"msisdn":"+2348012345678","network":"MTN"}}}
+            """);
+        var typed = Assert.IsType<ChargeSucceededEvent>(evt);
+        Assert.Equal(WebhookEventCategory.ChargeSucceeded, typed.Category);
+        Assert.Equal(100m, typed.Amount);
+        Assert.Equal("NGN", typed.Currency);
+    }
+
+    [Fact]
+    public async Task ParseWebhookAsync_ReturnsPayoutCompletedEvent_ForDisbursement()
+    {
+        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+        var evt = await provider.ParseWebhookAsync("""
+            {"event":"disbursement.successful","data":{"id":"CHP-D-1","status":"successful","amount":250,"currency":"NGN","mobile":{"msisdn":"+2348099999999"}}}
+            """);
+        var typed = Assert.IsType<PayoutCompletedEvent>(evt);
+        Assert.Equal(WebhookEventCategory.PayoutCompleted, typed.Category);
+        Assert.Equal("CHP-D-1", typed.PayoutReference);
+    }
+
+    [Fact]
+    public async Task ProcessPaymentAsync_DedupesViaIdempotencyKey()
+    {
+        var calls = 0;
+        var handler = new StubHttpMessageHandler((_, _) =>
+        {
+            calls++;
+            return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
+                {"id":"CHP-COL-1","status":"successful","amount":100,"currency":"NGN"}
+                """);
+        });
+        var cache = new InMemoryBhenguDistributedCache();
+        var provider = Create(handler, cache: cache);
+        var req = new PaymentRequest
+        {
+            PaymentMethodToken = "+2348012345678",
+            Amount = 100m,
+            Currency = "NGN",
+            Description = "Chipper test",
+            IdempotencyKey = "idem-1"
+        };
+        var first = await provider.ProcessPaymentAsync(req);
+        var second = await provider.ProcessPaymentAsync(req);
+        Assert.Equal(first.GatewayReference, second.GatewayReference);
+        Assert.Equal(1, calls);
     }
 }

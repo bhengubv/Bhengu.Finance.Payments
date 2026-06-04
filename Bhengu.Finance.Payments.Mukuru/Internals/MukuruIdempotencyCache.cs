@@ -1,0 +1,47 @@
+// © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
+
+using Bhengu.Finance.Payments.Core.Caching;
+
+namespace Bhengu.Finance.Payments.Mukuru.Internals;
+
+/// <summary>
+/// Client-side dedup wrapper for Mukuru. Mukuru's API does not expose a native Idempotency-Key
+/// header; remittance transactions are dedup'd by client-supplied reference, but our cache
+/// short-circuits a retry before it reaches Mukuru.
+/// </summary>
+public sealed class MukuruIdempotencyCache
+{
+    private readonly IBhenguDistributedCache _cache;
+    private readonly TimeSpan _ttl;
+
+    /// <summary>Construct an idempotency cache. TTL defaults to 24 hours.</summary>
+    public MukuruIdempotencyCache(IBhenguDistributedCache cache, TimeSpan? ttl = null)
+    {
+        _cache = cache ?? throw new ArgumentNullException(nameof(cache));
+        _ttl = ttl ?? TimeSpan.FromHours(24);
+    }
+
+    /// <summary>Execute the factory at most once per idempotency key.</summary>
+    public async Task<T> GetOrAddAsync<T>(string? idempotencyKey, Func<Task<T>> factory, CancellationToken ct = default) where T : class
+    {
+        ArgumentNullException.ThrowIfNull(factory);
+        if (string.IsNullOrWhiteSpace(idempotencyKey))
+            return await factory().ConfigureAwait(false);
+
+        var key = $"mukuru:idem:{idempotencyKey}";
+        var cached = await _cache.GetAsync<CachedResponse<T>>(key, ct).ConfigureAwait(false);
+        if (cached is { Value: not null })
+            return cached.Value;
+
+        var value = await factory().ConfigureAwait(false);
+        await _cache.SetAsync(key, new CachedResponse<T> { Value = value }, _ttl, ct).ConfigureAwait(false);
+        return value;
+    }
+
+    /// <summary>JSON-friendly envelope for cache round-trip.</summary>
+    public sealed class CachedResponse<T> where T : class
+    {
+        /// <summary>The cached value.</summary>
+        public T? Value { get; set; }
+    }
+}

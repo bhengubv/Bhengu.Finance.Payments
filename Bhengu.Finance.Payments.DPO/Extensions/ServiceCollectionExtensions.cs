@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Validation;
@@ -11,11 +12,13 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace Bhengu.Finance.Payments.DPO.Extensions;
 
+/// <summary>DI registration helpers for the DPO Group provider family.</summary>
 public static class ServiceCollectionExtensions
 {
     /// <summary>
-    /// Register the DPO Group provider. Reads configuration from <c>Bhengu:Finance:Payments:DPO</c>.
-    /// Fails fast at startup if required options (CompanyToken) are missing.
+    /// Register the DPO Group provider family (payment + payout + settlement). Reads configuration
+    /// from <c>Bhengu:Finance:Payments:DPO</c>. Fails fast at startup if required options
+    /// (CompanyToken) are missing.
     /// </summary>
     public static IServiceCollection AddDPOPayments(this IServiceCollection services, IConfiguration configuration)
     {
@@ -29,11 +32,25 @@ public static class ServiceCollectionExtensions
         if (string.IsNullOrWhiteSpace(probe.CompanyToken))
             throw new ProviderConfigurationException("dpo", $"{DPOOptions.ConfigSection}:CompanyToken is required");
 
+        services.AddBhenguInMemoryCache();
+
         services.AddHttpClient<DPOPaymentProvider>();
+        services.AddHttpClient<DPOSettlementProvider>();
+
         services.AddTransient<IPaymentGatewayProvider, DPOPaymentProvider>(sp =>
             sp.GetRequiredService<DPOPaymentProvider>());
+        services.AddTransient<IPayoutProvider, DPOPaymentProvider>(sp =>
+            sp.GetRequiredService<DPOPaymentProvider>());
+        services.AddTransient<ISettlementProvider, DPOSettlementProvider>(sp =>
+            sp.GetRequiredService<DPOSettlementProvider>());
 
-        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.DPO, (sp, _) => sp.GetRequiredService<DPOPaymentProvider>());
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.DPO,
+            (sp, _) => sp.GetRequiredService<DPOPaymentProvider>());
+        services.AddKeyedTransient<IPayoutProvider>(ProviderNames.DPO,
+            (sp, _) => sp.GetRequiredService<DPOPaymentProvider>());
+        services.AddKeyedTransient<ISettlementProvider>(ProviderNames.DPO,
+            (sp, _) => sp.GetRequiredService<DPOSettlementProvider>());
+
         services.AddBhenguPaymentStartupValidation();
 
         return services;

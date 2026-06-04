@@ -1,16 +1,19 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Ozow.Configuration;
+using Bhengu.Finance.Payments.Ozow.Internals;
 using Bhengu.Finance.Payments.Ozow.Providers;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Bhengu.Finance.Payments.Ozow.Extensions;
 
+/// <summary>DI registration for the Ozow provider.</summary>
 public static class ServiceCollectionExtensions
 {
     /// <summary>
@@ -33,14 +36,16 @@ public static class ServiceCollectionExtensions
         if (string.IsNullOrWhiteSpace(probe.ApiKey))
             throw new ProviderConfigurationException("ozow", $"{OzowOptions.ConfigSection}:ApiKey is required");
 
+        services.AddBhenguInMemoryCache();
+        services.AddSingleton<OzowIdempotencyCache>();
+
         services.AddHttpClient<OzowPaymentProvider>();
         services.AddTransient<IPaymentGatewayProvider, OzowPaymentProvider>(sp =>
             sp.GetRequiredService<OzowPaymentProvider>());
 
-        // Register as keyed service so consumers can resolve by name: [FromKeyedServices(ProviderNames.Ozow)]
-        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Ozow, (sp, _) => sp.GetRequiredService<OzowPaymentProvider>());
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Ozow,
+            (sp, _) => sp.GetRequiredService<OzowPaymentProvider>());
 
-        // Eager startup validation — fails the app at startup if config is broken (vs first request)
         services.AddBhenguPaymentStartupValidation();
 
         return services;

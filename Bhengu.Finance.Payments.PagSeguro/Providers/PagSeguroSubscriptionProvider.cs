@@ -1,16 +1,17 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
-using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models.Subscription;
 using Bhengu.Finance.Payments.PagSeguro.Configuration;
+using Bhengu.Finance.Payments.PagSeguro.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -32,7 +33,8 @@ namespace Bhengu.Finance.Payments.PagSeguro.Providers;
 /// </remarks>
 public sealed class PagSeguroSubscriptionProvider : ISubscriptionProvider
 {
-    private static readonly ConcurrentDictionary<string, Plan> PlanCache = new(StringComparer.Ordinal);
+    private const string PlanKeyPrefix = "pagseguro:plan:";
+    private static readonly TimeSpan PlanTtl = TimeSpan.FromDays(365);
 
     private static readonly JsonSerializerOptions WriteOptions = new()
     {
@@ -42,19 +44,22 @@ public sealed class PagSeguroSubscriptionProvider : ISubscriptionProvider
     private readonly HttpClient _httpClient;
     private readonly PagSeguroOptions _options;
     private readonly ILogger<PagSeguroSubscriptionProvider> _logger;
+    private readonly IBhenguDistributedCache _cache;
 
     /// <inheritdoc />
     public string ProviderName => ProviderNames.PagSeguro;
 
-    /// <summary>Create a new PagSeguro subscription provider bound to the supplied HTTP client and options.</summary>
+    /// <summary>Create a new PagSeguro subscription provider bound to the supplied HTTP client, options, and distributed cache.</summary>
     public PagSeguroSubscriptionProvider(
         HttpClient httpClient,
         IOptions<PagSeguroOptions> options,
-        ILogger<PagSeguroSubscriptionProvider> logger)
+        ILogger<PagSeguroSubscriptionProvider> logger,
+        IBhenguDistributedCache cache)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _cache = cache ?? throw new ArgumentNullException(nameof(cache));
 
         if (string.IsNullOrWhiteSpace(_options.ApiToken))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(PagSeguroOptions.ApiToken)} is required");
@@ -71,11 +76,24 @@ public sealed class PagSeguroSubscriptionProvider : ISubscriptionProvider
             _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _options.ApiToken);
     }
 
+    /// <summary>Back-compat constructor that uses the process-local in-memory cache.</summary>
+    public PagSeguroSubscriptionProvider(
+        HttpClient httpClient,
+        IOptions<PagSeguroOptions> options,
+        ILogger<PagSeguroSubscriptionProvider> logger)
+        : this(httpClient, options, logger, new InMemoryBhenguDistributedCache())
+    {
+    }
+
     /// <inheritdoc />
     public Task<Plan> CreatePlanAsync(PlanRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return PagSeguroObservability.ObserveAsync("create_plan", () => CreatePlanCoreAsync(request, ct));
+    }
 
+    private async Task<Plan> CreatePlanCoreAsync(PlanRequest request, CancellationToken ct)
+    {
         var reference = "pg_plan_" + Guid.NewGuid().ToString("N");
         var plan = new Plan
         {
@@ -88,28 +106,33 @@ public sealed class PagSeguroSubscriptionProvider : ISubscriptionProvider
             Description = request.Description
         };
 
-        PlanCache[reference] = plan;
-        _logger.LogInformation("PagSeguro plan cached in-process: {Reference} name={Name}", reference, request.Name);
+        await _cache.SetAsync(PlanKeyPrefix + reference, plan, PlanTtl, ct).ConfigureAwait(false);
+        _logger.LogInformation("PagSeguro plan cached: {Reference} name={Name}", reference, request.Name);
 
-        return Task.FromResult(plan);
+        return plan;
     }
 
     /// <inheritdoc />
     public Task<Plan?> GetPlanAsync(string planReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(planReference);
-        return Task.FromResult(PlanCache.TryGetValue(planReference, out var plan) ? plan : null);
+        return PagSeguroObservability.ObserveAsync("get_plan", () =>
+            _cache.GetAsync<Plan>(PlanKeyPrefix + planReference, ct));
     }
 
     /// <inheritdoc />
-    public async Task<Subscription> CreateSubscriptionAsync(SubscriptionRequest request, CancellationToken ct = default)
+    public Task<Subscription> CreateSubscriptionAsync(SubscriptionRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return PagSeguroObservability.ObserveAsync("create_subscription", () => CreateSubscriptionCoreAsync(request, ct));
+    }
 
-        if (!PlanCache.TryGetValue(request.PlanReference, out var plan))
-            throw new BhenguPaymentException(
+    private async Task<Subscription> CreateSubscriptionCoreAsync(SubscriptionRequest request, CancellationToken ct)
+    {
+        var plan = await _cache.GetAsync<Plan>(PlanKeyPrefix + request.PlanReference, ct).ConfigureAwait(false)
+            ?? throw new BhenguPaymentException(
                 ProviderName,
-                $"Plan reference '{request.PlanReference}' is not cached. PagBank requires the plan template to live in-process; call CreatePlanAsync first.",
+                $"Plan reference '{request.PlanReference}' is not cached. Call CreatePlanAsync first.",
                 providerErrorCode: "unknown_plan");
 
         var amountInCents = (long)(plan.Amount * 100);
@@ -161,10 +184,14 @@ public sealed class PagSeguroSubscriptionProvider : ISubscriptionProvider
     }
 
     /// <inheritdoc />
-    public async Task<Subscription?> GetSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
+    public Task<Subscription?> GetSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(subscriptionReference);
+        return PagSeguroObservability.ObserveAsync("get_subscription", () => GetSubscriptionCoreAsync(subscriptionReference, ct));
+    }
 
+    private async Task<Subscription?> GetSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
+    {
         try
         {
             var raw = await SendAsync(HttpMethod.Get, $"/recurring/orders/{Uri.EscapeDataString(subscriptionReference)}", body: null, ct, "GetSubscription").ConfigureAwait(false);
@@ -178,10 +205,14 @@ public sealed class PagSeguroSubscriptionProvider : ISubscriptionProvider
     }
 
     /// <inheritdoc />
-    public async Task<Subscription> CancelSubscriptionAsync(string subscriptionReference, bool immediately = false, CancellationToken ct = default)
+    public Task<Subscription> CancelSubscriptionAsync(string subscriptionReference, bool immediately = false, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(subscriptionReference);
+        return PagSeguroObservability.ObserveAsync("cancel_subscription", () => CancelSubscriptionCoreAsync(subscriptionReference, immediately, ct));
+    }
 
+    private async Task<Subscription> CancelSubscriptionCoreAsync(string subscriptionReference, bool immediately, CancellationToken ct)
+    {
         try
         {
             var raw = await SendAsync(HttpMethod.Post, $"/recurring/orders/{Uri.EscapeDataString(subscriptionReference)}/cancel", body: new { }, ct, "CancelSubscription").ConfigureAwait(false);
@@ -200,17 +231,19 @@ public sealed class PagSeguroSubscriptionProvider : ISubscriptionProvider
 
     /// <inheritdoc />
     public Task<Subscription> PauseSubscriptionAsync(string subscriptionReference, CancellationToken ct = default) =>
-        throw new BhenguPaymentException(
-            ProviderName,
-            "PagBank does not support pausing recurring orders; cancel and re-create when the customer is ready.",
-            providerErrorCode: "pause_not_supported");
+        PagSeguroObservability.ObserveAsync<Subscription>("pause_subscription", () =>
+            throw new BhenguPaymentException(
+                ProviderName,
+                "PagBank does not support pausing recurring orders; cancel and re-create when the customer is ready.",
+                providerErrorCode: "pause_not_supported"));
 
     /// <inheritdoc />
     public Task<Subscription> ResumeSubscriptionAsync(string subscriptionReference, CancellationToken ct = default) =>
-        throw new BhenguPaymentException(
-            ProviderName,
-            "PagBank does not support resuming recurring orders; pause is unsupported, so resume is unsupported.",
-            providerErrorCode: "resume_not_supported");
+        PagSeguroObservability.ObserveAsync<Subscription>("resume_subscription", () =>
+            throw new BhenguPaymentException(
+                ProviderName,
+                "PagBank does not support resuming recurring orders; pause is unsupported, so resume is unsupported.",
+                providerErrorCode: "resume_not_supported"));
 
     // === Helpers ===
 

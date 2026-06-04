@@ -6,6 +6,7 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.Stripe.Configuration;
+using Bhengu.Finance.Payments.Stripe.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Stripe;
@@ -66,10 +67,15 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
             httpClient: new SystemNetHttpClient(httpClient));
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return StripeObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+    }
 
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+    {
         var amountInCents = (long)(request.Amount * 100);
         var metadata = request.Metadata?.ToDictionary(k => k.Key, v => v.Value) ?? new Dictionary<string, string>();
 
@@ -112,10 +118,15 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
         }
     }
 
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return StripeObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+    }
 
+    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+    {
         var amountInCents = (long)(request.Amount * 100);
         var options = new PayoutCreateOptions
         {
@@ -151,10 +162,15 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
         }
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return StripeObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+    }
 
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
         var amountInCents = (long)(request.Amount * 100);
         var options = new RefundCreateOptions
         {
@@ -190,6 +206,7 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
         }
     }
 
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -198,25 +215,33 @@ public sealed class StripePaymentProvider : IPaymentGatewayProvider, IPayoutProv
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
             _logger.LogWarning("Stripe WebhookSecret not configured — signature verification cannot succeed.");
+            StripeObservability.RecordWebhookVerification(false);
             return false;
         }
 
         try
         {
             EventUtility.ConstructEvent(payload, signature, _options.WebhookSecret);
+            StripeObservability.RecordWebhookVerification(true);
             return true;
         }
         catch (StripeException ex)
         {
             _logger.LogWarning("Stripe webhook signature verification failed: {Error}", ex.Message);
+            StripeObservability.RecordWebhookVerification(false);
             return false;
         }
     }
 
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+        return StripeObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+    }
 
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
+    {
         try
         {
             // throwOnApiVersionMismatch:false lets the SDK keep up across Stripe API minor versions

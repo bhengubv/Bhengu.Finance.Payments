@@ -1,21 +1,25 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Fawry.Configuration;
+using Bhengu.Finance.Payments.Fawry.Internals;
 using Bhengu.Finance.Payments.Fawry.Providers;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Bhengu.Finance.Payments.Fawry.Extensions;
 
+/// <summary>DI registration helpers for the Fawry provider family.</summary>
 public static class ServiceCollectionExtensions
 {
     /// <summary>
     /// Register the Fawry provider. Reads configuration from <c>Bhengu:Finance:Payments:Fawry</c>.
     /// Fails fast at startup if required options (MerchantCode, SecurityKey) are missing.
+    /// Registers charge + refund + settlement, keyed by <see cref="ProviderNames.Fawry"/>.
     /// </summary>
     public static IServiceCollection AddFawryPayments(this IServiceCollection services, IConfiguration configuration)
     {
@@ -31,10 +35,22 @@ public static class ServiceCollectionExtensions
         if (string.IsNullOrWhiteSpace(probe.SecurityKey))
             throw new ProviderConfigurationException("fawry", $"{FawryOptions.ConfigSection}:SecurityKey is required");
 
+        services.AddBhenguInMemoryCache();
+        services.AddSingleton<FawryIdempotencyCache>();
+
         services.AddHttpClient<FawryPaymentProvider>();
+        services.AddHttpClient<FawrySettlementProvider>();
+
         services.AddTransient<IPaymentGatewayProvider, FawryPaymentProvider>(sp =>
             sp.GetRequiredService<FawryPaymentProvider>());
-        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Fawry, (sp, _) => sp.GetRequiredService<FawryPaymentProvider>());
+        services.AddTransient<ISettlementProvider, FawrySettlementProvider>(sp =>
+            sp.GetRequiredService<FawrySettlementProvider>());
+
+        services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Fawry,
+            (sp, _) => sp.GetRequiredService<FawryPaymentProvider>());
+        services.AddKeyedTransient<ISettlementProvider>(ProviderNames.Fawry,
+            (sp, _) => sp.GetRequiredService<FawrySettlementProvider>());
+
         services.AddBhenguPaymentStartupValidation();
 
         return services;

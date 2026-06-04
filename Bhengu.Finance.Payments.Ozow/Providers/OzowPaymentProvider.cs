@@ -1,5 +1,6 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Security.Cryptography;
@@ -10,7 +11,10 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Ozow.Configuration;
+using Bhengu.Finance.Payments.Ozow.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -19,8 +23,8 @@ namespace Bhengu.Finance.Payments.Ozow.Providers;
 /// <summary>
 /// Ozow payment gateway provider — instant EFT and PayShap payments for South Africa.
 /// Ozow's standard merchant API does NOT expose payouts — <see cref="IPayoutProvider"/>
-/// is intentionally not implemented; merchants requiring disbursements should use
-/// Ozow's separate Disbursement API.
+/// is intentionally not implemented; merchants requiring disbursements should use Ozow's
+/// separate Disbursement API.
 /// </summary>
 public sealed class OzowPaymentProvider : IPaymentGatewayProvider
 {
@@ -29,24 +33,33 @@ public sealed class OzowPaymentProvider : IPaymentGatewayProvider
     private readonly HttpClient _httpClient;
     private readonly OzowOptions _options;
     private readonly ILogger<OzowPaymentProvider> _logger;
+    private readonly OzowIdempotencyCache _idempotency;
 
+    /// <inheritdoc/>
     public string ProviderName => ProviderNames.Ozow;
 
+    /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
         ProviderCapabilities.Refund |
+        ProviderCapabilities.PartialRefund |
         ProviderCapabilities.Webhook |
         ProviderCapabilities.RedirectFlow |
-        ProviderCapabilities.BankTransfer;
+        ProviderCapabilities.BankTransfer |
+        ProviderCapabilities.Idempotency |
+        ProviderCapabilities.TypedWebhooks;
 
+    /// <summary>Construct the provider. Designed to be registered via DI.</summary>
     public OzowPaymentProvider(
         HttpClient httpClient,
         IOptions<OzowOptions> options,
-        ILogger<OzowPaymentProvider> logger)
+        ILogger<OzowPaymentProvider> logger,
+        OzowIdempotencyCache idempotency)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _idempotency = idempotency ?? throw new ArgumentNullException(nameof(idempotency));
 
         if (string.IsNullOrWhiteSpace(_options.SiteCode))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(OzowOptions.SiteCode)} is required");
@@ -62,14 +75,23 @@ public sealed class OzowPaymentProvider : IPaymentGatewayProvider
                 : (_options.BaseUrl ?? "https://api.ozow.com/"));
         }
 
-        _httpClient.DefaultRequestHeaders.Add("ApiKey", _options.ApiKey);
+        if (!_httpClient.DefaultRequestHeaders.Contains("ApiKey"))
+            _httpClient.DefaultRequestHeaders.Add("ApiKey", _options.ApiKey);
         if (!_httpClient.DefaultRequestHeaders.Accept.Any(h => h.MediaType == "application/json"))
             _httpClient.DefaultRequestHeaders.Add("Accept", "application/json");
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPaymentCoreAsync(request, ct), ct);
+    }
+
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+    {
+        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
+        var sw = Stopwatch.StartNew();
 
         var transactionReference = request.Metadata?.GetValueOrDefault("transaction_reference")
             ?? Guid.NewGuid().ToString("N");
@@ -101,33 +123,57 @@ public sealed class OzowPaymentProvider : IPaymentGatewayProvider
             }
         };
 
-        // PaymentMethodToken is not used by Ozow's redirect flow but we keep it on the API for
-        // future tokenised flows. We log it for traceability.
         if (!string.IsNullOrEmpty(request.PaymentMethodToken))
             _logger.LogDebug("Ozow ProcessPayment called with PaymentMethodToken={Token} (not used by redirect flow)", request.PaymentMethodToken);
 
-        var body = await SendAsync(HttpMethod.Post, "postpaymentrequest", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
-        var ozowResponse = JsonSerializer.Deserialize<OzowPaymentApiResponse>(body, DeserializeOptions);
-
-        _logger.LogInformation("Ozow payment request created: {TransactionId} status={Status}",
-            ozowResponse?.TransactionId, ozowResponse?.Status);
-
-        return new PaymentResponse
+        try
         {
-            GatewayReference = ozowResponse?.TransactionId ?? transactionReference,
-            Status = MapStatus(ozowResponse?.Status ?? "pending"),
-            Amount = request.Amount,
-            Currency = request.Currency,
-            ProcessedAt = DateTime.UtcNow,
-            RedirectUrl = ozowResponse?.PaymentUrl is { Length: > 0 } url ? url : null,
-            Message = "Payment initiated"
-        };
+            var body = await SendAsync(HttpMethod.Post, "postpaymentrequest", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
+            var ozowResponse = JsonSerializer.Deserialize<OzowPaymentApiResponse>(body, DeserializeOptions);
+
+            _logger.LogInformation("Ozow payment request created: {TransactionId} status={Status}",
+                ozowResponse?.TransactionId, ozowResponse?.Status);
+
+            var status = MapStatus(ozowResponse?.Status ?? "pending");
+            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("outcome", status.ToString().ToLowerInvariant()));
+
+            return new PaymentResponse
+            {
+                GatewayReference = ozowResponse?.TransactionId ?? transactionReference,
+                Status = status,
+                Amount = request.Amount,
+                Currency = request.Currency,
+                ProcessedAt = DateTime.UtcNow,
+                RedirectUrl = ozowResponse?.PaymentUrl is { Length: > 0 } url ? url : null,
+                Message = "Payment initiated"
+            };
+        }
+        catch (Exception)
+        {
+            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("outcome", BhenguPaymentDiagnostics.Outcomes.Error));
+            throw;
+        }
+        finally
+        {
+            BhenguPaymentDiagnostics.ChargeDurationMs.Record(sw.Elapsed.TotalMilliseconds,
+                new KeyValuePair<string, object?>("provider", ProviderName));
+        }
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessRefundCoreAsync(request, ct), ct);
+    }
 
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
+        using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
         var requestBody = new
         {
             siteCode = _options.SiteCode,
@@ -142,47 +188,63 @@ public sealed class OzowPaymentProvider : IPaymentGatewayProvider
         _logger.LogInformation("Ozow refund created: {RefundId} for transaction {TransactionId}",
             refundResponse?.RefundId, request.GatewayReference);
 
+        var status = MapStatus(refundResponse?.Status ?? "pending");
+        BhenguPaymentDiagnostics.RefundsTotal.Add(1,
+            new KeyValuePair<string, object?>("provider", ProviderName),
+            new KeyValuePair<string, object?>("outcome", status == PaymentStatus.Refunded ? BhenguPaymentDiagnostics.Outcomes.Success : BhenguPaymentDiagnostics.Outcomes.Pending));
+
         return new RefundResponse
         {
             GatewayReference = refundResponse?.RefundId ?? string.Empty,
             Amount = request.Amount,
-            Status = MapStatus(refundResponse?.Status ?? "pending"),
+            Status = status,
             ProcessedAt = DateTime.UtcNow,
             Message = refundResponse?.Status
         };
     }
 
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
+        bool valid;
         if (string.IsNullOrWhiteSpace(_options.PrivateKey))
         {
             _logger.LogWarning("Ozow PrivateKey not configured — signature verification cannot succeed.");
-            return false;
+            valid = false;
+        }
+        else
+        {
+            try
+            {
+                var hashInput = payload + _options.PrivateKey;
+                var computedHash = GenerateSha512Hash(hashInput);
+
+                valid = CryptographicOperations.FixedTimeEquals(
+                    Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
+                    Encoding.UTF8.GetBytes(computedHash));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Ozow webhook signature verification raised");
+                valid = false;
+            }
         }
 
-        try
-        {
-            var hashInput = payload + _options.PrivateKey;
-            var computedHash = GenerateSha512Hash(hashInput);
-
-            return CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
-                Encoding.UTF8.GetBytes(computedHash));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Ozow webhook signature verification raised");
-            return false;
-        }
+        BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
+            new KeyValuePair<string, object?>("provider", ProviderName),
+            new KeyValuePair<string, object?>("valid", valid));
+        return valid;
     }
 
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
 
+        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
         try
         {
             var webhookEvent = JsonSerializer.Deserialize<OzowWebhookNotification>(payload, DeserializeOptions);
@@ -191,19 +253,65 @@ public sealed class OzowPaymentProvider : IPaymentGatewayProvider
             _logger.LogInformation("Parsed Ozow webhook event: TransactionId={TransactionId} status={Status}",
                 webhookEvent.TransactionId, webhookEvent.Status);
 
-            var status = MapStatus(webhookEvent.Status ?? "");
             var reference = !string.IsNullOrEmpty(webhookEvent.TransactionReference)
                 ? webhookEvent.TransactionReference
                 : webhookEvent.TransactionId;
-
             if (string.IsNullOrEmpty(reference))
                 return Task.FromResult<WebhookEvent?>(null);
 
-            return Task.FromResult<WebhookEvent?>(new WebhookEvent
+            var status = MapStatus(webhookEvent.Status ?? "");
+            var amount = webhookEvent.Amount ?? 0m;
+            var currency = "ZAR";
+
+            return Task.FromResult<WebhookEvent?>(status switch
             {
-                GatewayReference = reference,
-                Status = status,
-                EventType = "ozow.notification"
+                PaymentStatus.Completed => new ChargeSucceededEvent
+                {
+                    GatewayReference = reference,
+                    Status = status,
+                    EventType = "ozow.notification",
+                    Category = WebhookEventCategory.ChargeSucceeded,
+                    Amount = amount,
+                    Currency = currency
+                },
+                PaymentStatus.Pending => new ChargePendingEvent
+                {
+                    GatewayReference = reference,
+                    Status = status,
+                    EventType = "ozow.notification",
+                    Category = WebhookEventCategory.ChargePending,
+                    Amount = amount,
+                    Currency = currency
+                },
+                PaymentStatus.Failed => new ChargeFailedEvent
+                {
+                    GatewayReference = reference,
+                    Status = status,
+                    EventType = "ozow.notification",
+                    Category = WebhookEventCategory.ChargeFailed,
+                    Amount = amount,
+                    Currency = currency,
+                    FailureCode = webhookEvent.Status,
+                    FailureMessage = webhookEvent.StatusMessage
+                },
+                PaymentStatus.Refunded => new RefundSucceededEvent
+                {
+                    GatewayReference = reference,
+                    Status = status,
+                    EventType = "ozow.notification",
+                    Category = WebhookEventCategory.RefundSucceeded,
+                    RefundReference = reference,
+                    Amount = amount,
+                    Currency = currency,
+                    IsPartial = false
+                },
+                _ => new WebhookEvent
+                {
+                    GatewayReference = reference,
+                    Status = status,
+                    EventType = "ozow.notification",
+                    Category = WebhookEventCategory.Unknown
+                }
             });
         }
         catch (Exception ex)
@@ -230,6 +338,10 @@ public sealed class OzowPaymentProvider : IPaymentGatewayProvider
         {
             throw new ProviderUnavailableException(ProviderName, "HTTP request to Ozow failed", ex);
         }
+        catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            throw new ProviderUnavailableException(ProviderName, "HTTP request to Ozow timed out", ex);
+        }
 
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
@@ -243,7 +355,7 @@ public sealed class OzowPaymentProvider : IPaymentGatewayProvider
         {
             _logger.LogError("Ozow {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
-                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
+                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
         }
 

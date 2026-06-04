@@ -7,6 +7,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -30,13 +31,14 @@ namespace Bhengu.Finance.Payments.Flutterwave.Providers;
 /// </summary>
 public sealed class FlutterwaveMarketplaceProvider : IMarketplaceProvider
 {
+    private const string SplitKeyPrefix = "flutterwave:split:";
+    private static readonly TimeSpan SplitTtl = TimeSpan.FromDays(365);
+
     private readonly HttpClient _httpClient;
     private readonly FlutterwaveOptions _options;
     private readonly ILogger<FlutterwaveMarketplaceProvider> _logger;
     private readonly FlutterwaveIdempotencyCache _idempotencyCache;
-
-    // In-process cache for split definitions — Flutterwave does not persist these server-side.
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, SplitDefinition> _splits = new(StringComparer.Ordinal);
+    private readonly IBhenguDistributedCache _cache;
 
     /// <inheritdoc/>
     public string ProviderName => ProviderNames.Flutterwave;
@@ -45,12 +47,14 @@ public sealed class FlutterwaveMarketplaceProvider : IMarketplaceProvider
     public FlutterwaveMarketplaceProvider(
         HttpClient httpClient,
         IOptions<FlutterwaveOptions> options,
-        ILogger<FlutterwaveMarketplaceProvider> logger)
+        ILogger<FlutterwaveMarketplaceProvider> logger,
+        IBhenguDistributedCache cache)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        _idempotencyCache = new FlutterwaveIdempotencyCache();
+        _cache = cache ?? throw new ArgumentNullException(nameof(cache));
+        _idempotencyCache = new FlutterwaveIdempotencyCache(cache);
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(FlutterwaveOptions.SecretKey)} is required");
@@ -61,11 +65,21 @@ public sealed class FlutterwaveMarketplaceProvider : IMarketplaceProvider
         _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _options.SecretKey);
     }
 
+    /// <summary>Back-compat constructor that uses the process-local in-memory cache.</summary>
+    public FlutterwaveMarketplaceProvider(
+        HttpClient httpClient,
+        IOptions<FlutterwaveOptions> options,
+        ILogger<FlutterwaveMarketplaceProvider> logger)
+        : this(httpClient, options, logger, new InMemoryBhenguDistributedCache())
+    {
+    }
+
     /// <inheritdoc/>
     public Task<SubAccount> CreateSubAccountAsync(SubAccountRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, () => CreateSubAccountCoreAsync(request, ct));
+        return FlutterwaveObservability.ObserveAsync("create_sub_account", () =>
+            _idempotencyCache.GetOrAddAsync(request.IdempotencyKey, () => CreateSubAccountCoreAsync(request, ct)));
     }
 
     private async Task<SubAccount> CreateSubAccountCoreAsync(SubAccountRequest request, CancellationToken ct)
@@ -109,9 +123,14 @@ public sealed class FlutterwaveMarketplaceProvider : IMarketplaceProvider
     }
 
     /// <inheritdoc/>
-    public async Task<SubAccount?> GetSubAccountAsync(string subAccountReference, CancellationToken ct = default)
+    public Task<SubAccount?> GetSubAccountAsync(string subAccountReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subAccountReference);
+        return FlutterwaveObservability.ObserveAsync("get_sub_account", () => GetSubAccountCoreAsync(subAccountReference, ct));
+    }
+
+    private async Task<SubAccount?> GetSubAccountCoreAsync(string subAccountReference, CancellationToken ct)
+    {
         try
         {
             var responseBody = await SendAsync(HttpMethod.Get, $"v3/subaccounts/{Uri.EscapeDataString(subAccountReference)}", body: null, ct, "GetSubAccount").ConfigureAwait(false);
@@ -125,7 +144,10 @@ public sealed class FlutterwaveMarketplaceProvider : IMarketplaceProvider
     }
 
     /// <inheritdoc/>
-    public async Task<IReadOnlyList<SubAccount>> ListSubAccountsAsync(CancellationToken ct = default)
+    public Task<IReadOnlyList<SubAccount>> ListSubAccountsAsync(CancellationToken ct = default)
+        => FlutterwaveObservability.ObserveAsync("list_sub_accounts", () => ListSubAccountsCoreAsync(ct));
+
+    private async Task<IReadOnlyList<SubAccount>> ListSubAccountsCoreAsync(CancellationToken ct)
     {
         var responseBody = await SendAsync(HttpMethod.Get, "v3/subaccounts", body: null, ct, "ListSubAccounts").ConfigureAwait(false);
         var fw = JsonSerializer.Deserialize<FlutterwaveSubAccountListResponse>(responseBody);
@@ -140,13 +162,17 @@ public sealed class FlutterwaveMarketplaceProvider : IMarketplaceProvider
     /// <inheritdoc/>
     /// <remarks>
     /// Flutterwave has no server-side split-definition object. The created <see cref="SplitDefinition"/>
-    /// is cached in-process and replayed on subsequent <see cref="ChargeWithSplitAsync"/> calls. Cache
-    /// is lost on process recycle — callers that need durable splits should persist the result.
+    /// is cached via <see cref="IBhenguDistributedCache"/> (365d TTL) and replayed on subsequent
+    /// <see cref="ChargeWithSplitAsync"/> calls. Survives restarts when Redis is wired.
     /// </remarks>
     public Task<SplitDefinition> CreateSplitAsync(SplitDefinitionRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return FlutterwaveObservability.ObserveAsync("create_split", () => CreateSplitCoreAsync(request, ct));
+    }
 
+    private async Task<SplitDefinition> CreateSplitCoreAsync(SplitDefinitionRequest request, CancellationToken ct)
+    {
         var reference = $"split-{Guid.NewGuid():N}";
         var def = new SplitDefinition
         {
@@ -155,16 +181,17 @@ public sealed class FlutterwaveMarketplaceProvider : IMarketplaceProvider
             Currency = request.Currency.ToUpperInvariant(),
             Rules = request.Rules
         };
-        _splits[reference] = def;
-        _logger.LogInformation("Flutterwave split cached locally: {Reference} rules={Count}", reference, request.Rules.Count);
-        return Task.FromResult(def);
+        await _cache.SetAsync(SplitKeyPrefix + reference, def, SplitTtl, ct).ConfigureAwait(false);
+        _logger.LogInformation("Flutterwave split cached: {Reference} rules={Count}", reference, request.Rules.Count);
+        return def;
     }
 
     /// <inheritdoc/>
     public Task<SplitDefinition?> GetSplitAsync(string splitReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(splitReference);
-        return Task.FromResult<SplitDefinition?>(_splits.TryGetValue(splitReference, out var def) ? def : null);
+        return FlutterwaveObservability.ObserveAsync("get_split", () =>
+            _cache.GetAsync<SplitDefinition>(SplitKeyPrefix + splitReference, ct));
     }
 
     /// <inheritdoc/>
@@ -177,7 +204,8 @@ public sealed class FlutterwaveMarketplaceProvider : IMarketplaceProvider
             throw new BhenguPaymentException(ProviderName, "ChargeWithSplitRequest requires either SplitReference or InlineRules.");
 
         var idempotencyKey = request.Payment.IdempotencyKey;
-        return _idempotencyCache.GetOrAddAsync(idempotencyKey, () => ChargeWithSplitCoreAsync(request, ct));
+        return FlutterwaveObservability.ObserveChargeAsync(request.Payment.Currency, () =>
+            _idempotencyCache.GetOrAddAsync(idempotencyKey, () => ChargeWithSplitCoreAsync(request, ct)));
     }
 
     private async Task<PaymentResponse> ChargeWithSplitCoreAsync(ChargeWithSplitRequest request, CancellationToken ct)
@@ -190,9 +218,9 @@ public sealed class FlutterwaveMarketplaceProvider : IMarketplaceProvider
         IReadOnlyList<SplitRule> rules;
         if (request.SplitReference is not null)
         {
-            if (!_splits.TryGetValue(request.SplitReference, out var def))
-                throw new BhenguPaymentException(ProviderName, $"Unknown SplitReference '{request.SplitReference}'.");
-            rules = def.Rules;
+            var cached = await _cache.GetAsync<SplitDefinition>(SplitKeyPrefix + request.SplitReference, ct).ConfigureAwait(false)
+                ?? throw new BhenguPaymentException(ProviderName, $"Unknown SplitReference '{request.SplitReference}'.");
+            rules = cached.Rules;
         }
         else
         {

@@ -1,11 +1,13 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
-using System.Collections.Concurrent;
+using System.Diagnostics;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Marketplace;
+using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Stripe.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -29,10 +31,13 @@ namespace Bhengu.Finance.Payments.Stripe.Providers;
 /// </remarks>
 public sealed class StripeMarketplaceProvider : IMarketplaceProvider
 {
+    private const string SplitKeyPrefix = "stripe:split:";
+    private static readonly TimeSpan SplitTtl = TimeSpan.FromDays(365);
+
     private readonly StripeOptions _options;
     private readonly ILogger<StripeMarketplaceProvider> _logger;
     private readonly IStripeClient _stripeClient;
-    private readonly ConcurrentDictionary<string, SplitDefinition> _splits = new(StringComparer.Ordinal);
+    private readonly IBhenguDistributedCache _cache;
 
     /// <inheritdoc />
     public string ProviderName => ProviderNames.Stripe;
@@ -41,11 +46,13 @@ public sealed class StripeMarketplaceProvider : IMarketplaceProvider
     public StripeMarketplaceProvider(
         HttpClient httpClient,
         IOptions<StripeOptions> options,
-        ILogger<StripeMarketplaceProvider> logger)
+        ILogger<StripeMarketplaceProvider> logger,
+        IBhenguDistributedCache cache)
     {
         ArgumentNullException.ThrowIfNull(httpClient);
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _cache = cache ?? throw new ArgumentNullException(nameof(cache));
 
         if (string.IsNullOrWhiteSpace(_options.SecretKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(StripeOptions.SecretKey)} is required");
@@ -56,15 +63,24 @@ public sealed class StripeMarketplaceProvider : IMarketplaceProvider
             httpClient: new SystemNetHttpClient(httpClient));
     }
 
+    /// <summary>Back-compat constructor that uses the process-local in-memory cache.</summary>
+    public StripeMarketplaceProvider(
+        HttpClient httpClient,
+        IOptions<StripeOptions> options,
+        ILogger<StripeMarketplaceProvider> logger)
+        : this(httpClient, options, logger, new InMemoryBhenguDistributedCache())
+    {
+    }
+
     /// <inheritdoc />
     public async Task<SubAccount> CreateSubAccountAsync(SubAccountRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-
-        var requestOptions = BuildRequestOptions(request.IdempotencyKey);
-
+        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "create_sub_account");
+        var outcome = BhenguPaymentDiagnostics.Outcomes.Success;
         try
         {
+            var requestOptions = BuildRequestOptions(request.IdempotencyKey);
             var accountService = new AccountService(_stripeClient);
             var createOptions = new AccountCreateOptions
             {
@@ -102,13 +118,27 @@ public sealed class StripeMarketplaceProvider : IMarketplaceProvider
 
             return Map(account, request, onboardingUrl);
         }
+        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
+        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
+        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
         catch (StripeException ex)
         {
+            outcome = BhenguPaymentDiagnostics.Outcomes.Error;
             throw TranslateException(ex, "CreateSubAccount");
         }
         catch (HttpRequestException ex)
         {
+            outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable;
             throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
+        }
+        catch
+        {
+            outcome = BhenguPaymentDiagnostics.Outcomes.Error;
+            throw;
+        }
+        finally
+        {
+            activity.SetOutcome(outcome);
         }
     }
 
@@ -116,7 +146,8 @@ public sealed class StripeMarketplaceProvider : IMarketplaceProvider
     public async Task<SubAccount?> GetSubAccountAsync(string subAccountReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subAccountReference);
-
+        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "get_sub_account");
+        var outcome = BhenguPaymentDiagnostics.Outcomes.Success;
         try
         {
             var service = new AccountService(_stripeClient);
@@ -129,17 +160,30 @@ public sealed class StripeMarketplaceProvider : IMarketplaceProvider
         }
         catch (StripeException ex)
         {
+            outcome = BhenguPaymentDiagnostics.Outcomes.Error;
             throw TranslateException(ex, "GetSubAccount");
         }
         catch (HttpRequestException ex)
         {
+            outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable;
             throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
+        }
+        catch
+        {
+            outcome = BhenguPaymentDiagnostics.Outcomes.Error;
+            throw;
+        }
+        finally
+        {
+            activity.SetOutcome(outcome);
         }
     }
 
     /// <inheritdoc />
     public async Task<IReadOnlyList<SubAccount>> ListSubAccountsAsync(CancellationToken ct = default)
     {
+        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "list_sub_accounts");
+        var outcome = BhenguPaymentDiagnostics.Outcomes.Success;
         try
         {
             var service = new AccountService(_stripeClient);
@@ -148,42 +192,80 @@ public sealed class StripeMarketplaceProvider : IMarketplaceProvider
         }
         catch (StripeException ex)
         {
+            outcome = BhenguPaymentDiagnostics.Outcomes.Error;
             throw TranslateException(ex, "ListSubAccounts");
         }
         catch (HttpRequestException ex)
         {
+            outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable;
             throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
+        }
+        catch
+        {
+            outcome = BhenguPaymentDiagnostics.Outcomes.Error;
+            throw;
+        }
+        finally
+        {
+            activity.SetOutcome(outcome);
         }
     }
 
     /// <inheritdoc />
-    public Task<SplitDefinition> CreateSplitAsync(SplitDefinitionRequest request, CancellationToken ct = default)
+    public async Task<SplitDefinition> CreateSplitAsync(SplitDefinitionRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        if (request.Rules is null || request.Rules.Count == 0)
-            throw new BhenguPaymentException(ProviderName, "SplitDefinitionRequest.Rules must contain at least one beneficiary");
-
-        // Stripe has no first-class split resource. Persist locally and surface a stable reference
-        // the caller can pass on subsequent ChargeWithSplit calls.
-        var reference = $"split_{Guid.NewGuid():N}";
-        var split = new SplitDefinition
+        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "create_split");
+        var outcome = BhenguPaymentDiagnostics.Outcomes.Success;
+        try
         {
-            Reference = reference,
-            Name = request.Name,
-            Currency = request.Currency,
-            Rules = request.Rules
-        };
-        _splits[reference] = split;
-        _logger.LogInformation("Stripe in-memory split definition created: {SplitId} rules={RuleCount}", reference, request.Rules.Count);
-        return Task.FromResult(split);
+            if (request.Rules is null || request.Rules.Count == 0)
+                throw new BhenguPaymentException(ProviderName, "SplitDefinitionRequest.Rules must contain at least one beneficiary");
+
+            // Stripe has no first-class split resource. Persist in the distributed cache (365d TTL)
+            // and surface a stable reference the caller can pass on subsequent ChargeWithSplit calls.
+            var reference = $"split_{Guid.NewGuid():N}";
+            var split = new SplitDefinition
+            {
+                Reference = reference,
+                Name = request.Name,
+                Currency = request.Currency,
+                Rules = request.Rules
+            };
+            await _cache.SetAsync(SplitKeyPrefix + reference, split, SplitTtl, ct).ConfigureAwait(false);
+            _logger.LogInformation("Stripe split definition cached: {SplitId} rules={RuleCount}", reference, request.Rules.Count);
+            return split;
+        }
+        catch
+        {
+            outcome = BhenguPaymentDiagnostics.Outcomes.Error;
+            throw;
+        }
+        finally
+        {
+            activity.SetOutcome(outcome);
+        }
     }
 
     /// <inheritdoc />
-    public Task<SplitDefinition?> GetSplitAsync(string splitReference, CancellationToken ct = default)
+    public async Task<SplitDefinition?> GetSplitAsync(string splitReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(splitReference);
-        _splits.TryGetValue(splitReference, out var split);
-        return Task.FromResult(split);
+        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "get_split");
+        var outcome = BhenguPaymentDiagnostics.Outcomes.Success;
+        try
+        {
+            return await _cache.GetAsync<SplitDefinition>(SplitKeyPrefix + splitReference, ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            outcome = BhenguPaymentDiagnostics.Outcomes.Error;
+            throw;
+        }
+        finally
+        {
+            activity.SetOutcome(outcome);
+        }
     }
 
     /// <inheritdoc />
@@ -191,16 +273,21 @@ public sealed class StripeMarketplaceProvider : IMarketplaceProvider
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(request.Payment);
-
-        var rules = request.InlineRules ?? (request.SplitReference is not null && _splits.TryGetValue(request.SplitReference, out var def) ? def.Rules : null);
-        if (rules is null || rules.Count == 0)
-            throw new BhenguPaymentException(ProviderName, "Either SplitReference (with rules registered) or InlineRules must be supplied");
-
-        var requestOptions = BuildRequestOptions(request.Payment.IdempotencyKey);
-        var amountInCents = (long)(request.Payment.Amount * 100);
-
+        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Payment.Currency);
+        var outcome = BhenguPaymentDiagnostics.Outcomes.Success;
+        var start = Stopwatch.GetTimestamp();
         try
         {
+            var cachedRules = request.SplitReference is not null
+                ? (await _cache.GetAsync<SplitDefinition>(SplitKeyPrefix + request.SplitReference, ct).ConfigureAwait(false))?.Rules
+                : null;
+            var rules = request.InlineRules ?? cachedRules;
+            if (rules is null || rules.Count == 0)
+                throw new BhenguPaymentException(ProviderName, "Either SplitReference (with rules registered) or InlineRules must be supplied");
+
+            var requestOptions = BuildRequestOptions(request.Payment.IdempotencyKey);
+            var amountInCents = (long)(request.Payment.Amount * 100);
+
             // Fast path: a single 100% rule maps to PaymentIntent.transfer_data.destination —
             // one HTTP call, no post-settle transfer juggling. Stripe Connect's canonical pattern.
             if (rules.Count == 1 && rules[0].ShareType == SplitShareType.Percentage && rules[0].Percentage is 100m)
@@ -297,13 +384,34 @@ public sealed class StripeMarketplaceProvider : IMarketplaceProvider
                 Message = $"transfer_group={transferGroup}"
             };
         }
+        catch (PaymentDeclinedException) { outcome = BhenguPaymentDiagnostics.Outcomes.Declined; throw; }
+        catch (ProviderRateLimitException) { outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited; throw; }
+        catch (ProviderUnavailableException) { outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable; throw; }
         catch (StripeException ex)
         {
+            outcome = BhenguPaymentDiagnostics.Outcomes.Error;
             throw TranslateException(ex, "ChargeWithSplit");
         }
         catch (HttpRequestException ex)
         {
+            outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable;
             throw new ProviderUnavailableException(ProviderName, "HTTP request to Stripe failed", ex);
+        }
+        catch
+        {
+            outcome = BhenguPaymentDiagnostics.Outcomes.Error;
+            throw;
+        }
+        finally
+        {
+            activity.SetOutcome(outcome);
+            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("outcome", outcome));
+            BhenguPaymentDiagnostics.ChargeDurationMs.Record(
+                Stopwatch.GetElapsedTime(start).TotalMilliseconds,
+                new KeyValuePair<string, object?>("provider", ProviderName),
+                new KeyValuePair<string, object?>("outcome", outcome));
         }
     }
 

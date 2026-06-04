@@ -181,13 +181,13 @@ public class PaystackIdempotencyTests
     {
         var cache = new PaystackIdempotencyCache();
         var calls = 0;
-        async Task<int> Factory()
+        async Task<string> Factory()
         {
             await Task.Yield();
-            return Interlocked.Increment(ref calls);
+            return Interlocked.Increment(ref calls).ToString(System.Globalization.CultureInfo.InvariantCulture);
         }
-        var first = await cache.GetOrAddAsync<int>(null, Factory);
-        var second = await cache.GetOrAddAsync<int>(null, Factory);
+        var first = await cache.GetOrAddAsync<string>(null, Factory);
+        var second = await cache.GetOrAddAsync<string>(null, Factory);
         Assert.NotEqual(first, second);
         Assert.Equal(2, calls);
     }

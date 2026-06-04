@@ -52,7 +52,8 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         ProviderCapabilities.Idempotency |
         ProviderCapabilities.TypedWebhooks |
         ProviderCapabilities.PartialRefund |
-        ProviderCapabilities.Disputes;
+        ProviderCapabilities.Disputes |
+        ProviderCapabilities.ThreeDSecure;
 
     public RazorpayPaymentProvider(
         HttpClient httpClient,
@@ -75,10 +76,15 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", credentials);
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return Internals.RazorpayObservability.ObserveChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct));
+    }
 
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+    {
         var amountInPaise = (long)(request.Amount * 100);
         var currency = string.IsNullOrWhiteSpace(request.Currency)
             ? _options.Currency
@@ -141,10 +147,15 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         };
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return Internals.RazorpayObservability.ObserveRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct));
+    }
 
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
         var amountInPaise = (long)(request.Amount * 100);
         var refundBody = new
         {
@@ -172,10 +183,15 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         };
     }
 
-    public async Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return Internals.RazorpayObservability.ObservePayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct));
+    }
 
+    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+    {
         if (string.IsNullOrWhiteSpace(_options.RazorpayXAccountNumber))
             throw new ProviderConfigurationException(ProviderName,
                 $"{nameof(RazorpayOptions.RazorpayXAccountNumber)} is required for RazorpayX payouts");
@@ -213,6 +229,7 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         };
     }
 
+    /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -221,30 +238,39 @@ public sealed class RazorpayPaymentProvider : IPaymentGatewayProvider, IPayoutPr
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
             _logger.LogWarning("Razorpay WebhookSecret not configured — signature verification cannot succeed.");
+            Internals.RazorpayObservability.RecordWebhookVerification(false);
             return false;
         }
 
+        bool verified;
         try
         {
             using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
             var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
             var computedSignature = Convert.ToHexString(computedHash).ToLowerInvariant();
 
-            return CryptographicOperations.FixedTimeEquals(
+            verified = CryptographicOperations.FixedTimeEquals(
                 Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
                 Encoding.UTF8.GetBytes(computedSignature));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Razorpay webhook signature verification raised");
-            return false;
+            verified = false;
         }
+        Internals.RazorpayObservability.RecordWebhookVerification(verified);
+        return verified;
     }
 
+    /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+        return Internals.RazorpayObservability.ObserveWebhookAsync(() => ParseWebhookCoreAsync(payload, ct));
+    }
 
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload, CancellationToken ct)
+    {
         try
         {
             var webhookEvent = JsonSerializer.Deserialize<RazorpayWebhookEvent>(payload);

@@ -3,9 +3,12 @@
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Webhooks;
 using Bhengu.Finance.Payments.PayJustNow.Configuration;
+using Bhengu.Finance.Payments.PayJustNow.Internals;
 using Bhengu.Finance.Payments.PayJustNow.Providers;
 using Bhengu.Finance.Payments.Tests.TestHelpers;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -26,7 +29,8 @@ public class PayJustNowPaymentProviderTests
             UseSandbox = true
         };
         var http = new HttpClient(handler);
-        return new PayJustNowPaymentProvider(http, Options.Create(opts), NullLogger<PayJustNowPaymentProvider>.Instance);
+        return new PayJustNowPaymentProvider(http, Options.Create(opts), NullLogger<PayJustNowPaymentProvider>.Instance,
+            new PayJustNowIdempotencyCache(new InMemoryBhenguDistributedCache()));
     }
 
     private static PaymentRequest SamplePayment() => new()
@@ -42,7 +46,8 @@ public class PayJustNowPaymentProviderTests
     {
         var http = new HttpClient(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
         Assert.Throws<ProviderConfigurationException>(() =>
-            new PayJustNowPaymentProvider(http, Options.Create(new PayJustNowOptions { MerchantId = "x" }), NullLogger<PayJustNowPaymentProvider>.Instance));
+            new PayJustNowPaymentProvider(http, Options.Create(new PayJustNowOptions { MerchantId = "x" }), NullLogger<PayJustNowPaymentProvider>.Instance,
+                new PayJustNowIdempotencyCache(new InMemoryBhenguDistributedCache())));
     }
 
     [Fact]
@@ -50,7 +55,21 @@ public class PayJustNowPaymentProviderTests
     {
         var http = new HttpClient(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
         Assert.Throws<ProviderConfigurationException>(() =>
-            new PayJustNowPaymentProvider(http, Options.Create(new PayJustNowOptions { ApiKey = "x" }), NullLogger<PayJustNowPaymentProvider>.Instance));
+            new PayJustNowPaymentProvider(http, Options.Create(new PayJustNowOptions { ApiKey = "x" }), NullLogger<PayJustNowPaymentProvider>.Instance,
+                new PayJustNowIdempotencyCache(new InMemoryBhenguDistributedCache())));
+    }
+
+    [Fact]
+    public void Capabilities_IncludeSubscriptionsAndMandatesAndTypedWebhooks()
+    {
+        var provider = Create(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
+        Assert.True(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.Subscriptions));
+        Assert.True(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.Mandates));
+        Assert.True(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.TypedWebhooks));
+        Assert.True(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.Idempotency));
+        Assert.True(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.PartialRefund));
+        Assert.False(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.Payout));
+        Assert.False(provider.Capabilities.HasFlag(Bhengu.Finance.Payments.Core.ProviderCapabilities.ThreeDSecure));
     }
 
     [Fact]
@@ -94,6 +113,23 @@ public class PayJustNowPaymentProviderTests
         var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("network down"));
         var provider = Create(handler);
         await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.ProcessPaymentAsync(SamplePayment()));
+    }
+
+    [Fact]
+    public async Task ProcessPaymentAsync_DedupesOnSameIdempotencyKey()
+    {
+        var calls = 0;
+        var handler = new StubHttpMessageHandler((_, _) =>
+        {
+            calls++;
+            return StubHttpMessageHandler.Json(HttpStatusCode.OK,
+                $$"""{"order_id":"pjn_{{calls}}","status":"approved"}""");
+        });
+        var provider = Create(handler);
+        var r1 = await provider.ProcessPaymentAsync(SamplePayment() with { IdempotencyKey = "abc" });
+        var r2 = await provider.ProcessPaymentAsync(SamplePayment() with { IdempotencyKey = "abc" });
+        Assert.Equal(r1.GatewayReference, r2.GatewayReference);
+        Assert.Equal(1, calls);
     }
 
     [Fact]
@@ -145,15 +181,43 @@ public class PayJustNowPaymentProviderTests
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsEvent_ForOrderApproved()
+    public async Task ParseWebhookAsync_ReturnsTypedChargeSucceeded_ForOrderApproved()
     {
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
         var evt = await provider.ParseWebhookAsync("""
-            {"event_type":"order.approved","order_id":"pjn_99"}
+            {"event_type":"order.approved","order_id":"pjn_99","amount":15000,"currency":"ZAR"}
             """);
         Assert.NotNull(evt);
-        Assert.Equal("pjn_99", evt!.GatewayReference);
-        Assert.Equal(PaymentStatus.Completed, evt.Status);
+        var typed = Assert.IsType<ChargeSucceededEvent>(evt);
+        Assert.Equal("pjn_99", typed.GatewayReference);
+        Assert.Equal(WebhookEventCategory.ChargeSucceeded, typed.Category);
+        Assert.Equal(150m, typed.Amount);
+    }
+
+    [Fact]
+    public async Task ParseWebhookAsync_ReturnsTypedSubscriptionRenewed_OnInstalmentPaid()
+    {
+        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+        var evt = await provider.ParseWebhookAsync("""
+            {"event_type":"instalment.paid","order_id":"pjn_99","amount":5000,"currency":"ZAR","next_instalment_at":"2026-07-04T00:00:00Z"}
+            """);
+        Assert.NotNull(evt);
+        var typed = Assert.IsType<SubscriptionRenewedEvent>(evt);
+        Assert.Equal(50m, typed.Amount);
+        Assert.NotNull(typed.NextBillingAt);
+    }
+
+    [Fact]
+    public async Task ParseWebhookAsync_ReturnsTypedMandateActivated()
+    {
+        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+        var evt = await provider.ParseWebhookAsync("""
+            {"event_type":"mandate.activated","order_id":"pjn_mandate_5","amount":15000,"currency":"ZAR"}
+            """);
+        Assert.NotNull(evt);
+        var typed = Assert.IsType<MandateActivatedEvent>(evt);
+        Assert.Equal(WebhookEventCategory.MandateActivated, typed.Category);
+        Assert.Equal("pjn_mandate_5", typed.MandateReference);
     }
 
     [Fact]

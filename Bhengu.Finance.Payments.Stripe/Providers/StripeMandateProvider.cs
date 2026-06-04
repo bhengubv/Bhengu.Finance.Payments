@@ -6,6 +6,7 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Mandate;
 using Bhengu.Finance.Payments.Stripe.Configuration;
+using Bhengu.Finance.Payments.Stripe.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Stripe;
@@ -49,10 +50,14 @@ public sealed class StripeMandateProvider : IMandateProvider
     }
 
     /// <inheritdoc />
-    public async Task<Mandate> CreateMandateAsync(MandateRequest request, CancellationToken ct = default)
+    public Task<Mandate> CreateMandateAsync(MandateRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return StripeObservability.ObserveAsync("create_mandate", () => CreateMandateCoreAsync(request, ct));
+    }
 
+    private async Task<Mandate> CreateMandateCoreAsync(MandateRequest request, CancellationToken ct)
+    {
         var requestOptions = BuildRequestOptions(request.IdempotencyKey);
 
         try
@@ -110,10 +115,14 @@ public sealed class StripeMandateProvider : IMandateProvider
     }
 
     /// <inheritdoc />
-    public async Task<Mandate?> GetMandateAsync(string mandateReference, CancellationToken ct = default)
+    public Task<Mandate?> GetMandateAsync(string mandateReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(mandateReference);
+        return StripeObservability.ObserveAsync("get_mandate", () => GetMandateCoreAsync(mandateReference, ct));
+    }
 
+    private async Task<Mandate?> GetMandateCoreAsync(string mandateReference, CancellationToken ct)
+    {
         try
         {
             // Stripe mandate IDs use the prefix "mandate_". SetupIntent IDs use "seti_".
@@ -152,10 +161,14 @@ public sealed class StripeMandateProvider : IMandateProvider
     }
 
     /// <inheritdoc />
-    public async Task<Mandate> CancelMandateAsync(string mandateReference, CancellationToken ct = default)
+    public Task<Mandate> CancelMandateAsync(string mandateReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(mandateReference);
+        return StripeObservability.ObserveAsync("cancel_mandate", () => CancelMandateCoreAsync(mandateReference, ct));
+    }
 
+    private async Task<Mandate> CancelMandateCoreAsync(string mandateReference, CancellationToken ct)
+    {
         try
         {
             // Stripe mandates cannot be "cancelled" directly via the API — the canonical way is to
@@ -213,10 +226,14 @@ public sealed class StripeMandateProvider : IMandateProvider
     }
 
     /// <inheritdoc />
-    public async Task<PaymentResponse> ChargeMandateAsync(MandateChargeRequest request, CancellationToken ct = default)
+    public Task<PaymentResponse> ChargeMandateAsync(MandateChargeRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return StripeObservability.ObserveChargeAsync(request.Currency, () => ChargeMandateCoreAsync(request, ct));
+    }
 
+    private async Task<PaymentResponse> ChargeMandateCoreAsync(MandateChargeRequest request, CancellationToken ct)
+    {
         var requestOptions = BuildRequestOptions(request.IdempotencyKey);
 
         try

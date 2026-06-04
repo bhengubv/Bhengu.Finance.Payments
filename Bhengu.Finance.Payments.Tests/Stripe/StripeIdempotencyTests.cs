@@ -17,6 +17,7 @@ namespace Bhengu.Finance.Payments.Tests.Stripe;
 /// This is the Stripe-native pattern — distinct from providers that emulate idempotency
 /// with an in-process cache.
 /// </summary>
+[Collection(StripeConfigurationCollection.Name)]
 public class StripeIdempotencyTests
 {
     private static StripeOptions Opts() => new() { SecretKey = "sk_test_fake", WebhookSecret = "whsec_test_fake" };
