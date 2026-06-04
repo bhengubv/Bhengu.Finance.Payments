@@ -8,7 +8,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Mandate;
-using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Mukuru.Configuration;
 using Bhengu.Finance.Payments.Mukuru.Internals;
 using Microsoft.Extensions.Logging;
@@ -27,15 +27,14 @@ namespace Bhengu.Finance.Payments.Mukuru.Providers;
 /// active recurring transfer. The returned <see cref="PaymentResponse.GatewayReference"/> is the
 /// per-instalment transaction id — distinct from the mandate's parent reference.
 /// </remarks>
-public sealed class MukuruMandateProvider : IMandateProvider
+public sealed class MukuruMandateProvider : BhenguProviderBase, IMandateProvider
 {
     private readonly MukuruPaymentProvider _payment;
     private readonly MukuruOptions _options;
-    private readonly ILogger<MukuruMandateProvider> _logger;
     private readonly MukuruIdempotencyCache _idempotency;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Mukuru;
+    public override string ProviderName => ProviderNames.Mukuru;
 
     /// <summary>Construct the provider. Designed to be registered via DI.</summary>
     public MukuruMandateProvider(
@@ -43,10 +42,10 @@ public sealed class MukuruMandateProvider : IMandateProvider
         IOptions<MukuruOptions> options,
         ILogger<MukuruMandateProvider> logger,
         MukuruIdempotencyCache idempotency)
+        : base(logger)
     {
         _payment = payment ?? throw new ArgumentNullException(nameof(payment));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotency = idempotency ?? throw new ArgumentNullException(nameof(idempotency));
     }
 
@@ -54,13 +53,13 @@ public sealed class MukuruMandateProvider : IMandateProvider
     public Task<Mandate> CreateMandateAsync(MandateRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreateMandateCoreAsync(request, ct), ct);
+        return RunOperationAsync("create_mandate",
+            () => _idempotency.GetOrAddAsync(request.IdempotencyKey, () => CreateMandateCoreAsync(request, ct), ct),
+            ct);
     }
 
     private async Task<Mandate> CreateMandateCoreAsync(MandateRequest request, CancellationToken ct)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "mandate.create");
-
         var body = new
         {
             shopper_reference = request.CustomerId,
@@ -79,9 +78,14 @@ public sealed class MukuruMandateProvider : IMandateProvider
     }
 
     /// <inheritdoc/>
-    public async Task<Mandate?> GetMandateAsync(string mandateReference, CancellationToken ct = default)
+    public Task<Mandate?> GetMandateAsync(string mandateReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(mandateReference);
+        return RunOperationAsync("get_mandate", () => GetMandateCoreAsync(mandateReference, ct), ct);
+    }
+
+    private async Task<Mandate?> GetMandateCoreAsync(string mandateReference, CancellationToken ct)
+    {
         try
         {
             var response = await _payment.SendAsync(HttpMethod.Get, $"v1/send/recurring/{Uri.EscapeDataString(mandateReference)}", null, ct, "GetMandate").ConfigureAwait(false);
@@ -95,10 +99,14 @@ public sealed class MukuruMandateProvider : IMandateProvider
     }
 
     /// <inheritdoc/>
-    public async Task<Mandate> CancelMandateAsync(string mandateReference, CancellationToken ct = default)
+    public Task<Mandate> CancelMandateAsync(string mandateReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(mandateReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "mandate.cancel");
+        return RunOperationAsync("cancel_mandate", () => CancelMandateCoreAsync(mandateReference, ct), ct);
+    }
+
+    private async Task<Mandate> CancelMandateCoreAsync(string mandateReference, CancellationToken ct)
+    {
         try
         {
             var response = await _payment.SendAsync(HttpMethod.Post, $"v1/send/recurring/{Uri.EscapeDataString(mandateReference)}/cancel", new { }, ct, "CancelMandate").ConfigureAwait(false);
@@ -125,13 +133,13 @@ public sealed class MukuruMandateProvider : IMandateProvider
     public Task<PaymentResponse> ChargeMandateAsync(MandateChargeRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ChargeMandateCoreAsync(request, ct), ct);
+        return RunChargeAsync(request.Currency,
+            () => _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ChargeMandateCoreAsync(request, ct), ct),
+            ct);
     }
 
     private async Task<PaymentResponse> ChargeMandateCoreAsync(MandateChargeRequest request, CancellationToken ct)
     {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "mandate.charge");
-
         var body = new
         {
             amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture),

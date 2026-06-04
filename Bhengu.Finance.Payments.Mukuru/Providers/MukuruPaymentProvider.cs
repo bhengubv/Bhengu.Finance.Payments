@@ -1,10 +1,8 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
-using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -13,7 +11,8 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
-using Bhengu.Finance.Payments.Core.Observability;
+using Bhengu.Finance.Payments.Core.Providers;
+using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.Mukuru.Configuration;
 using Bhengu.Finance.Payments.Mukuru.Internals;
 using Microsoft.Extensions.Logging;
@@ -35,11 +34,10 @@ namespace Bhengu.Finance.Payments.Mukuru.Providers;
 /// Mukuru also exposes Mukuru Send recurring-transfer authorisations — wrapped via the sibling
 /// <see cref="MukuruMandateProvider"/>.
 /// </remarks>
-public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProvider
+public sealed class MukuruPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly MukuruOptions _options;
-    private readonly ILogger<MukuruPaymentProvider> _logger;
     private readonly MukuruIdempotencyCache _idempotency;
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
 
@@ -47,7 +45,7 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
     private DateTimeOffset _cachedTokenExpiresAt = DateTimeOffset.MinValue;
 
     /// <inheritdoc/>
-    public string ProviderName => ProviderNames.Mukuru;
+    public override string ProviderName => ProviderNames.Mukuru;
 
     /// <inheritdoc/>
     public ProviderCapabilities Capabilities =>
@@ -68,10 +66,10 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         IOptions<MukuruOptions> options,
         ILogger<MukuruPaymentProvider> logger,
         MukuruIdempotencyCache idempotency)
+        : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _idempotency = idempotency ?? throw new ArgumentNullException(nameof(idempotency));
 
         if (string.IsNullOrWhiteSpace(_options.ClientId))
@@ -93,14 +91,13 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPaymentCoreAsync(request, ct), ct);
+        return RunChargeAsync(request.Currency,
+            () => _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPaymentCoreAsync(request, ct), ct),
+            ct);
     }
 
     private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
     {
-        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
-        var sw = Stopwatch.StartNew();
-
         var requestBody = new
         {
             amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture),
@@ -109,70 +106,46 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
             reference = request.PaymentMethodToken
         };
 
-        try
-        {
-            var body = await SendAsync(HttpMethod.Post, "v1/wallet/topup", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
-            var topupResponse = JsonSerializer.Deserialize<MukuruTopupResponse>(body);
+        var body = await SendAsync(HttpMethod.Post, "v1/wallet/topup", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
+        var topupResponse = JsonSerializer.Deserialize<MukuruTopupResponse>(body);
 
-            _logger.LogInformation("Mukuru wallet topup: ref={Ref} status={Status}",
-                topupResponse?.Reference, topupResponse?.Status);
+        Logger.LogInformation("Mukuru wallet topup: ref={Ref} status={Status}",
+            topupResponse?.Reference, topupResponse?.Status);
 
-            var status = MapStatus(topupResponse?.Status);
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", status.ToString().ToLowerInvariant()));
-
-            return new PaymentResponse
-            {
-                GatewayReference = topupResponse?.TransactionId ?? request.PaymentMethodToken,
-                Status = status,
-                Amount = request.Amount,
-                Currency = request.Currency,
-                ProcessedAt = DateTime.UtcNow,
-                Message = topupResponse?.Message
-            };
-        }
-        catch (Exception)
+        return new PaymentResponse
         {
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", BhenguPaymentDiagnostics.Outcomes.Error));
-            throw;
-        }
-        finally
-        {
-            BhenguPaymentDiagnostics.ChargeDurationMs.Record(sw.Elapsed.TotalMilliseconds,
-                new KeyValuePair<string, object?>("provider", ProviderName));
-        }
+            GatewayReference = topupResponse?.TransactionId ?? request.PaymentMethodToken,
+            Status = MapStatus(topupResponse?.Status),
+            Amount = request.Amount,
+            Currency = request.Currency,
+            ProcessedAt = DateTime.UtcNow,
+            Message = topupResponse?.Message
+        };
     }
 
     /// <inheritdoc/>
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessRefundCoreAsync(request, ct), ct);
+        return RunRefundAsync(request.GatewayReference,
+            () => _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessRefundCoreAsync(request, ct), ct),
+            ct);
     }
 
     private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
     {
-        using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
         var path = $"v1/transactions/{Uri.EscapeDataString(request.GatewayReference)}/cancel";
         var body = await SendAsync(HttpMethod.Get, path, null, ct, "ProcessRefund").ConfigureAwait(false);
         var cancelResponse = JsonSerializer.Deserialize<MukuruCancelResponse>(body);
 
-        _logger.LogInformation("Mukuru transaction cancellation: txId={TxId} status={Status}",
+        Logger.LogInformation("Mukuru transaction cancellation: txId={TxId} status={Status}",
             request.GatewayReference, cancelResponse?.Status);
-
-        var status = MapStatus(cancelResponse?.Status);
-        BhenguPaymentDiagnostics.RefundsTotal.Add(1,
-            new KeyValuePair<string, object?>("provider", ProviderName),
-            new KeyValuePair<string, object?>("outcome", status == PaymentStatus.Refunded ? BhenguPaymentDiagnostics.Outcomes.Success : BhenguPaymentDiagnostics.Outcomes.Pending));
 
         return new RefundResponse
         {
             GatewayReference = cancelResponse?.TransactionId ?? request.GatewayReference,
             Amount = request.Amount,
-            Status = status,
+            Status = MapStatus(cancelResponse?.Status),
             ProcessedAt = DateTime.UtcNow,
             Message = cancelResponse?.Message
         };
@@ -182,12 +155,13 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPayoutCoreAsync(request, ct), ct);
+        return RunPayoutAsync(request.Currency,
+            () => _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPayoutCoreAsync(request, ct), ct),
+            ct);
     }
 
     private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
     {
-        using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, request.Currency);
         var parts = request.DestinationToken.Split(':');
         if (parts.Length < 3)
             throw new BhenguPaymentException(ProviderName,
@@ -226,22 +200,16 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
             reference
         };
 
-        var body = await SendAsync(HttpMethod.Post, "v1/transactions", requestBody, ct, "ProcessPayout")
-            .ConfigureAwait(false);
+        var body = await SendAsync(HttpMethod.Post, "v1/transactions", requestBody, ct, "ProcessPayout").ConfigureAwait(false);
         var txResponse = JsonSerializer.Deserialize<MukuruTransactionResponse>(body);
 
-        _logger.LogInformation("Mukuru transaction created: txId={TxId} status={Status}",
+        Logger.LogInformation("Mukuru transaction created: txId={TxId} status={Status}",
             txResponse?.TransactionId, txResponse?.Status);
-
-        var status = MapStatus(txResponse?.Status);
-        BhenguPaymentDiagnostics.PayoutsTotal.Add(1,
-            new KeyValuePair<string, object?>("provider", ProviderName),
-            new KeyValuePair<string, object?>("outcome", status == PaymentStatus.Completed ? BhenguPaymentDiagnostics.Outcomes.Success : BhenguPaymentDiagnostics.Outcomes.Pending));
 
         return new PayoutResponse
         {
             GatewayReference = txResponse?.TransactionId ?? reference,
-            Status = status,
+            Status = MapStatus(txResponse?.Status),
             Amount = request.Amount,
             Currency = request.Currency,
             ProcessedAt = DateTime.UtcNow
@@ -254,50 +222,34 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        bool valid;
         if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
         {
-            _logger.LogWarning("Mukuru WebhookSecret not configured — signature verification cannot succeed.");
-            valid = false;
-        }
-        else
-        {
-            try
-            {
-                using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(_options.WebhookSecret));
-                var computed = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant();
-                var supplied = signature.StartsWith("sha256=", StringComparison.OrdinalIgnoreCase)
-                    ? signature["sha256=".Length..]
-                    : signature;
-                valid = CryptographicOperations.FixedTimeEquals(
-                    Encoding.UTF8.GetBytes(computed),
-                    Encoding.UTF8.GetBytes(supplied.ToLowerInvariant()));
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Mukuru webhook signature verification raised");
-                valid = false;
-            }
+            Logger.LogWarning("Mukuru WebhookSecret not configured — signature verification cannot succeed.");
+            return RunWebhookVerify(() => false);
         }
 
-        BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
-            new KeyValuePair<string, object?>("provider", ProviderName),
-            new KeyValuePair<string, object?>("valid", valid));
-        return valid;
+        // Mukuru headers may be prefixed "sha256=<hex>"; strip the prefix before hand-off.
+        var supplied = signature.StartsWith("sha256=", StringComparison.OrdinalIgnoreCase)
+            ? signature["sha256=".Length..]
+            : signature;
+        return RunWebhookVerify(() => SignatureHelpers.VerifyHmacSha256(payload, supplied, _options.WebhookSecret));
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
+        return RunOperationAsync("parse_webhook", () => ParseWebhookCoreAsync(payload), ct);
+    }
 
-        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
+    private Task<WebhookEvent?> ParseWebhookCoreAsync(string payload)
+    {
         try
         {
             var webhookEvent = JsonSerializer.Deserialize<MukuruWebhookEvent>(payload);
             if (webhookEvent is null) return Task.FromResult<WebhookEvent?>(null);
 
-            _logger.LogInformation("Parsed Mukuru webhook: type={Type} txId={TxId}",
+            Logger.LogInformation("Parsed Mukuru webhook: type={Type} txId={TxId}",
                 webhookEvent.EventType, webhookEvent.Data?.TransactionId);
 
             var reference = webhookEvent.Data?.TransactionId;
@@ -376,7 +328,7 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to parse Mukuru webhook event");
+            Logger.LogError(ex, "Failed to parse Mukuru webhook event");
             return Task.FromResult<WebhookEvent?>(null);
         }
     }
@@ -391,14 +343,11 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
         if (!string.IsNullOrEmpty(_cachedToken))
             req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _cachedToken);
 
+        // HttpRequestException is auto-translated to ProviderUnavailableException by BhenguProviderBase.
         HttpResponseMessage response;
         try
         {
             response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new ProviderUnavailableException(ProviderName, "HTTP request to Mukuru failed", ex);
         }
         catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
         {
@@ -415,7 +364,7 @@ public sealed class MukuruPaymentProvider : IPaymentGatewayProvider, IPayoutProv
 
         if (!response.IsSuccessStatusCode)
         {
-            _logger.LogError("Mukuru {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            Logger.LogError("Mukuru {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");

@@ -6,6 +6,7 @@ using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Validation;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -27,13 +28,13 @@ namespace Bhengu.Finance.Payments.ApplePay.Providers;
 /// has no webhook channel; the downstream processor handles webhook events.
 /// </para>
 /// </summary>
-public sealed class ApplePayPaymentProvider : IPaymentGatewayProvider, IRequiresPostConstructionValidation
+public sealed class ApplePayPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IRequiresPostConstructionValidation
 {
     private readonly IServiceProvider _services;
     private readonly ApplePayOptions _options;
-    private readonly ILogger<ApplePayPaymentProvider> _logger;
 
-    public string ProviderName => ProviderNames.ApplePay;
+    /// <inheritdoc/>
+    public override string ProviderName => ProviderNames.ApplePay;
 
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
@@ -48,14 +49,15 @@ public sealed class ApplePayPaymentProvider : IPaymentGatewayProvider, IRequires
     /// </summary>
     public void Validate() => ResolveDownstream();
 
+    /// <summary>Construct the Apple Pay forwarding provider.</summary>
     public ApplePayPaymentProvider(
         IServiceProvider services,
         IOptions<ApplePayOptions> options,
         ILogger<ApplePayPaymentProvider> logger)
+        : base(logger)
     {
         _services = services ?? throw new ArgumentNullException(nameof(services));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         if (string.IsNullOrWhiteSpace(_options.MerchantId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(ApplePayOptions.MerchantId)} is required");
@@ -63,9 +65,15 @@ public sealed class ApplePayPaymentProvider : IPaymentGatewayProvider, IRequires
             throw new ProviderConfigurationException(ProviderName, $"{nameof(ApplePayOptions.DownstreamProcessor)} is required (e.g. 'stripe')");
     }
 
-    public async Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return RunChargeAsync(request.Currency, () => ProcessPaymentCoreAsync(request, ct), ct);
+    }
+
+    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+    {
         ValidatePkPaymentToken(request.PaymentMethodToken);
 
         var downstream = ResolveDownstream();
@@ -79,17 +87,23 @@ public sealed class ApplePayPaymentProvider : IPaymentGatewayProvider, IRequires
 
         var downstreamRequest = request with { Metadata = enrichedMetadata };
 
-        _logger.LogInformation("Apple Pay forwarding charge to downstream={Downstream} amount={Amount} {Currency}",
+        Logger.LogInformation("Apple Pay forwarding charge to downstream={Downstream} amount={Amount} {Currency}",
             _options.DownstreamProcessor, request.Amount, request.Currency);
 
         return await downstream.ProcessPaymentAsync(downstreamRequest, ct).ConfigureAwait(false);
     }
 
-    public async Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    /// <inheritdoc/>
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct), ct);
+    }
+
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    {
         var downstream = ResolveDownstream();
-        _logger.LogInformation("Apple Pay forwarding refund to downstream={Downstream} ref={Ref} amount={Amount}",
+        Logger.LogInformation("Apple Pay forwarding refund to downstream={Downstream} ref={Ref} amount={Amount}",
             _options.DownstreamProcessor, request.GatewayReference, request.Amount);
         return await downstream.ProcessRefundAsync(request, ct).ConfigureAwait(false);
     }
