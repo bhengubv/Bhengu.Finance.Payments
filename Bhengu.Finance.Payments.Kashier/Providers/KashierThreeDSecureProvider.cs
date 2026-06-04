@@ -49,96 +49,98 @@ public sealed class KashierThreeDSecureProvider : BhenguProviderBase, IThreeDSec
     }
 
     /// <inheritdoc/>
-    public async Task<ThreeDSecureChallenge> StartAuthenticationAsync(PaymentRequest chargeIntent, CancellationToken ct = default)
+    public Task<ThreeDSecureChallenge> StartAuthenticationAsync(PaymentRequest chargeIntent, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(chargeIntent);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "3ds.start");
-
-        var requestThreeDs = !string.Equals(chargeIntent.Metadata?.GetValueOrDefault("request_3d_secure"), "false", StringComparison.OrdinalIgnoreCase);
-        if (!requestThreeDs)
+        return RunOperationAsync("start_3ds_authentication", async () =>
         {
+            var requestThreeDs = !string.Equals(chargeIntent.Metadata?.GetValueOrDefault("request_3d_secure"), "false", StringComparison.OrdinalIgnoreCase);
+            if (!requestThreeDs)
+            {
+                return new ThreeDSecureChallenge
+                {
+                    Status = ThreeDSecureStatus.NotRequired,
+                    ChallengeReference = chargeIntent.IdempotencyKey ?? $"kashier-noscan-{Guid.NewGuid():N}"
+                };
+            }
+
+            var orderId = chargeIntent.Metadata?.GetValueOrDefault("orderId") ?? $"kashier-3ds-{Guid.NewGuid():N}";
+            var amount = chargeIntent.Amount.ToString("0.00", CultureInfo.InvariantCulture);
+            var currency = string.IsNullOrWhiteSpace(chargeIntent.Currency) ? _options.Currency : chargeIntent.Currency.ToUpperInvariant();
+
+            var requestBody = new
+            {
+                amount,
+                currency,
+                shopperReference = chargeIntent.CustomerId,
+                cardData = chargeIntent.PaymentMethodToken,
+                description = chargeIntent.Description,
+                ThreeDs = true
+            };
+
+            var responseBody = await KashierHttpClient.SendAsync(
+                _httpClient, Logger, HttpMethod.Post, $"orders/{Uri.EscapeDataString(orderId)}/payments",
+                requestBody, "Start3DS", ct, chargeIntent.IdempotencyKey).ConfigureAwait(false);
+
+            var response = JsonSerializer.Deserialize<KashierThreeDsResponse>(responseBody, KashierHttpClient.Json)?.Response
+                ?? throw new ProviderUnavailableException(ProviderName, "Kashier 3DS start returned no payload");
+
+            var statusUpper = response.Status?.ToUpperInvariant();
+            var status = (statusUpper, hasAcs: !string.IsNullOrWhiteSpace(response.AcsUrl)) switch
+            {
+                ({ } s, _) when s is "SUCCESS" or "APPROVED" => ThreeDSecureStatus.Authenticated,
+                (_, true) => ThreeDSecureStatus.ChallengeRequired,
+                ("PENDING_3DS" or "INPROGRESS", _) => ThreeDSecureStatus.ChallengeRequired,
+                ("FAILED" or "DECLINED", _) => ThreeDSecureStatus.Failed,
+                _ => ThreeDSecureStatus.Attempted
+            };
+
+            Logger.LogInformation("Kashier 3DS challenge: status={Status} acsUrl={HasAcs}", status, !string.IsNullOrEmpty(response.AcsUrl));
+
             return new ThreeDSecureChallenge
             {
-                Status = ThreeDSecureStatus.NotRequired,
-                ChallengeReference = chargeIntent.IdempotencyKey ?? $"kashier-noscan-{Guid.NewGuid():N}"
+                Status = status,
+                ChallengeReference = response.TransactionId ?? orderId,
+                RedirectUrl = response.AcsUrl,
+                ChallengePayload = response.Pareq,
+                ProtocolVersion = response.ProtocolVersion ?? "2.x",
+                DsTransactionId = response.DsTransactionId
             };
-        }
-
-        var orderId = chargeIntent.Metadata?.GetValueOrDefault("orderId") ?? $"kashier-3ds-{Guid.NewGuid():N}";
-        var amount = chargeIntent.Amount.ToString("0.00", CultureInfo.InvariantCulture);
-        var currency = string.IsNullOrWhiteSpace(chargeIntent.Currency) ? _options.Currency : chargeIntent.Currency.ToUpperInvariant();
-
-        var requestBody = new
-        {
-            amount,
-            currency,
-            shopperReference = chargeIntent.CustomerId,
-            cardData = chargeIntent.PaymentMethodToken,
-            description = chargeIntent.Description,
-            ThreeDs = true
-        };
-
-        var responseBody = await KashierHttpClient.SendAsync(
-            _httpClient, Logger, HttpMethod.Post, $"orders/{Uri.EscapeDataString(orderId)}/payments",
-            requestBody, "Start3DS", ct, chargeIntent.IdempotencyKey).ConfigureAwait(false);
-
-        var response = JsonSerializer.Deserialize<KashierThreeDsResponse>(responseBody, KashierHttpClient.Json)?.Response
-            ?? throw new ProviderUnavailableException(ProviderName, "Kashier 3DS start returned no payload");
-
-        var statusUpper = response.Status?.ToUpperInvariant();
-        var status = (statusUpper, hasAcs: !string.IsNullOrWhiteSpace(response.AcsUrl)) switch
-        {
-            ({ } s, _) when s is "SUCCESS" or "APPROVED" => ThreeDSecureStatus.Authenticated,
-            (_, true) => ThreeDSecureStatus.ChallengeRequired,
-            ("PENDING_3DS" or "INPROGRESS", _) => ThreeDSecureStatus.ChallengeRequired,
-            ("FAILED" or "DECLINED", _) => ThreeDSecureStatus.Failed,
-            _ => ThreeDSecureStatus.Attempted
-        };
-
-        Logger.LogInformation("Kashier 3DS challenge: status={Status} acsUrl={HasAcs}", status, !string.IsNullOrEmpty(response.AcsUrl));
-
-        return new ThreeDSecureChallenge
-        {
-            Status = status,
-            ChallengeReference = response.TransactionId ?? orderId,
-            RedirectUrl = response.AcsUrl,
-            ChallengePayload = response.Pareq,
-            ProtocolVersion = response.ProtocolVersion ?? "2.x",
-            DsTransactionId = response.DsTransactionId
-        };
+        }, ct);
     }
 
     /// <inheritdoc/>
-    public async Task<ThreeDSecureChallenge> GetChallengeAsync(string challengeReference, CancellationToken ct = default)
+    public Task<ThreeDSecureChallenge> GetChallengeAsync(string challengeReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(challengeReference);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "3ds.get");
-
-        try
+        return RunOperationAsync("get_3ds_challenge", async () =>
         {
-            var responseBody = await KashierHttpClient.SendAsync(
-                _httpClient, Logger, HttpMethod.Get, $"payments/{Uri.EscapeDataString(challengeReference)}", null, "Get3DS", ct).ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<KashierThreeDsResponse>(responseBody, KashierHttpClient.Json)?.Response;
-            if (response is null)
-                return new ThreeDSecureChallenge { Status = ThreeDSecureStatus.ChallengeRequired, ChallengeReference = challengeReference };
-
-            return new ThreeDSecureChallenge
+            try
             {
-                Status = (response.Status?.ToUpperInvariant()) switch
+                var responseBody = await KashierHttpClient.SendAsync(
+                    _httpClient, Logger, HttpMethod.Get, $"payments/{Uri.EscapeDataString(challengeReference)}", null, "Get3DS", ct).ConfigureAwait(false);
+                var response = JsonSerializer.Deserialize<KashierThreeDsResponse>(responseBody, KashierHttpClient.Json)?.Response;
+                if (response is null)
+                    return new ThreeDSecureChallenge { Status = ThreeDSecureStatus.ChallengeRequired, ChallengeReference = challengeReference };
+
+                return new ThreeDSecureChallenge
                 {
-                    "SUCCESS" or "APPROVED" => ThreeDSecureStatus.Authenticated,
-                    "FAILED" or "DECLINED" => ThreeDSecureStatus.Failed,
-                    _ => ThreeDSecureStatus.ChallengeRequired
-                },
-                ChallengeReference = challengeReference,
-                DsTransactionId = response.DsTransactionId,
-                ProtocolVersion = response.ProtocolVersion
-            };
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            return new ThreeDSecureChallenge { Status = ThreeDSecureStatus.ChallengeRequired, ChallengeReference = challengeReference };
-        }
+                    Status = (response.Status?.ToUpperInvariant()) switch
+                    {
+                        "SUCCESS" or "APPROVED" => ThreeDSecureStatus.Authenticated,
+                        "FAILED" or "DECLINED" => ThreeDSecureStatus.Failed,
+                        _ => ThreeDSecureStatus.ChallengeRequired
+                    },
+                    ChallengeReference = challengeReference,
+                    DsTransactionId = response.DsTransactionId,
+                    ProtocolVersion = response.ProtocolVersion
+                };
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return new ThreeDSecureChallenge { Status = ThreeDSecureStatus.ChallengeRequired, ChallengeReference = challengeReference };
+            }
+        }, ct);
     }
 
     private sealed class KashierThreeDsResponse

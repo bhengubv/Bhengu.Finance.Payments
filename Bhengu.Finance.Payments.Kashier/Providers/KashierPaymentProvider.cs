@@ -1,6 +1,5 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
-using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
@@ -12,7 +11,6 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
-using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Kashier.Configuration;
 using Bhengu.Finance.Payments.Kashier.Internals;
 using Microsoft.Extensions.Logging;
@@ -80,29 +78,25 @@ public sealed class KashierPaymentProvider : BhenguProviderBase, IPaymentGateway
         return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPaymentCoreAsync(request, ct), ct);
     }
 
-    private async Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
-    {
-        using var activity = BhenguPaymentDiagnostics.StartChargeActivity(ProviderName, request.Currency);
-        var sw = Stopwatch.StartNew();
-
-        var orderId = request.Metadata?.GetValueOrDefault("orderId") ?? $"kashier-{Guid.NewGuid():N}";
-        var amount = request.Amount.ToString("0.00", CultureInfo.InvariantCulture);
-        var currency = string.IsNullOrWhiteSpace(request.Currency) ? _options.Currency : request.Currency.ToUpperInvariant();
-        var requestThreeDs = !string.Equals(request.Metadata?.GetValueOrDefault("request_3d_secure"), "false", StringComparison.OrdinalIgnoreCase);
-
-        var requestBody = new
+    private Task<PaymentResponse> ProcessPaymentCoreAsync(PaymentRequest request, CancellationToken ct)
+        => RunChargeAsync(request.Currency, async () =>
         {
-            amount,
-            currency,
-            shopperReference = request.Metadata?.GetValueOrDefault("shopperReference"),
-            cardData = request.PaymentMethodToken,
-            description = request.Description,
-            // Kashier honours the "3ds" boolean. true = mandatory step-up if the issuer supports it.
-            ThreeDs = requestThreeDs
-        };
+            var orderId = request.Metadata?.GetValueOrDefault("orderId") ?? $"kashier-{Guid.NewGuid():N}";
+            var amount = request.Amount.ToString("0.00", CultureInfo.InvariantCulture);
+            var currency = string.IsNullOrWhiteSpace(request.Currency) ? _options.Currency : request.Currency.ToUpperInvariant();
+            var requestThreeDs = !string.Equals(request.Metadata?.GetValueOrDefault("request_3d_secure"), "false", StringComparison.OrdinalIgnoreCase);
 
-        try
-        {
+            var requestBody = new
+            {
+                amount,
+                currency,
+                shopperReference = request.Metadata?.GetValueOrDefault("shopperReference"),
+                cardData = request.PaymentMethodToken,
+                description = request.Description,
+                // Kashier honours the "3ds" boolean. true = mandatory step-up if the issuer supports it.
+                ThreeDs = requestThreeDs
+            };
+
             var body = await KashierHttpClient.SendAsync(
                 _httpClient, Logger, HttpMethod.Post, $"orders/{Uri.EscapeDataString(orderId)}/payments",
                 requestBody, "ProcessPayment", ct, request.IdempotencyKey).ConfigureAwait(false);
@@ -114,17 +108,6 @@ public sealed class KashierPaymentProvider : BhenguProviderBase, IPaymentGateway
             var txId = kashierResponse?.Response?.TransactionId ?? orderId;
             var status = MapStatus(kashierResponse?.Response?.Status);
 
-            activity.SetOutcome(status switch
-            {
-                PaymentStatus.Completed => BhenguPaymentDiagnostics.Outcomes.Success,
-                PaymentStatus.Pending => BhenguPaymentDiagnostics.Outcomes.Pending,
-                PaymentStatus.Failed => BhenguPaymentDiagnostics.Outcomes.Declined,
-                _ => BhenguPaymentDiagnostics.Outcomes.Pending
-            });
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", status.ToString().ToLowerInvariant()));
-
             return new PaymentResponse
             {
                 GatewayReference = txId,
@@ -135,21 +118,7 @@ public sealed class KashierPaymentProvider : BhenguProviderBase, IPaymentGateway
                 RedirectUrl = kashierResponse?.Response?.RedirectUrl,
                 Message = kashierResponse?.Response?.Status
             };
-        }
-        catch (Exception)
-        {
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            BhenguPaymentDiagnostics.ChargesTotal.Add(1,
-                new KeyValuePair<string, object?>("provider", ProviderName),
-                new KeyValuePair<string, object?>("outcome", BhenguPaymentDiagnostics.Outcomes.Error));
-            throw;
-        }
-        finally
-        {
-            BhenguPaymentDiagnostics.ChargeDurationMs.Record(sw.Elapsed.TotalMilliseconds,
-                new KeyValuePair<string, object?>("provider", ProviderName));
-        }
-    }
+        }, ct);
 
     /// <inheritdoc/>
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
@@ -158,41 +127,37 @@ public sealed class KashierPaymentProvider : BhenguProviderBase, IPaymentGateway
         return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessRefundCoreAsync(request, ct), ct);
     }
 
-    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
-    {
-        using var activity = BhenguPaymentDiagnostics.StartRefundActivity(ProviderName, request.GatewayReference);
-        var requestBody = new
+    private Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+        => RunRefundAsync(request.GatewayReference, async () =>
         {
-            merchantId = _options.MerchantId,
-            orderId = request.GatewayReference,
-            transactionId = request.GatewayReference,
-            amount = request.Amount.ToString("0.00", CultureInfo.InvariantCulture),
-            reason = request.Reason
-        };
+            var requestBody = new
+            {
+                merchantId = _options.MerchantId,
+                orderId = request.GatewayReference,
+                transactionId = request.GatewayReference,
+                amount = request.Amount.ToString("0.00", CultureInfo.InvariantCulture),
+                reason = request.Reason
+            };
 
-        var body = await KashierHttpClient.SendAsync(
-            _httpClient, Logger, HttpMethod.Post, "payments/refund", requestBody, "ProcessRefund", ct, request.IdempotencyKey).ConfigureAwait(false);
-        var refundResponse = JsonSerializer.Deserialize<KashierPaymentResponse>(body, KashierHttpClient.Json);
+            var body = await KashierHttpClient.SendAsync(
+                _httpClient, Logger, HttpMethod.Post, "payments/refund", requestBody, "ProcessRefund", ct, request.IdempotencyKey).ConfigureAwait(false);
+            var refundResponse = JsonSerializer.Deserialize<KashierPaymentResponse>(body, KashierHttpClient.Json);
 
-        Logger.LogInformation("Kashier refund created: tx={Tx} status={Status}",
-            request.GatewayReference, refundResponse?.Response?.Status);
+            Logger.LogInformation("Kashier refund created: tx={Tx} status={Status}",
+                request.GatewayReference, refundResponse?.Response?.Status);
 
-        var mapped = MapStatus(refundResponse?.Response?.Status);
-        var outcome = mapped is PaymentStatus.Completed or PaymentStatus.Refunded ? PaymentStatus.Refunded : mapped;
+            var mapped = MapStatus(refundResponse?.Response?.Status);
+            var outcome = mapped is PaymentStatus.Completed or PaymentStatus.Refunded ? PaymentStatus.Refunded : mapped;
 
-        BhenguPaymentDiagnostics.RefundsTotal.Add(1,
-            new KeyValuePair<string, object?>("provider", ProviderName),
-            new KeyValuePair<string, object?>("outcome", outcome == PaymentStatus.Refunded ? BhenguPaymentDiagnostics.Outcomes.Success : BhenguPaymentDiagnostics.Outcomes.Pending));
-
-        return new RefundResponse
-        {
-            GatewayReference = refundResponse?.Response?.TransactionId ?? request.GatewayReference,
-            Amount = request.Amount,
-            Status = outcome,
-            ProcessedAt = DateTime.UtcNow,
-            Message = refundResponse?.Response?.Status
-        };
-    }
+            return new RefundResponse
+            {
+                GatewayReference = refundResponse?.Response?.TransactionId ?? request.GatewayReference,
+                Amount = request.Amount,
+                Status = outcome,
+                ProcessedAt = DateTime.UtcNow,
+                Message = refundResponse?.Response?.Status
+            };
+        }, ct);
 
     /// <inheritdoc/>
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
@@ -201,39 +166,36 @@ public sealed class KashierPaymentProvider : BhenguProviderBase, IPaymentGateway
         return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => ProcessPayoutCoreAsync(request, ct), ct);
     }
 
-    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
-    {
-        using var activity = BhenguPaymentDiagnostics.StartPayoutActivity(ProviderName, request.Currency);
-        var requestBody = new
+    private Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
+        => RunPayoutAsync(request.Currency, async () =>
         {
-            merchantId = _options.MerchantId,
-            destination = request.DestinationToken,
-            amount = request.Amount.ToString("0.00", CultureInfo.InvariantCulture),
-            currency = request.Currency.ToUpperInvariant(),
-            description = request.Description
-        };
+            var requestBody = new
+            {
+                merchantId = _options.MerchantId,
+                destination = request.DestinationToken,
+                amount = request.Amount.ToString("0.00", CultureInfo.InvariantCulture),
+                currency = request.Currency.ToUpperInvariant(),
+                description = request.Description
+            };
 
-        var body = await KashierHttpClient.SendAsync(
-            _httpClient, Logger, HttpMethod.Post, "payouts", requestBody, "ProcessPayout", ct, request.IdempotencyKey).ConfigureAwait(false);
-        var payoutResponse = JsonSerializer.Deserialize<KashierPaymentResponse>(body, KashierHttpClient.Json);
+            var body = await KashierHttpClient.SendAsync(
+                _httpClient, Logger, HttpMethod.Post, "payouts", requestBody, "ProcessPayout", ct, request.IdempotencyKey).ConfigureAwait(false);
+            var payoutResponse = JsonSerializer.Deserialize<KashierPaymentResponse>(body, KashierHttpClient.Json);
 
-        Logger.LogInformation("Kashier payout created: id={Id} status={Status}",
-            payoutResponse?.Response?.TransactionId, payoutResponse?.Response?.Status);
+            Logger.LogInformation("Kashier payout created: id={Id} status={Status}",
+                payoutResponse?.Response?.TransactionId, payoutResponse?.Response?.Status);
 
-        var status = MapStatus(payoutResponse?.Response?.Status);
-        BhenguPaymentDiagnostics.PayoutsTotal.Add(1,
-            new KeyValuePair<string, object?>("provider", ProviderName),
-            new KeyValuePair<string, object?>("outcome", status == PaymentStatus.Completed ? BhenguPaymentDiagnostics.Outcomes.Success : BhenguPaymentDiagnostics.Outcomes.Pending));
+            var status = MapStatus(payoutResponse?.Response?.Status);
 
-        return new PayoutResponse
-        {
-            GatewayReference = payoutResponse?.Response?.TransactionId ?? string.Empty,
-            Amount = request.Amount,
-            Currency = request.Currency,
-            Status = status,
-            ProcessedAt = DateTime.UtcNow
-        };
-    }
+            return new PayoutResponse
+            {
+                GatewayReference = payoutResponse?.Response?.TransactionId ?? string.Empty,
+                Amount = request.Amount,
+                Currency = request.Currency,
+                Status = status,
+                ProcessedAt = DateTime.UtcNow
+            };
+        }, ct);
 
     /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
@@ -241,143 +203,139 @@ public sealed class KashierPaymentProvider : BhenguProviderBase, IPaymentGateway
         ArgumentException.ThrowIfNullOrEmpty(payload);
         ArgumentException.ThrowIfNullOrEmpty(signature);
 
-        var secret = string.IsNullOrWhiteSpace(_options.WebhookSecret) ? _options.SecretKey : _options.WebhookSecret;
-        bool valid;
-        if (string.IsNullOrWhiteSpace(secret))
+        return RunWebhookVerify(() =>
         {
-            Logger.LogWarning("Kashier webhook secret not configured — signature verification cannot succeed.");
-            valid = false;
-        }
-        else
-        {
+            var secret = string.IsNullOrWhiteSpace(_options.WebhookSecret) ? _options.SecretKey : _options.WebhookSecret;
+            if (string.IsNullOrWhiteSpace(secret))
+            {
+                Logger.LogWarning("Kashier webhook secret not configured — signature verification cannot succeed.");
+                return false;
+            }
+
             try
             {
                 using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
                 var computedHash = hmac.ComputeHash(Encoding.UTF8.GetBytes(payload));
                 var computedSignature = Convert.ToHexString(computedHash).ToLowerInvariant();
 
-                valid = CryptographicOperations.FixedTimeEquals(
+                return CryptographicOperations.FixedTimeEquals(
                     Encoding.UTF8.GetBytes(signature.ToLowerInvariant()),
                     Encoding.UTF8.GetBytes(computedSignature));
             }
             catch (Exception ex)
             {
                 Logger.LogError(ex, "Kashier webhook signature verification raised");
-                valid = false;
+                return false;
             }
-        }
-
-        BhenguPaymentDiagnostics.WebhookVerificationsTotal.Add(1,
-            new KeyValuePair<string, object?>("provider", ProviderName),
-            new KeyValuePair<string, object?>("valid", valid));
-        return valid;
+        });
     }
 
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-
-        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
-        try
+        return RunOperationAsync("parse_webhook", () =>
         {
-            var webhook = JsonSerializer.Deserialize<KashierWebhookEvent>(payload, KashierHttpClient.Json);
-            if (webhook is null) return Task.FromResult<WebhookEvent?>(null);
-
-            Logger.LogInformation("Parsed Kashier webhook: event={Event} status={Status}",
-                webhook.Event, webhook.Data?.Status);
-
-            var data = webhook.Data;
-            var reference = data?.TransactionId ?? data?.OrderId;
-            if (string.IsNullOrEmpty(reference))
-                return Task.FromResult<WebhookEvent?>(null);
-
-            var amount = decimal.TryParse(data?.Amount, NumberStyles.Number, CultureInfo.InvariantCulture, out var amt) ? amt : 0m;
-            var currency = data?.Currency ?? _options.Currency;
-            var eventUpper = webhook.Event?.ToUpperInvariant();
-            var statusUpper = data?.Status?.ToUpperInvariant();
-
-            return Task.FromResult<WebhookEvent?>(eventUpper switch
+            try
             {
-                "PAY" or "CAPTURE" when statusUpper is "SUCCESS" or "PAID" => new ChargeSucceededEvent
+                var webhook = JsonSerializer.Deserialize<KashierWebhookEvent>(payload, KashierHttpClient.Json);
+                if (webhook is null) return Task.FromResult<WebhookEvent?>(null);
+
+                Logger.LogInformation("Parsed Kashier webhook: event={Event} status={Status}",
+                    webhook.Event, webhook.Data?.Status);
+
+                var data = webhook.Data;
+                var reference = data?.TransactionId ?? data?.OrderId;
+                if (string.IsNullOrEmpty(reference))
+                    return Task.FromResult<WebhookEvent?>(null);
+
+                var amount = decimal.TryParse(data?.Amount, NumberStyles.Number, CultureInfo.InvariantCulture, out var amt) ? amt : 0m;
+                var currency = data?.Currency ?? _options.Currency;
+                var eventUpper = webhook.Event?.ToUpperInvariant();
+                var statusUpper = data?.Status?.ToUpperInvariant();
+
+                return Task.FromResult<WebhookEvent?>(eventUpper switch
                 {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Completed,
-                    EventType = webhook.Event,
-                    Category = WebhookEventCategory.ChargeSucceeded,
-                    Amount = amount,
-                    Currency = currency,
-                    CustomerId = data?.ShopperReference,
-                    PaymentMethodToken = data?.CardToken
-                },
-                "PAY" or "CAPTURE" => new ChargePendingEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Pending,
-                    EventType = webhook.Event,
-                    Category = WebhookEventCategory.ChargePending,
-                    Amount = amount,
-                    Currency = currency
-                },
-                "FAILED" or "DECLINED" => new ChargeFailedEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Failed,
-                    EventType = webhook.Event,
-                    Category = WebhookEventCategory.ChargeFailed,
-                    Amount = amount,
-                    Currency = currency,
-                    FailureCode = data?.Status,
-                    FailureMessage = data?.Message
-                },
-                "REFUND" => new RefundSucceededEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Refunded,
-                    EventType = webhook.Event,
-                    Category = WebhookEventCategory.RefundSucceeded,
-                    RefundReference = data?.RefundId ?? reference,
-                    Amount = amount,
-                    Currency = currency,
-                    IsPartial = false
-                },
-                "PAYOUT" when statusUpper is "SUCCESS" or "PAID" => new PayoutCompletedEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Completed,
-                    EventType = webhook.Event,
-                    Category = WebhookEventCategory.PayoutCompleted,
-                    PayoutReference = reference,
-                    Amount = amount,
-                    Currency = currency,
-                    DestinationToken = data?.Destination
-                },
-                "PAYOUT" => new PayoutFailedEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Failed,
-                    EventType = webhook.Event,
-                    Category = WebhookEventCategory.PayoutFailed,
-                    PayoutReference = reference,
-                    Amount = amount,
-                    Currency = currency,
-                    FailureCode = data?.Status,
-                    FailureMessage = data?.Message
-                },
-                _ => new WebhookEvent
-                {
-                    GatewayReference = reference,
-                    Status = MapStatus(statusUpper),
-                    EventType = webhook.Event,
-                    Category = WebhookEventCategory.Unknown
-                }
-            });
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Failed to parse Kashier webhook");
-            return Task.FromResult<WebhookEvent?>(null);
-        }
+                    "PAY" or "CAPTURE" when statusUpper is "SUCCESS" or "PAID" => new ChargeSucceededEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Completed,
+                        EventType = webhook.Event,
+                        Category = WebhookEventCategory.ChargeSucceeded,
+                        Amount = amount,
+                        Currency = currency,
+                        CustomerId = data?.ShopperReference,
+                        PaymentMethodToken = data?.CardToken
+                    },
+                    "PAY" or "CAPTURE" => new ChargePendingEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Pending,
+                        EventType = webhook.Event,
+                        Category = WebhookEventCategory.ChargePending,
+                        Amount = amount,
+                        Currency = currency
+                    },
+                    "FAILED" or "DECLINED" => new ChargeFailedEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Failed,
+                        EventType = webhook.Event,
+                        Category = WebhookEventCategory.ChargeFailed,
+                        Amount = amount,
+                        Currency = currency,
+                        FailureCode = data?.Status,
+                        FailureMessage = data?.Message
+                    },
+                    "REFUND" => new RefundSucceededEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Refunded,
+                        EventType = webhook.Event,
+                        Category = WebhookEventCategory.RefundSucceeded,
+                        RefundReference = data?.RefundId ?? reference,
+                        Amount = amount,
+                        Currency = currency,
+                        IsPartial = false
+                    },
+                    "PAYOUT" when statusUpper is "SUCCESS" or "PAID" => new PayoutCompletedEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Completed,
+                        EventType = webhook.Event,
+                        Category = WebhookEventCategory.PayoutCompleted,
+                        PayoutReference = reference,
+                        Amount = amount,
+                        Currency = currency,
+                        DestinationToken = data?.Destination
+                    },
+                    "PAYOUT" => new PayoutFailedEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Failed,
+                        EventType = webhook.Event,
+                        Category = WebhookEventCategory.PayoutFailed,
+                        PayoutReference = reference,
+                        Amount = amount,
+                        Currency = currency,
+                        FailureCode = data?.Status,
+                        FailureMessage = data?.Message
+                    },
+                    _ => new WebhookEvent
+                    {
+                        GatewayReference = reference,
+                        Status = MapStatus(statusUpper),
+                        EventType = webhook.Event,
+                        Category = WebhookEventCategory.Unknown
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Failed to parse Kashier webhook");
+                return Task.FromResult<WebhookEvent?>(null);
+            }
+        }, ct);
     }
 
     /// <summary>

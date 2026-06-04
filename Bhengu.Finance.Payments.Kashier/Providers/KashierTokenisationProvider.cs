@@ -48,21 +48,23 @@ public sealed class KashierTokenisationProvider : BhenguProviderBase, ITokenisat
     }
 
     /// <inheritdoc/>
-    public async Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
+    public Task<PaymentMethod?> GetPaymentMethodAsync(string token, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(token);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise.get");
-        try
+        return RunOperationAsync<PaymentMethod?>("get_payment_method", async () =>
         {
-            var responseBody = await KashierHttpClient.SendAsync(
-                _httpClient, Logger, HttpMethod.Get, $"cards/{Uri.EscapeDataString(token)}", null, "GetPaymentMethod", ct).ConfigureAwait(false);
-            var card = JsonSerializer.Deserialize<KashierCardResponse>(responseBody, KashierHttpClient.Json)?.Response;
-            return card is null || string.IsNullOrEmpty(card.CardToken) ? null : Map(card, null);
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            return null;
-        }
+            try
+            {
+                var responseBody = await KashierHttpClient.SendAsync(
+                    _httpClient, Logger, HttpMethod.Get, $"cards/{Uri.EscapeDataString(token)}", null, "GetPaymentMethod", ct).ConfigureAwait(false);
+                var card = JsonSerializer.Deserialize<KashierCardResponse>(responseBody, KashierHttpClient.Json)?.Response;
+                return card is null || string.IsNullOrEmpty(card.CardToken) ? null : Map(card, null);
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return null;
+            }
+        }, ct);
     }
 
     /// <inheritdoc/>
@@ -88,20 +90,22 @@ public sealed class KashierTokenisationProvider : BhenguProviderBase, ITokenisat
     }
 
     /// <inheritdoc/>
-    public async Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
+    public Task<bool> DeletePaymentMethodAsync(string token, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(token);
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise.delete");
-        try
+        return RunOperationAsync("delete_payment_method", async () =>
         {
-            await KashierHttpClient.SendAsync(
-                _httpClient, Logger, HttpMethod.Delete, $"cards/{Uri.EscapeDataString(token)}", null, "DeletePaymentMethod", ct).ConfigureAwait(false);
-            return true;
-        }
-        catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
-        {
-            return false;
-        }
+            try
+            {
+                await KashierHttpClient.SendAsync(
+                    _httpClient, Logger, HttpMethod.Delete, $"cards/{Uri.EscapeDataString(token)}", null, "DeletePaymentMethod", ct).ConfigureAwait(false);
+                return true;
+            }
+            catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
+            {
+                return false;
+            }
+        }, ct);
     }
 
     internal static PaymentMethod Map(KashierCardData card, TokeniseRequest? request) => new()
@@ -187,35 +191,34 @@ public sealed class KashierRawCardTokenisationProvider : BhenguProviderBase, IRa
         return _idempotency.GetOrAddAsync(request.IdempotencyKey, () => TokeniseCoreAsync(request, ct), ct);
     }
 
-    private async Task<PaymentMethod> TokeniseCoreAsync(TokeniseRequest request, CancellationToken ct)
-    {
-        using var activity = BhenguPaymentDiagnostics.StartOperationActivity(ProviderName, "tokenise");
-
-        var body = new
+    private Task<PaymentMethod> TokeniseCoreAsync(TokeniseRequest request, CancellationToken ct)
+        => RunOperationAsync("tokenise_card", async () =>
         {
-            merchantId = _options.MerchantId,
-            shopperReference = request.CustomerId,
-            cardholderName = request.Card.CardholderName,
-            cardNumber = request.Card.CardNumber,
-            expiryMonth = request.Card.ExpiryMonth.ToString("D2", CultureInfo.InvariantCulture),
-            expiryYear = request.Card.ExpiryYear.ToString(CultureInfo.InvariantCulture),
-            cvv = request.Card.Cvv,
-            setAsDefault = request.SetAsDefault,
-            displayName = request.DisplayName
-        };
+            var body = new
+            {
+                merchantId = _options.MerchantId,
+                shopperReference = request.CustomerId,
+                cardholderName = request.Card.CardholderName,
+                cardNumber = request.Card.CardNumber,
+                expiryMonth = request.Card.ExpiryMonth.ToString("D2", CultureInfo.InvariantCulture),
+                expiryYear = request.Card.ExpiryYear.ToString(CultureInfo.InvariantCulture),
+                cvv = request.Card.Cvv,
+                setAsDefault = request.SetAsDefault,
+                displayName = request.DisplayName
+            };
 
-        var responseBody = await KashierHttpClient.SendAsync(
-            _httpClient, Logger, HttpMethod.Post, "cards", body, "Tokenise", ct, request.IdempotencyKey).ConfigureAwait(false);
-        var response = JsonSerializer.Deserialize<KashierTokenisationProvider.KashierCardResponse>(responseBody, KashierHttpClient.Json)?.Response
-            ?? throw new BhenguPaymentException(ProviderName, "Kashier tokenisation returned no payload", "no_data");
+            var responseBody = await KashierHttpClient.SendAsync(
+                _httpClient, Logger, HttpMethod.Post, "cards", body, "Tokenise", ct, request.IdempotencyKey).ConfigureAwait(false);
+            var response = JsonSerializer.Deserialize<KashierTokenisationProvider.KashierCardResponse>(responseBody, KashierHttpClient.Json)?.Response
+                ?? throw new BhenguPaymentException(ProviderName, "Kashier tokenisation returned no payload", "no_data");
 
-        if (string.IsNullOrWhiteSpace(response.CardToken))
-            throw new PaymentDeclinedException(ProviderName, "no_card_token",
-                "Kashier did not return a card_token — card may have been declined.");
+            if (string.IsNullOrWhiteSpace(response.CardToken))
+                throw new PaymentDeclinedException(ProviderName, "no_card_token",
+                    "Kashier did not return a card_token — card may have been declined.");
 
-        Logger.LogInformation("Kashier tokenised card for shopper {Shopper} → token={Token}",
-            request.CustomerId, response.CardToken);
+            Logger.LogInformation("Kashier tokenised card for shopper {Shopper} → token={Token}",
+                request.CustomerId, response.CardToken);
 
-        return KashierTokenisationProvider.Map(response, request);
-    }
+            return KashierTokenisationProvider.Map(response, request);
+        }, ct);
 }
