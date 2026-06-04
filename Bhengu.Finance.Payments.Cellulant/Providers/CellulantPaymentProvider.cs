@@ -14,7 +14,6 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Webhooks;
-using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Security;
 using Microsoft.Extensions.Logging;
@@ -245,28 +244,23 @@ public sealed class CellulantPaymentProvider : BhenguProviderBase, IPaymentGatew
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-
-        using var activity = BhenguPaymentDiagnostics.StartWebhookActivity(ProviderName);
-        try
+        return RunOperationAsync("parse_webhook", () =>
         {
-            var webhookEvent = JsonSerializer.Deserialize<CellulantWebhookEvent>(payload);
-            if (webhookEvent is null)
+            try
             {
-                activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
+                var webhookEvent = JsonSerializer.Deserialize<CellulantWebhookEvent>(payload);
+                if (webhookEvent is null) return Task.FromResult<WebhookEvent?>(null);
+
+                Logger.LogInformation("Parsed Cellulant webhook event: {EventType}", webhookEvent.EventType);
+                var typed = MapWebhookEvent(webhookEvent);
+                return Task.FromResult(typed);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Failed to parse Cellulant webhook event");
                 return Task.FromResult<WebhookEvent?>(null);
             }
-
-            Logger.LogInformation("Parsed Cellulant webhook event: {EventType}", webhookEvent.EventType);
-            var typed = MapWebhookEvent(webhookEvent);
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Success);
-            return Task.FromResult(typed);
-        }
-        catch (Exception ex)
-        {
-            Logger.LogError(ex, "Failed to parse Cellulant webhook event");
-            activity.SetOutcome(BhenguPaymentDiagnostics.Outcomes.Error);
-            return Task.FromResult<WebhookEvent?>(null);
-        }
+        }, ct);
     }
 
     private static WebhookEvent? MapWebhookEvent(CellulantWebhookEvent webhookEvent)
