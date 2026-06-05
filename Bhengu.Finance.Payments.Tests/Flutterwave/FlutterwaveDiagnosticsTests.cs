@@ -35,7 +35,12 @@ public class FlutterwaveDiagnosticsTests
             Metadata = new Dictionary<string, string> { ["email"] = "buyer@x.com" }
         });
 
-        Assert.Equal(1, recorder.CounterTotalFor("bhengu_payments_charges_total", "flutterwave"));
+        // >= 1 (not == 1) because DiagnosticsCounterRecorder uses a process-wide MeterListener;
+        // under parallel xunit the Flutterwave concurrency stress test in Tests/Depth/ may have
+        // emitted earlier increments under the same provider tag. We're only proving "the counter
+        // moved on our charge" not "no one else has ever incremented it." Matches every other
+        // provider's *DiagnosticsTests.cs in the family.
+        Assert.True(recorder.CounterTotalFor("bhengu_payments_charges_total", "flutterwave") >= 1);
         Assert.True(recorder.HistogramObservationsFor("bhengu_payments_charge_duration_ms", "flutterwave") >= 1);
     }
 }
