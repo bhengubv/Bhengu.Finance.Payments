@@ -1,10 +1,12 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Stitch.Configuration;
+using Bhengu.Finance.Payments.Stitch.Internals;
 using Bhengu.Finance.Payments.Stitch.Providers;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -46,6 +48,8 @@ public static class ServiceCollectionExtensions
         // shortcut works for pay-by-bank but DebiCheck needs the scoped bearer token).
         if (!string.IsNullOrWhiteSpace(probe.ClientSecret))
         {
+            services.AddBhenguInMemoryCache();
+            services.AddSingleton<StitchOAuthCache>();
             services.AddHttpClient<StitchMandateProvider>();
             services.AddTransient<IMandateProvider, StitchMandateProvider>(sp => sp.GetRequiredService<StitchMandateProvider>());
             services.AddKeyedTransient<IMandateProvider>(ProviderNames.Stitch, (sp, _) => sp.GetRequiredService<StitchMandateProvider>());

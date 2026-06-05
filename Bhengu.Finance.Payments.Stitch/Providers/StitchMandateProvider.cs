@@ -13,6 +13,7 @@ using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Mandate;
 using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Stitch.Configuration;
+using Bhengu.Finance.Payments.Stitch.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Mandate = Bhengu.Finance.Payments.Core.Models.Mandate.Mandate;
@@ -48,9 +49,10 @@ namespace Bhengu.Finance.Payments.Stitch.Providers;
 /// </list>
 /// <para>
 /// Authentication uses OAuth2 client credentials against <see cref="StitchOptions.TokenEndpoint"/>
-/// (default <c>https://secure.stitch.money/connect/token</c>). Access tokens are cached and
-/// refreshed 60 seconds before expiry under a <see cref="SemaphoreSlim"/> to avoid thundering-herd
-/// re-issue.
+/// (default <c>https://secure.stitch.money/connect/token</c>). Access tokens are cached in the
+/// distributed <see cref="StitchOAuthCache"/> and refreshed 60 seconds before expiry; with a
+/// Redis-backed cache the token is shared across replicas so the upstream is hit at most once
+/// per token lifetime per client id.
 /// </para>
 /// </remarks>
 public sealed class StitchMandateProvider : BhenguProviderBase, IMandateProvider
@@ -60,30 +62,30 @@ public sealed class StitchMandateProvider : BhenguProviderBase, IMandateProvider
 
     private readonly HttpClient _httpClient;
     private readonly StitchOptions _options;
+    private readonly StitchOAuthCache _tokenCache;
     private readonly Uri _graphqlUri;
     private readonly Uri _tokenUri;
-    private readonly SemaphoreSlim _tokenLock = new(1, 1);
-
-    private string? _cachedToken;
-    private DateTimeOffset _cachedTokenExpiresAt = DateTimeOffset.MinValue;
 
     /// <inheritdoc />
     public override string ProviderName => ProviderNames.Stitch;
 
     /// <summary>
-    /// Construct the provider. Throws <see cref="ProviderConfigurationException"/> when
-    /// <see cref="StitchOptions.ClientId"/> or <see cref="StitchOptions.ClientSecret"/> is unset
-    /// (DebiCheck operations require the full OAuth2 client_credentials flow, not the simpler
-    /// API-key shortcut that the payment provider supports).
+    /// Construct the provider with a distributed OAuth cache. Throws
+    /// <see cref="ProviderConfigurationException"/> when <see cref="StitchOptions.ClientId"/> or
+    /// <see cref="StitchOptions.ClientSecret"/> is unset (DebiCheck operations require the full
+    /// OAuth2 client_credentials flow, not the simpler API-key shortcut that the payment
+    /// provider supports).
     /// </summary>
     public StitchMandateProvider(
         HttpClient httpClient,
         IOptions<StitchOptions> options,
-        ILogger<StitchMandateProvider> logger)
+        ILogger<StitchMandateProvider> logger,
+        StitchOAuthCache tokenCache)
         : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
+        _tokenCache = tokenCache ?? throw new ArgumentNullException(nameof(tokenCache));
 
         if (string.IsNullOrWhiteSpace(_options.ClientId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(StitchOptions.ClientId)} is required");
@@ -109,6 +111,15 @@ public sealed class StitchMandateProvider : BhenguProviderBase, IMandateProvider
         _tokenUri = Uri.TryCreate(_options.TokenEndpoint, UriKind.Absolute, out var tAbs)
             ? tAbs
             : new Uri(DefaultTokenEndpoint, UriKind.Absolute);
+    }
+
+    /// <summary>Back-compat constructor that uses the process-local in-memory cache.</summary>
+    public StitchMandateProvider(
+        HttpClient httpClient,
+        IOptions<StitchOptions> options,
+        ILogger<StitchMandateProvider> logger)
+        : this(httpClient, options, logger, new StitchOAuthCache())
+    {
     }
 
     /// <inheritdoc />
@@ -314,7 +325,9 @@ public sealed class StitchMandateProvider : BhenguProviderBase, IMandateProvider
 
     private async Task<string> SendGraphqlAsync(string query, object variables, CancellationToken ct, string operation)
     {
-        await EnsureTokenAsync(ct).ConfigureAwait(false);
+        var accessToken = await _tokenCache
+            .GetOrFetchAsync(_options.ClientId, FetchAccessTokenAsync, ct)
+            .ConfigureAwait(false);
 
         var payload = new { query, variables };
         var json = JsonSerializer.Serialize(payload);
@@ -322,61 +335,46 @@ public sealed class StitchMandateProvider : BhenguProviderBase, IMandateProvider
         {
             Content = new StringContent(json, Encoding.UTF8, "application/json")
         };
-        if (!string.IsNullOrEmpty(_cachedToken))
-            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _cachedToken);
+        if (!string.IsNullOrEmpty(accessToken))
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
         req.Headers.TryAddWithoutValidation("X-Stitch-Client-Id", _options.ClientId);
 
         return await ExecuteAsync(req, ct, operation).ConfigureAwait(false);
     }
 
-    private async Task EnsureTokenAsync(CancellationToken ct)
+    private async Task<(string AccessToken, int ExpiresInSeconds)> FetchAccessTokenAsync(CancellationToken ct)
     {
-        if (_cachedToken is not null && _cachedTokenExpiresAt > DateTimeOffset.UtcNow.AddSeconds(60))
-            return;
+        var form = new FormUrlEncodedContent(new Dictionary<string, string>
+        {
+            ["grant_type"] = "client_credentials",
+            ["client_id"] = _options.ClientId,
+            ["client_secret"] = _options.ClientSecret ?? string.Empty,
+            ["scope"] = "client_paymentrequest client_paymentauthorizationrequest"
+        });
 
-        await _tokenLock.WaitAsync(ct).ConfigureAwait(false);
+        using var req = new HttpRequestMessage(HttpMethod.Post, _tokenUri) { Content = form };
+
+        HttpResponseMessage response;
         try
         {
-            if (_cachedToken is not null && _cachedTokenExpiresAt > DateTimeOffset.UtcNow.AddSeconds(60))
-                return;
-
-            var form = new FormUrlEncodedContent(new Dictionary<string, string>
-            {
-                ["grant_type"] = "client_credentials",
-                ["client_id"] = _options.ClientId,
-                ["client_secret"] = _options.ClientSecret ?? string.Empty,
-                ["scope"] = "client_paymentrequest client_paymentauthorizationrequest"
-            });
-
-            using var req = new HttpRequestMessage(HttpMethod.Post, _tokenUri) { Content = form };
-
-            HttpResponseMessage response;
-            try
-            {
-                response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-            }
-            catch (HttpRequestException ex)
-            {
-                throw new ProviderUnavailableException(ProviderName, $"HTTP request to Stitch token endpoint failed", ex);
-            }
-
-            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            if (!response.IsSuccessStatusCode)
-                throw new ProviderUnavailableException(ProviderName,
-                    $"Stitch token endpoint returned {(int)response.StatusCode}: {body}");
-
-            var token = JsonSerializer.Deserialize<StitchTokenResponse>(body);
-            if (token is null || string.IsNullOrEmpty(token.AccessToken))
-                throw new ProviderUnavailableException(ProviderName, "Stitch token endpoint returned no access_token");
-
-            _cachedToken = token.AccessToken;
-            _cachedTokenExpiresAt = DateTimeOffset.UtcNow.AddSeconds(Math.Max(60, token.ExpiresIn - 60));
-            Logger.LogDebug("Stitch access token cached, expires={Expires}", _cachedTokenExpiresAt);
+            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         }
-        finally
+        catch (HttpRequestException ex)
         {
-            _tokenLock.Release();
+            throw new ProviderUnavailableException(ProviderName, "HTTP request to Stitch token endpoint failed", ex);
         }
+
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new ProviderUnavailableException(ProviderName,
+                $"Stitch token endpoint returned {(int)response.StatusCode}: {body}");
+
+        var token = JsonSerializer.Deserialize<StitchTokenResponse>(body);
+        if (token is null || string.IsNullOrEmpty(token.AccessToken))
+            throw new ProviderUnavailableException(ProviderName, "Stitch token endpoint returned no access_token");
+
+        Logger.LogDebug("Stitch access token fetched, expires_in={ExpiresIn}s", token.ExpiresIn);
+        return (token.AccessToken, token.ExpiresIn);
     }
 
     private async Task<string> ExecuteAsync(HttpRequestMessage req, CancellationToken ct, string operation)
