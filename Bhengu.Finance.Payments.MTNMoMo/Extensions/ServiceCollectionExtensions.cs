@@ -6,6 +6,7 @@ using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.MTNMoMo.Configuration;
+using Bhengu.Finance.Payments.MTNMoMo.Internals;
 using Bhengu.Finance.Payments.MTNMoMo.Providers;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -37,6 +38,7 @@ public static class ServiceCollectionExtensions
             throw new ProviderConfigurationException("mtnmomo", $"{MTNMoMoOptions.ConfigSection}:TargetEnvironment is required");
 
         services.AddBhenguInMemoryCache();
+        services.AddSingleton<MTNMoMoOAuthCache>();
         services.AddHttpClient<MTNMoMoPaymentProvider>();
         services.AddHttpClient<MTNMoMoPayoutProvider>();
         services.AddTransient<IPaymentGatewayProvider, MTNMoMoPaymentProvider>(sp =>
