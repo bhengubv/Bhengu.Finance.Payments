@@ -7,7 +7,6 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
-using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -61,13 +60,12 @@ public sealed class MPesaPayoutProvider : BhenguProviderBase, IPayoutProvider
         HttpClient httpClient,
         IOptions<MPesaOptions> options,
         ILogger<MPesaPayoutProvider> logger,
-        IBhenguDistributedCache cache)
+        MPesaOAuthCache tokenCache)
         : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        ArgumentNullException.ThrowIfNull(cache);
-        _tokenCache = new MPesaOAuthCache(cache);
+        _tokenCache = tokenCache ?? throw new ArgumentNullException(nameof(tokenCache));
 
         if (string.IsNullOrWhiteSpace(_options.ConsumerKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(MPesaOptions.ConsumerKey)} is required");
@@ -95,7 +93,7 @@ public sealed class MPesaPayoutProvider : BhenguProviderBase, IPayoutProvider
         HttpClient httpClient,
         IOptions<MPesaOptions> options,
         ILogger<MPesaPayoutProvider> logger)
-        : this(httpClient, options, logger, new InMemoryBhenguDistributedCache())
+        : this(httpClient, options, logger, new MPesaOAuthCache())
     {
     }
 
@@ -188,42 +186,29 @@ public sealed class MPesaPayoutProvider : BhenguProviderBase, IPayoutProvider
         return responseBody;
     }
 
-    private async Task<string> GetAccessTokenAsync(CancellationToken ct)
+    private Task<string> GetAccessTokenAsync(CancellationToken ct) =>
+        _tokenCache.GetOrFetchAsync(_options.ConsumerKey, FetchAccessTokenAsync, ct);
+
+    private async Task<(string AccessToken, int ExpiresInSeconds)> FetchAccessTokenAsync(CancellationToken ct)
     {
-        var cached = await _tokenCache.GetAsync(_options.ConsumerKey, ct).ConfigureAwait(false);
-        if (cached is not null) return cached;
+        var creds = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{_options.ConsumerKey}:{_options.ConsumerSecret}"));
+        using var req = new HttpRequestMessage(HttpMethod.Get, "oauth/v1/generate?grant_type=client_credentials");
+        req.Headers.Authorization = new AuthenticationHeaderValue("Basic", creds);
 
-        await _tokenCache.WaitFetchSlotAsync(ct).ConfigureAwait(false);
-        try
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
         {
-            cached = await _tokenCache.GetAsync(_options.ConsumerKey, ct).ConfigureAwait(false);
-            if (cached is not null) return cached;
-
-            var creds = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{_options.ConsumerKey}:{_options.ConsumerSecret}"));
-            using var req = new HttpRequestMessage(HttpMethod.Get, "oauth/v1/generate?grant_type=client_credentials");
-            req.Headers.Authorization = new AuthenticationHeaderValue("Basic", creds);
-
-            var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            if (!response.IsSuccessStatusCode)
-            {
-                Logger.LogError("M-Pesa OAuth failed: {StatusCode} {Body}", response.StatusCode, body);
-                throw new ProviderUnavailableException(ProviderName, $"M-Pesa OAuth HTTP {(int)response.StatusCode}: {body}");
-            }
-
-            var token = JsonSerializer.Deserialize<MPesaOAuthResponse>(body);
-            if (token is null || string.IsNullOrEmpty(token.AccessToken))
-                throw new ProviderUnavailableException(ProviderName, "M-Pesa OAuth returned an empty token");
-
-            var expiresIn = int.TryParse(token.ExpiresIn, NumberStyles.Integer, CultureInfo.InvariantCulture, out var s) ? s : 3599;
-            var ttl = TimeSpan.FromSeconds(Math.Max(60, expiresIn - 60));
-            await _tokenCache.SetAsync(_options.ConsumerKey, token.AccessToken, ttl, ct).ConfigureAwait(false);
-            return token.AccessToken;
+            Logger.LogError("M-Pesa OAuth failed: {StatusCode} {Body}", response.StatusCode, body);
+            throw new ProviderUnavailableException(ProviderName, $"M-Pesa OAuth HTTP {(int)response.StatusCode}: {body}");
         }
-        finally
-        {
-            _tokenCache.ReleaseFetchSlot();
-        }
+
+        var token = JsonSerializer.Deserialize<MPesaOAuthResponse>(body);
+        if (token is null || string.IsNullOrEmpty(token.AccessToken))
+            throw new ProviderUnavailableException(ProviderName, "M-Pesa OAuth returned an empty token");
+
+        var expiresIn = int.TryParse(token.ExpiresIn, NumberStyles.Integer, CultureInfo.InvariantCulture, out var s) ? s : 3599;
+        return (token.AccessToken, expiresIn);
     }
 
     // ===== Daraja JSON shapes (internal) =====
