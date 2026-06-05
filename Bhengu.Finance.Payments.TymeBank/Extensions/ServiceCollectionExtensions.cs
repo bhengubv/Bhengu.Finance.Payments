@@ -1,10 +1,12 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.TymeBank.Configuration;
+using Bhengu.Finance.Payments.TymeBank.Internals;
 using Bhengu.Finance.Payments.TymeBank.Providers;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -31,6 +33,8 @@ public static class ServiceCollectionExtensions
         if (string.IsNullOrWhiteSpace(probe.ClientSecret))
             throw new ProviderConfigurationException("tymebank", $"{TymeBankOptions.ConfigSection}:ClientSecret is required");
 
+        services.AddBhenguInMemoryCache();
+        services.AddSingleton<TymeBankOAuthCache>();
         services.AddHttpClient<TymeBankPaymentProvider>();
         services.AddTransient<IPaymentGatewayProvider, TymeBankPaymentProvider>(sp =>
             sp.GetRequiredService<TymeBankPaymentProvider>());

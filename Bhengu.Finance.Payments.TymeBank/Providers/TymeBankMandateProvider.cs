@@ -13,6 +13,7 @@ using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.Mandate;
 using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.TymeBank.Configuration;
+using Bhengu.Finance.Payments.TymeBank.Internals;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Mandate = Bhengu.Finance.Payments.Core.Models.Mandate.Mandate;
@@ -46,35 +47,37 @@ namespace Bhengu.Finance.Payments.TymeBank.Providers;
 ///   </description></item>
 /// </list>
 /// <para>
-/// Authentication reuses the same OAuth2 client_credentials access-token cache as the
-/// <see cref="TymeBankPaymentProvider"/> (cached for the lifetime of the HttpClient, refreshed
-/// 60 seconds before expiry under a <see cref="SemaphoreSlim"/>).
+/// Authentication reuses the shared <see cref="TymeBankOAuthCache"/> alongside
+/// <see cref="TymeBankPaymentProvider"/> — both providers hit the same <c>oauth2/token</c>
+/// endpoint with the same credentials, so cache hits cross provider boundaries. Backed by
+/// <see cref="IBhenguDistributedCache"/> so tokens survive process restarts and are shared
+/// across replicas when Redis is wired up.
 /// </para>
 /// </remarks>
 public sealed class TymeBankMandateProvider : BhenguProviderBase, IMandateProvider
 {
     private readonly HttpClient _httpClient;
     private readonly TymeBankOptions _options;
-    private readonly SemaphoreSlim _tokenLock = new(1, 1);
-
-    private string? _cachedToken;
-    private DateTimeOffset _cachedTokenExpiresAt = DateTimeOffset.MinValue;
+    private readonly TymeBankOAuthCache _tokenCache;
 
     /// <inheritdoc />
     public override string ProviderName => ProviderNames.TymeBank;
 
     /// <summary>
-    /// Construct the provider. Throws <see cref="ProviderConfigurationException"/> when
-    /// <see cref="TymeBankOptions.ClientId"/> or <see cref="TymeBankOptions.ClientSecret"/> is unset.
+    /// Construct the provider with a distributed OAuth cache. Throws
+    /// <see cref="ProviderConfigurationException"/> when <see cref="TymeBankOptions.ClientId"/>
+    /// or <see cref="TymeBankOptions.ClientSecret"/> is unset.
     /// </summary>
     public TymeBankMandateProvider(
         HttpClient httpClient,
         IOptions<TymeBankOptions> options,
-        ILogger<TymeBankMandateProvider> logger)
+        ILogger<TymeBankMandateProvider> logger,
+        TymeBankOAuthCache tokenCache)
         : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
+        _tokenCache = tokenCache ?? throw new ArgumentNullException(nameof(tokenCache));
 
         if (string.IsNullOrWhiteSpace(_options.ClientId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(TymeBankOptions.ClientId)} is required");
@@ -89,6 +92,15 @@ public sealed class TymeBankMandateProvider : BhenguProviderBase, IMandateProvid
             if (!resolved.EndsWith('/')) resolved += "/";
             _httpClient.BaseAddress = new Uri(resolved);
         }
+    }
+
+    /// <summary>Back-compat constructor that uses the process-local in-memory cache.</summary>
+    public TymeBankMandateProvider(
+        HttpClient httpClient,
+        IOptions<TymeBankOptions> options,
+        ILogger<TymeBankMandateProvider> logger)
+        : this(httpClient, options, logger, new TymeBankOAuthCache())
+    {
     }
 
     /// <inheritdoc />
@@ -304,7 +316,9 @@ public sealed class TymeBankMandateProvider : BhenguProviderBase, IMandateProvid
 
     private async Task<string> SendAsync(HttpMethod method, string path, object? body, CancellationToken ct, string operation, string? idempotencyKey = null)
     {
-        await EnsureTokenAsync(ct).ConfigureAwait(false);
+        var accessToken = await _tokenCache
+            .GetOrFetchAsync(_options.ClientId, FetchAccessTokenAsync, ct)
+            .ConfigureAwait(false);
 
         using var req = new HttpRequestMessage(method, path);
         if (body is not null)
@@ -312,8 +326,8 @@ public sealed class TymeBankMandateProvider : BhenguProviderBase, IMandateProvid
             var json = JsonSerializer.Serialize(body, JsonWriteOptions);
             req.Content = new StringContent(json, Encoding.UTF8, "application/json");
         }
-        if (!string.IsNullOrEmpty(_cachedToken))
-            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _cachedToken);
+        if (!string.IsNullOrEmpty(accessToken))
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
         if (!string.IsNullOrWhiteSpace(idempotencyKey))
             req.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
 
@@ -346,52 +360,37 @@ public sealed class TymeBankMandateProvider : BhenguProviderBase, IMandateProvid
         return responseBody;
     }
 
-    private async Task EnsureTokenAsync(CancellationToken ct)
+    private async Task<(string AccessToken, int ExpiresInSeconds)> FetchAccessTokenAsync(CancellationToken ct)
     {
-        if (_cachedToken is not null && _cachedTokenExpiresAt > DateTimeOffset.UtcNow.AddSeconds(60))
-            return;
+        var form = new FormUrlEncodedContent(new Dictionary<string, string>
+        {
+            ["grant_type"] = "client_credentials",
+            ["client_id"] = _options.ClientId,
+            ["client_secret"] = _options.ClientSecret
+        });
 
-        await _tokenLock.WaitAsync(ct).ConfigureAwait(false);
+        using var req = new HttpRequestMessage(HttpMethod.Post, "oauth2/token") { Content = form };
+
+        HttpResponseMessage response;
         try
         {
-            if (_cachedToken is not null && _cachedTokenExpiresAt > DateTimeOffset.UtcNow.AddSeconds(60))
-                return;
-
-            var form = new FormUrlEncodedContent(new Dictionary<string, string>
-            {
-                ["grant_type"] = "client_credentials",
-                ["client_id"] = _options.ClientId,
-                ["client_secret"] = _options.ClientSecret
-            });
-
-            using var req = new HttpRequestMessage(HttpMethod.Post, "oauth2/token") { Content = form };
-
-            HttpResponseMessage response;
-            try
-            {
-                response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-            }
-            catch (HttpRequestException ex)
-            {
-                throw new ProviderUnavailableException(ProviderName, "HTTP request to TymeBank oauth2/token failed", ex);
-            }
-
-            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            if (!response.IsSuccessStatusCode)
-                throw new ProviderUnavailableException(ProviderName,
-                    $"TymeBank oauth2/token returned {(int)response.StatusCode}: {body}");
-
-            var token = JsonSerializer.Deserialize<TymeBankTokenResponse>(body);
-            if (token is null || string.IsNullOrEmpty(token.AccessToken))
-                throw new ProviderUnavailableException(ProviderName, "TymeBank oauth2/token returned no access_token");
-
-            _cachedToken = token.AccessToken;
-            _cachedTokenExpiresAt = DateTimeOffset.UtcNow.AddSeconds(Math.Max(60, token.ExpiresIn - 60));
+            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         }
-        finally
+        catch (HttpRequestException ex)
         {
-            _tokenLock.Release();
+            throw new ProviderUnavailableException(ProviderName, "HTTP request to TymeBank oauth2/token failed", ex);
         }
+
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new ProviderUnavailableException(ProviderName,
+                $"TymeBank oauth2/token returned {(int)response.StatusCode}: {body}");
+
+        var token = JsonSerializer.Deserialize<TymeBankTokenResponse>(body);
+        if (token is null || string.IsNullOrEmpty(token.AccessToken))
+            throw new ProviderUnavailableException(ProviderName, "TymeBank oauth2/token returned no access_token");
+
+        return (token.AccessToken, token.ExpiresIn);
     }
 
     private static readonly JsonSerializerOptions JsonWriteOptions = new()
