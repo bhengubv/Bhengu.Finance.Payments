@@ -1,7 +1,14 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Net;
+using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.Subscription;
+using Bhengu.Finance.Payments.Flutterwave.Configuration;
+using Bhengu.Finance.Payments.Flutterwave.Providers;
+using Bhengu.Finance.Payments.PayFast.Configuration;
+using Bhengu.Finance.Payments.PayFast.Internals;
+using Bhengu.Finance.Payments.PayFast.Providers;
 using Bhengu.Finance.Payments.Paystack.Configuration;
 using Bhengu.Finance.Payments.Paystack.Internals;
 using Bhengu.Finance.Payments.Paystack.Providers;
@@ -244,4 +251,233 @@ public sealed class ConcurrencyTests
         var end = body.IndexOf('"', start);
         return end < 0 ? null : body[start..end];
     }
+
+    // -----------------------------------------------------------------------
+    //  Flutterwave — internal FlutterwaveIdempotencyCache. The provider creates
+    //  its own cache instance per construction, so we test through the public
+    //  ProcessPaymentAsync surface and assert the in-flight coalesce collapses
+    //  50 callers onto a single upstream HTTP call.
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 50 concurrent <see cref="FlutterwavePaymentProvider.ProcessPaymentAsync"/> calls under the
+    /// same <see cref="PaymentRequest.IdempotencyKey"/> coalesce onto a single upstream POST to
+    /// <c>v3/payments</c>. All 50 callers observe the same cached <see cref="PaymentResponse"/>.
+    /// </summary>
+    [Fact]
+    public async Task Flutterwave_FiftyConcurrentCalls_SameKey_DedupesToOneHttpCall()
+    {
+        var handler = new CountingStubHttpMessageHandler((_, _) =>
+            StubHttpMessageHandler.Json(HttpStatusCode.OK, """
+                {"status":"success","message":"Hosted Link","data":{"link":"https://checkout.flutterwave.com/v3/hosted/pay/concurrent"}}
+                """));
+
+        var provider = new FlutterwavePaymentProvider(
+            new HttpClient(handler),
+            Options.Create(new FlutterwaveOptions
+            {
+                SecretKey = "FLWSECK_TEST-xxx",
+                PublicKey = "FLWPUBK_TEST-xxx",
+                EncryptionKey = "FLWSECK_TEST_xxx",
+                WebhookSecret = "verify",
+                RedirectUrl = "https://example.com/return"
+            }),
+            NullLogger<FlutterwavePaymentProvider>.Instance);
+
+        var request = new PaymentRequest
+        {
+            PaymentMethodToken = "tx-concurrent-1",
+            Amount = 100m,
+            Currency = "NGN",
+            Description = "fw-concurrent",
+            IdempotencyKey = "fw-concurrent-key-1",
+            Metadata = new Dictionary<string, string>
+            {
+                ["email"] = "buyer@example.com",
+                ["name"] = "Buyer Concurrent"
+            }
+        };
+
+        var results = await Task.WhenAll(
+            Enumerable.Range(0, ConcurrentCallers).Select(_ => provider.ProcessPaymentAsync(request)));
+
+        Assert.Equal(1, handler.CallCount);
+        Assert.Equal(ConcurrentCallers, results.Length);
+        Assert.All(results, r => Assert.Equal("tx-concurrent-1", r.GatewayReference));
+        // Coalesced callers observe the same materialised PaymentResponse — the cache hands
+        // back the same instance to every caller waiting on the in-flight task.
+        Assert.All(results, r => Assert.Same(results[0], r));
+    }
+
+    // -----------------------------------------------------------------------
+    //  PayFast — PayFastPlanCache. CreatePlanAsync writes a new entry per call
+    //  (each call generates a new plan reference), so the natural concurrency
+    //  contract here is that 50 concurrent CreatePlanAsync calls all succeed
+    //  without data races, returning 50 distinct references. NO HTTP call is
+    //  made (plan creation is local-cache only on PayFast), so the assertion
+    //  is on the cache state, not on upstream call count.
+    //  Plan FETCH after creation must always return the same reference.
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 50 concurrent <see cref="PayFastSubscriptionProvider.CreatePlanAsync"/> calls each create a
+    /// fresh plan in <see cref="PayFastPlanCache"/>. Asserts (a) no exception escapes, (b) all 50
+    /// plans were durably written and individually retrievable, and (c) no upstream HTTP call was
+    /// made — plan creation is local-cache-only on PayFast (no plan resource on the wire).
+    /// </summary>
+    [Fact]
+    public async Task PayFast_FiftyConcurrentCreatePlanCalls_AllSucceedWithoutHttpAndAllReadable()
+    {
+        var handler = new CountingStubHttpMessageHandler((_, _) =>
+            StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}"));
+
+        var cache = new PayFastPlanCache();
+        var provider = new PayFastSubscriptionProvider(
+            new HttpClient(handler),
+            Options.Create(new PayFastOptions
+            {
+                MerchantId = "10000100",
+                MerchantKey = "46f0cd694581a",
+                Passphrase = "jt7NOE43FZPn",
+                UseSandbox = true,
+                ReturnUrl = "https://example.com/return",
+                CancelUrl = "https://example.com/cancel",
+                NotifyUrl = "https://example.com/notify"
+            }),
+            NullLogger<PayFastSubscriptionProvider>.Instance,
+            cache);
+
+        var planRequest = new PlanRequest
+        {
+            Name = "Concurrent Plan",
+            Amount = 50m,
+            Currency = "ZAR",
+            Interval = SubscriptionInterval.Monthly,
+            TotalCycles = 0
+        };
+
+        // 50 parallel CreatePlanAsync — each generates its OWN plan reference.
+        var plans = await Task.WhenAll(
+            Enumerable.Range(0, ConcurrentCallers).Select(_ => provider.CreatePlanAsync(planRequest)));
+
+        Assert.Equal(ConcurrentCallers, plans.Length);
+        // No upstream HTTP — plan creation is local-cache only on PayFast.
+        Assert.Equal(0, handler.CallCount);
+        // Every plan reference is distinct (no key collisions under concurrency).
+        var references = plans.Select(p => p.Reference).ToArray();
+        Assert.Equal(ConcurrentCallers, references.Distinct(StringComparer.Ordinal).Count());
+
+        // Every cached plan must round-trip — the cache survived all 50 concurrent writes.
+        foreach (var p in plans)
+        {
+            var fetched = await provider.GetPlanAsync(p.Reference);
+            Assert.NotNull(fetched);
+            Assert.Equal(p.Reference, fetched!.Reference);
+            Assert.Equal(planRequest.Amount, fetched.Amount);
+        }
+    }
+
+    /// <summary>
+    /// Second variant: 50 concurrent <see cref="PayFastSubscriptionProvider.GetPlanAsync"/> reads
+    /// of the SAME previously-written plan reference all succeed and return structurally-equal
+    /// <see cref="Plan"/> records. Demonstrates the read path under contention is also safe.
+    /// </summary>
+    [Fact]
+    public async Task PayFast_FiftyConcurrentGetPlanCalls_SameReference_AllReturnSamePlan()
+    {
+        var cache = new PayFastPlanCache();
+        var provider = new PayFastSubscriptionProvider(
+            new HttpClient(new CountingStubHttpMessageHandler((_, _) =>
+                StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}"))),
+            Options.Create(new PayFastOptions
+            {
+                MerchantId = "10000100",
+                MerchantKey = "46f0cd694581a",
+                Passphrase = "jt7NOE43FZPn",
+                UseSandbox = true
+            }),
+            NullLogger<PayFastSubscriptionProvider>.Instance,
+            cache);
+
+        var seed = await provider.CreatePlanAsync(new PlanRequest
+        {
+            Name = "Shared",
+            Amount = 199m,
+            Currency = "ZAR",
+            Interval = SubscriptionInterval.Monthly,
+            TotalCycles = 12
+        });
+
+        var fetches = await Task.WhenAll(
+            Enumerable.Range(0, ConcurrentCallers).Select(_ => provider.GetPlanAsync(seed.Reference)));
+
+        Assert.Equal(ConcurrentCallers, fetches.Length);
+        Assert.All(fetches, p =>
+        {
+            Assert.NotNull(p);
+            Assert.Equal(seed.Reference, p!.Reference);
+            Assert.Equal(199m, p.Amount);
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    //  Stripe (second wave) — extends the existing single-test coverage with
+    //  a Refund-flow variant. Stripe.net regenerates the auto-idempotency
+    //  header on EACH PaymentIntentService.CreateAsync, so the only way for
+    //  the SDK to share a key across 50 concurrent retries is when the caller
+    //  supplies one via Stripe.RequestOptions.IdempotencyKey (= our
+    //  RefundRequest.IdempotencyKey). Asserts the same key is on every wire.
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 50 concurrent <see cref="StripePaymentProvider.ProcessRefundAsync"/> calls under the same
+    /// <see cref="RefundRequest.IdempotencyKey"/>: every outbound request carries the same
+    /// <c>Idempotency-Key</c> header so Stripe's server-side dedup collapses them to a single
+    /// refund. The Stripe.net SDK does NOT coalesce client-side, so we expect 50 HTTP calls.
+    /// </summary>
+    [Fact]
+    public async Task StripeRefund_FiftyConcurrentCalls_SameKey_EveryRequestCarriesSameIdempotencyHeader()
+    {
+        var observedKeys = new List<string?>();
+        var keyLock = new object();
+        var handler = new CountingStubHttpMessageHandler((req, _) =>
+        {
+            var headerValue = req.Headers.TryGetValues("Idempotency-Key", out var v) ? v.FirstOrDefault() : null;
+            lock (keyLock) observedKeys.Add(headerValue);
+            return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
+                {"id":"re_stripe_concurrent","object":"refund","amount":500,"currency":"usd","status":"succeeded","payment_intent":"pi_x"}
+                """);
+        });
+
+        var provider = new StripePaymentProvider(
+            new HttpClient(handler),
+            Options.Create(new StripeOptions { SecretKey = "sk_test_fake", WebhookSecret = "whsec_test_fake" }),
+            NullLogger<StripePaymentProvider>.Instance);
+
+        var request = new RefundRequest
+        {
+            GatewayReference = "pi_x",
+            Amount = 5m,
+            Reason = "stripe-refund-concurrent",
+            IdempotencyKey = "stripe-refund-concurrent-key"
+        };
+
+        var results = await Task.WhenAll(
+            Enumerable.Range(0, ConcurrentCallers).Select(_ => provider.ProcessRefundAsync(request)));
+
+        Assert.Equal(ConcurrentCallers, handler.CallCount);
+        Assert.Equal(ConcurrentCallers, observedKeys.Count);
+        Assert.All(observedKeys, k => Assert.Equal("stripe-refund-concurrent-key", k));
+        Assert.All(results, r => Assert.Equal("re_stripe_concurrent", r.GatewayReference));
+    }
+
+    // -----------------------------------------------------------------------
+    //  Note on Yoco: the YocoPaymentProvider has NO idempotency cache and the
+    //  Yoco Online REST API does not accept an Idempotency-Key header. The
+    //  YocoTokenCache exists for tokenisation reads (PaymentMethod lookups),
+    //  NOT for ProcessPaymentAsync or CheckoutAsync de-duplication. A concurrent
+    //  "50→1" dedup test cannot exist for Yoco within its current contract;
+    //  callers must supply their own at-most-once retry strategy at the HTTP
+    //  layer. See depth report — Yoco intentionally skipped from this category.
+    // -----------------------------------------------------------------------
 }
