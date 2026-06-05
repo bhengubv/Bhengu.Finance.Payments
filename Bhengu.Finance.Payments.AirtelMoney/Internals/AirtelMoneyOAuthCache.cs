@@ -1,48 +1,100 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using System.Collections.Concurrent;
 using Bhengu.Finance.Payments.Core.Caching;
 
 namespace Bhengu.Finance.Payments.AirtelMoney.Internals;
 
 /// <summary>
-/// Distributed-cache-backed Airtel Money OAuth token cache. Survives process restarts and is
-/// shared across replicas when Redis is wired up via <c>Bhengu.Finance.Payments.Redis</c>.
-/// A per-instance <see cref="SemaphoreSlim"/> deduplicates concurrent token fetches within a
-/// single replica; the cache layer prevents redundant fetches across replicas / restarts.
+/// Airtel Money OAuth token cache backed by <see cref="IBhenguDistributedCache"/>. With a Redis
+/// implementation every replica shares the same access token until <c>expires_in − 60s</c> so
+/// <c>POST auth/oauth2/token</c> is hit at most once per token lifetime per client id — not once
+/// per replica.
 /// </summary>
-internal sealed class AirtelMoneyOAuthCache
+/// <remarks>
+/// <para>Concurrent fetches for the same client id within one process are coalesced onto a single
+/// <see cref="Task{TResult}"/> via a <c>Lazy&lt;Task&lt;string&gt;&gt;</c> guarded in a
+/// <see cref="ConcurrentDictionary{TKey, TValue}"/>; only the first caller hits Airtel, peers
+/// observe the same result. <see cref="LazyThreadSafetyMode.ExecutionAndPublication"/> is critical
+/// so the dict's value factory does not run multiple times during the burst.</para>
+/// </remarks>
+public sealed class AirtelMoneyOAuthCache
 {
-    private const string KeyPrefix = "airtel:oauth:";
+    private const string KeyPrefix = "airtelmoney:oauth:";
 
     private readonly IBhenguDistributedCache _cache;
-    private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly ConcurrentDictionary<string, object> _inFlight = new(StringComparer.Ordinal);
 
     public AirtelMoneyOAuthCache(IBhenguDistributedCache cache)
     {
         _cache = cache ?? throw new ArgumentNullException(nameof(cache));
     }
 
-    /// <summary>Try to read a cached token for the given client id. Returns null when missing / expired.</summary>
-    public async Task<string?> GetAsync(string clientId, CancellationToken ct)
+    /// <summary>
+    /// Default-constructor convenience for tests / back-compat callers without DI. Uses a private
+    /// <see cref="InMemoryBhenguDistributedCache"/>.
+    /// </summary>
+    public AirtelMoneyOAuthCache() : this(new InMemoryBhenguDistributedCache()) { }
+
+    /// <summary>
+    /// Return a valid Airtel Money access token for <paramref name="clientId"/>. Cache hits return
+    /// immediately; concurrent misses are coalesced onto one <paramref name="fetch"/> invocation,
+    /// after which the token is cached for <c>(expiresIn − 60s)</c> seconds.
+    /// </summary>
+    /// <param name="clientId">Airtel Open API client id — used to derive the cache slot.</param>
+    /// <param name="fetch">Async factory performing the actual <c>auth/oauth2/token</c> POST and
+    /// returning <c>(accessToken, expiresInSeconds)</c>.</param>
+    /// <param name="ct">Cancellation token forwarded to the cache and factory.</param>
+    public async Task<string> GetOrFetchAsync(
+        string clientId,
+        Func<CancellationToken, Task<(string AccessToken, int ExpiresInSeconds)>> fetch,
+        CancellationToken ct)
     {
-        var entry = await _cache.GetAsync<TokenEntry>(BuildKey(clientId), ct).ConfigureAwait(false);
-        return entry?.AccessToken;
+        ArgumentException.ThrowIfNullOrEmpty(clientId);
+        ArgumentNullException.ThrowIfNull(fetch);
+
+        var cacheKey = BuildKey(clientId);
+
+        var existing = await _cache.GetAsync<TokenEntry>(cacheKey, ct).ConfigureAwait(false);
+        if (existing is not null && !string.IsNullOrEmpty(existing.AccessToken))
+            return existing.AccessToken;
+
+        var lazy = (Lazy<Task<string>>)_inFlight.GetOrAdd(
+            cacheKey,
+            _ => new Lazy<Task<string>>(() => RunAndPersistAsync(cacheKey, fetch, ct),
+                LazyThreadSafetyMode.ExecutionAndPublication));
+        try
+        {
+            return await lazy.Value.ConfigureAwait(false);
+        }
+        finally
+        {
+            _inFlight.TryRemove(new KeyValuePair<string, object>(cacheKey, lazy));
+        }
     }
 
-    /// <summary>Store a token under the given client id for at most <paramref name="ttl"/>.</summary>
-    public Task SetAsync(string clientId, string accessToken, TimeSpan ttl, CancellationToken ct) =>
-        _cache.SetAsync(BuildKey(clientId), new TokenEntry { AccessToken = accessToken }, ttl, ct);
+    private async Task<string> RunAndPersistAsync(
+        string cacheKey,
+        Func<CancellationToken, Task<(string AccessToken, int ExpiresInSeconds)>> fetch,
+        CancellationToken ct)
+    {
+        var snapshot = await _cache.GetAsync<TokenEntry>(cacheKey, ct).ConfigureAwait(false);
+        if (snapshot is not null && !string.IsNullOrEmpty(snapshot.AccessToken))
+            return snapshot.AccessToken;
 
-    /// <summary>Acquire the per-instance fetch gate.</summary>
-    public Task WaitFetchSlotAsync(CancellationToken ct) => _gate.WaitAsync(ct);
+        var (token, expiresIn) = await fetch(ct).ConfigureAwait(false);
+        if (string.IsNullOrEmpty(token))
+            return token;
 
-    /// <summary>Release the per-instance fetch gate.</summary>
-    public void ReleaseFetchSlot() => _gate.Release();
+        var ttl = TimeSpan.FromSeconds(Math.Max(60, expiresIn - 60));
+        await _cache.SetAsync(cacheKey, new TokenEntry { AccessToken = token }, ttl, ct).ConfigureAwait(false);
+        return token;
+    }
 
     private static string BuildKey(string clientId) =>
         KeyPrefix + (clientId.Length > 8 ? clientId[^8..] : clientId);
 
-    /// <summary>Serialised cache entry.</summary>
+    /// <summary>Serialised cache entry — record for safe in-memory reference storage.</summary>
     public sealed record TokenEntry
     {
         public string AccessToken { get; init; } = string.Empty;

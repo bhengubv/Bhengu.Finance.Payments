@@ -9,7 +9,6 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.AirtelMoney.Configuration;
 using Bhengu.Finance.Payments.AirtelMoney.Internals;
 using Bhengu.Finance.Payments.Core;
-using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -48,13 +47,12 @@ public sealed class AirtelMoneyPaymentProvider : BhenguProviderBase, IPaymentGat
         HttpClient httpClient,
         IOptions<AirtelMoneyOptions> options,
         ILogger<AirtelMoneyPaymentProvider> logger,
-        IBhenguDistributedCache cache)
+        AirtelMoneyOAuthCache tokenCache)
         : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        ArgumentNullException.ThrowIfNull(cache);
-        _tokenCache = new AirtelMoneyOAuthCache(cache);
+        _tokenCache = tokenCache ?? throw new ArgumentNullException(nameof(tokenCache));
 
         if (string.IsNullOrWhiteSpace(_options.ClientId))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(AirtelMoneyOptions.ClientId)} is required");
@@ -79,7 +77,7 @@ public sealed class AirtelMoneyPaymentProvider : BhenguProviderBase, IPaymentGat
         HttpClient httpClient,
         IOptions<AirtelMoneyOptions> options,
         ILogger<AirtelMoneyPaymentProvider> logger)
-        : this(httpClient, options, logger, new InMemoryBhenguDistributedCache())
+        : this(httpClient, options, logger, new AirtelMoneyOAuthCache())
     {
     }
 
@@ -361,49 +359,36 @@ public sealed class AirtelMoneyPaymentProvider : BhenguProviderBase, IPaymentGat
         return (responseBody, response);
     }
 
-    private async Task<string> GetAccessTokenAsync(CancellationToken ct)
+    private Task<string> GetAccessTokenAsync(CancellationToken ct) =>
+        _tokenCache.GetOrFetchAsync(_options.ClientId, FetchAccessTokenAsync, ct);
+
+    private async Task<(string AccessToken, int ExpiresInSeconds)> FetchAccessTokenAsync(CancellationToken ct)
     {
-        var cached = await _tokenCache.GetAsync(_options.ClientId, ct).ConfigureAwait(false);
-        if (cached is not null) return cached;
-
-        await _tokenCache.WaitFetchSlotAsync(ct).ConfigureAwait(false);
-        try
+        var body = new
         {
-            cached = await _tokenCache.GetAsync(_options.ClientId, ct).ConfigureAwait(false);
-            if (cached is not null) return cached;
+            client_id = _options.ClientId,
+            client_secret = _options.ClientSecret,
+            grant_type = "client_credentials"
+        };
 
-            var body = new
-            {
-                client_id = _options.ClientId,
-                client_secret = _options.ClientSecret,
-                grant_type = "client_credentials"
-            };
-
-            using var req = new HttpRequestMessage(HttpMethod.Post, "auth/oauth2/token")
-            {
-                Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json")
-            };
-
-            var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
-            var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            if (!response.IsSuccessStatusCode)
-            {
-                Logger.LogError("Airtel Money OAuth failed: {StatusCode} {Body}", response.StatusCode, responseBody);
-                throw new ProviderUnavailableException(ProviderName, $"Airtel Money OAuth HTTP {(int)response.StatusCode}: {responseBody}");
-            }
-
-            var token = JsonSerializer.Deserialize<AirtelOAuthResponse>(responseBody);
-            if (token is null || string.IsNullOrEmpty(token.AccessToken))
-                throw new ProviderUnavailableException(ProviderName, "Airtel Money OAuth returned an empty token");
-
-            var ttl = TimeSpan.FromSeconds(Math.Max(60, (token.ExpiresIn > 0 ? token.ExpiresIn : 3599) - 60));
-            await _tokenCache.SetAsync(_options.ClientId, token.AccessToken, ttl, ct).ConfigureAwait(false);
-            return token.AccessToken;
-        }
-        finally
+        using var req = new HttpRequestMessage(HttpMethod.Post, "auth/oauth2/token")
         {
-            _tokenCache.ReleaseFetchSlot();
+            Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json")
+        };
+
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
+        var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            Logger.LogError("Airtel Money OAuth failed: {StatusCode} {Body}", response.StatusCode, responseBody);
+            throw new ProviderUnavailableException(ProviderName, $"Airtel Money OAuth HTTP {(int)response.StatusCode}: {responseBody}");
         }
+
+        var token = JsonSerializer.Deserialize<AirtelOAuthResponse>(responseBody);
+        if (token is null || string.IsNullOrEmpty(token.AccessToken))
+            throw new ProviderUnavailableException(ProviderName, "Airtel Money OAuth returned an empty token");
+
+        return (token.AccessToken, token.ExpiresIn > 0 ? token.ExpiresIn : 3599);
     }
 
     private static PaymentStatus MapStatus(string? raw) => (raw ?? string.Empty).ToUpperInvariant() switch

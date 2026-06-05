@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using Bhengu.Finance.Payments.AirtelMoney.Configuration;
+using Bhengu.Finance.Payments.AirtelMoney.Internals;
 using Bhengu.Finance.Payments.AirtelMoney.Providers;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Caching;
@@ -36,6 +37,8 @@ public static class ServiceCollectionExtensions
         if (string.IsNullOrWhiteSpace(probe.Currency))
             throw new ProviderConfigurationException("airtelmoney", $"{AirtelMoneyOptions.ConfigSection}:Currency is required");
 
+        services.AddBhenguInMemoryCache();
+        services.AddSingleton<AirtelMoneyOAuthCache>();
         services.AddHttpClient<AirtelMoneyPaymentProvider>();
         services.AddHttpClient<AirtelMoneyPayoutProvider>();
         services.AddTransient<IPaymentGatewayProvider, AirtelMoneyPaymentProvider>(sp =>
