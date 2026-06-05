@@ -7,6 +7,7 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
@@ -27,6 +28,7 @@ namespace Bhengu.Finance.Payments.UnionPay.Providers;
 /// back-notify verification use the same RSA-SHA256 form-signing scheme.
 /// UnionPay does not expose a standard payout API; <see cref="IPayoutProvider"/> is not implemented.
 /// </summary>
+[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
 public sealed class UnionPayPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider
 {
     private const string FrontTransPath = "/gateway/api/frontTransReq.do";

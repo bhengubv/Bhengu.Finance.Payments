@@ -8,6 +8,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -26,6 +27,7 @@ namespace Bhengu.Finance.Payments.OPay.Providers;
 /// cashier, refund and payout REST APIs. Requests are HMAC-SHA512 signed with the merchant
 /// SecretKey and the signature is carried in the <c>Authorization</c> header.
 /// </summary>
+[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
 public sealed class OPayPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private const string ProductionBaseUrl = "https://liveapi.opaycheckout.com";

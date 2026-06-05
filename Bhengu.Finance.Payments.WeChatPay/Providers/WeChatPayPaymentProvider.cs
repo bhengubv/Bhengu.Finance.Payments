@@ -9,6 +9,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -25,6 +26,7 @@ namespace Bhengu.Finance.Payments.WeChatPay.Providers;
 /// charges, refunds and partner batch-transfer payouts. RSA-SHA256 signed Authorization
 /// headers; webhook notifications are AEAD-AES-256-GCM ciphertext that the SDK decrypts.
 /// </summary>
+[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
 public sealed class WeChatPayPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private const string NativePath = "/v3/pay/transactions/native";

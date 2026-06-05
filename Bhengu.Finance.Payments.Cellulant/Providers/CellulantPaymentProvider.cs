@@ -9,6 +9,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Cellulant.Configuration;
 using Bhengu.Finance.Payments.Cellulant.Internals;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
@@ -28,6 +29,7 @@ namespace Bhengu.Finance.Payments.Cellulant.Providers;
 /// via the <c>x-tingg-signature</c> header. Honours per-call <c>IdempotencyKey</c> by dedup'ing
 /// via the shared <see cref="IBhenguDistributedCache"/> for 24 hours.
 /// </summary>
+[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
 public sealed class CellulantPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;

@@ -1,6 +1,7 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Diagnostics;
+using Bhengu.Finance.Payments.Core.Auditing;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Observability;
 using Microsoft.Extensions.Logging;
@@ -112,6 +113,8 @@ public abstract class BhenguProviderBase
 
         var start = Stopwatch.GetTimestamp();
         string outcome = BhenguPaymentDiagnostics.Outcomes.Error;
+        string? errorType = null;
+        string? errorCode = null;
         try
         {
             var result = await op().ConfigureAwait(false);
@@ -121,21 +124,28 @@ public abstract class BhenguProviderBase
         catch (OperationCanceledException)
         {
             outcome = BhenguPaymentDiagnostics.Outcomes.Error;
+            errorType = nameof(OperationCanceledException);
             throw;
         }
-        catch (PaymentDeclinedException)
+        catch (PaymentDeclinedException ex)
         {
             outcome = BhenguPaymentDiagnostics.Outcomes.Declined;
+            errorType = nameof(PaymentDeclinedException);
+            errorCode = ex.ProviderErrorCode;
             throw;
         }
-        catch (ProviderRateLimitException)
+        catch (ProviderRateLimitException ex)
         {
             outcome = BhenguPaymentDiagnostics.Outcomes.RateLimited;
+            errorType = nameof(ProviderRateLimitException);
+            errorCode = ex.ProviderErrorCode;
             throw;
         }
-        catch (ProviderUnavailableException)
+        catch (ProviderUnavailableException ex)
         {
             outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable;
+            errorType = nameof(ProviderUnavailableException);
+            errorCode = ex.ProviderErrorCode;
             throw;
         }
         catch (HttpRequestException ex)
@@ -143,20 +153,26 @@ public abstract class BhenguProviderBase
             // Translate raw HTTP failures into the canonical hierarchy so providers don't each
             // re-implement the same translation.
             outcome = BhenguPaymentDiagnostics.Outcomes.Unavailable;
+            errorType = nameof(ProviderUnavailableException);
             throw new ProviderUnavailableException(ProviderName, "HTTP request failed", ex);
         }
-        catch (BhenguPaymentException)
+        catch (BhenguPaymentException ex)
         {
             outcome = BhenguPaymentDiagnostics.Outcomes.Error;
+            errorType = ex.GetType().Name;
+            errorCode = ex.ProviderErrorCode;
             throw;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
             outcome = BhenguPaymentDiagnostics.Outcomes.Error;
+            errorType = ex.GetType().Name;
             throw;
         }
         finally
         {
+            var elapsedMs = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+
             activity.SetOutcome(outcome);
             activity?.Dispose();
             counter?.Add(1,
@@ -164,10 +180,30 @@ public abstract class BhenguProviderBase
                 new KeyValuePair<string, object?>("outcome", outcome));
             if (durationHistogram is not null)
             {
-                var elapsed = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
-                durationHistogram.Record(elapsed,
+                durationHistogram.Record(elapsedMs,
                     new KeyValuePair<string, object?>("provider", ProviderName),
                     new KeyValuePair<string, object?>("outcome", outcome));
+            }
+
+            // Fire-and-forget audit emission via the process-wide ambient sink. Defaults to
+            // NoopAuditLog when AddBhenguPaymentAuditLog hasn't been wired — never throws.
+            try
+            {
+                var entry = new PaymentAuditEntry
+                {
+                    At = DateTime.UtcNow,
+                    Provider = ProviderName,
+                    Operation = activity?.OperationName ?? "unknown",
+                    Outcome = outcome,
+                    DurationMs = elapsedMs,
+                    ErrorType = errorType,
+                    ErrorCode = errorCode,
+                };
+                _ = BhenguPaymentAuditing.Default.RecordAsync(entry, CancellationToken.None);
+            }
+            catch
+            {
+                // Audit failure must never affect the original operation outcome.
             }
         }
     }

@@ -20,6 +20,7 @@ public static class ServiceCollectionExtensions
         ArgumentNullException.ThrowIfNull(services);
         services.TryAddSingleton<IWebhookReplayStore, InMemoryWebhookReplayStore>();
         services.TryAddSingleton<IWebhookReplayer, WebhookReplayer>();
+        services.TryAddSingleton<IWebhookEventDispatcher, WebhookEventDispatcher>();
         return services;
     }
 }

@@ -22,6 +22,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <WarningsAsErrors />
+    <!-- BHENGU_PCI_SAQ_D is the [Experimental] marker on IRawCardTokenisationProvider. Suppressed
+         inside this repo (impls + DI + tests reference the interface by design); external
+         consumers of the SDK still see the warning on their reference. -->
+    <NoWarn>$(NoWarn);BHENGU_PCI_SAQ_D</NoWarn>
     <WarningsNotAsErrors>CS1591;NU1510</WarningsNotAsErrors>
     <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
 
@@ -35,7 +39,7 @@
 
     <!-- Shared version for the whole family. Used by .All meta-package; individual provider csprojs
          can still override Version locally if they need to ship out-of-band. -->
-    <BhenguPaymentsVersion>2.0.0</BhenguPaymentsVersion>
+    <BhenguPaymentsVersion>2.1.0</BhenguPaymentsVersion>
   </PropertyGroup>
 
   <ItemGroup>

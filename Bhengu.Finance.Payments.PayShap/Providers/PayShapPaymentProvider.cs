@@ -2,6 +2,7 @@
 
 using System.Text.Json;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -46,6 +47,7 @@ namespace Bhengu.Finance.Payments.PayShap.Providers;
 /// <see cref="PaymentRequest.PaymentMethodToken"/> is treated as the payee proxy alias when no explicit
 /// <c>payshap.payee.identifier_value</c> is provided.
 /// </summary>
+[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
 public sealed class PayShapPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider
 {
     private readonly IPayShapService _payShapService;

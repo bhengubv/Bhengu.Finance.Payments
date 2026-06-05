@@ -7,6 +7,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Providers;
@@ -25,6 +26,7 @@ namespace Bhengu.Finance.Payments.Fawry.Providers;
 /// is intentionally not implemented. Merchants requiring disbursements must use
 /// the Fawry Disbursement product (separate contract + API).
 /// </summary>
+[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
 public sealed class FawryPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider
 {
     private const string LiveDefaultUrl = "https://atfawry.fawrystaging.com/ECommerceWeb/api/";

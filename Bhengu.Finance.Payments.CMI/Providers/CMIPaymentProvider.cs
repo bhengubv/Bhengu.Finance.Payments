@@ -7,6 +7,7 @@ using System.Xml.Linq;
 using Bhengu.Finance.Payments.CMI.Configuration;
 using Bhengu.Finance.Payments.CMI.Internals;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -29,6 +30,7 @@ namespace Bhengu.Finance.Payments.CMI.Providers;
 /// the issuer's <c>mdStatus</c> is 1 (full auth) or 2/3/4 (attempted, Visa-only shift). See
 /// <see cref="CMIThreeDSecureProvider"/> for an explicit step-up API.
 /// </remarks>
+[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
 public sealed class CMIPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider
 {
     private readonly HttpClient _httpClient;

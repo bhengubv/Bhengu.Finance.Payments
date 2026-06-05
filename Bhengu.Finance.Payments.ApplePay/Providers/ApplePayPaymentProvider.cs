@@ -3,11 +3,11 @@
 using System.Text.Json;
 using Bhengu.Finance.Payments.ApplePay.Configuration;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Providers;
-using Bhengu.Finance.Payments.Core.Validation;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -28,6 +28,7 @@ namespace Bhengu.Finance.Payments.ApplePay.Providers;
 /// has no webhook channel; the downstream processor handles webhook events.
 /// </para>
 /// </summary>
+[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
 public sealed class ApplePayPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IRequiresPostConstructionValidation
 {
     private readonly IServiceProvider _services;

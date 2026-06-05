@@ -10,6 +10,7 @@ using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.Alipay.Configuration;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -23,6 +24,7 @@ namespace Bhengu.Finance.Payments.Alipay.Providers;
 /// global merchants accepting Chinese consumers (1B+ users). RSA-SHA256 signed requests,
 /// response/webhook signature verification, and IPayoutProvider for disbursements.
 /// </summary>
+[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
 public sealed class AlipayPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private const string PayPath = "/ams/api/v1/payments/pay";

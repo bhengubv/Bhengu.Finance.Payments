@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -23,6 +24,7 @@ namespace Bhengu.Finance.Payments.Yoco.Providers;
 /// Yoco does NOT expose payouts on the standard merchant API — <see cref="IPayoutProvider"/>
 /// is intentionally not implemented; merchants requiring payouts should use Yoco Business/Marketplace.
 /// </summary>
+[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
 public sealed class YocoPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider
 {
     private static readonly JsonSerializerOptions s_jsonOptions = new(JsonSerializerDefaults.Web)

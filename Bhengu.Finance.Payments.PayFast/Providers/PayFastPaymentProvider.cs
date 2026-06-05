@@ -4,6 +4,7 @@ using System.Net;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
@@ -23,6 +24,7 @@ namespace Bhengu.Finance.Payments.PayFast.Providers;
 /// Supports tokenised ad-hoc charging via the PayFast subscriptions API.
 /// PayFast does NOT support payouts via API — <see cref="IPayoutProvider"/> is intentionally not implemented.
 /// </summary>
+[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
 public sealed class PayFastPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider
 {
     private const string SubSeenKeyPrefix = "payfast:sub-seen:";

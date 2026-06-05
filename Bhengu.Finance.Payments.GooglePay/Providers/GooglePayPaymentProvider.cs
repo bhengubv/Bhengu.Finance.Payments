@@ -2,11 +2,11 @@
 
 using System.Text.Json;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Providers;
-using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Google.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -24,6 +24,7 @@ namespace Bhengu.Finance.Payments.Google.Providers;
 /// <see cref="IPaymentGatewayProvider"/> such as Stripe).
 /// </para>
 /// </summary>
+[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
 public sealed class GooglePayPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IRequiresPostConstructionValidation
 {
     private readonly IServiceProvider _services;

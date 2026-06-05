@@ -34,7 +34,8 @@ public class RazorpayDiagnosticsTests
             Description = "diag"
         });
 
-        Assert.Equal(1, recorder.CounterTotalFor("bhengu_payments_charges_total", "razorpay"));
+        // >= 1 (not == 1) — process-wide MeterListener counter, parallel tests may also increment.
+        Assert.True(recorder.CounterTotalFor("bhengu_payments_charges_total", "razorpay") >= 1);
         Assert.True(recorder.HistogramObservationsFor("bhengu_payments_charge_duration_ms", "razorpay") >= 1);
     }
 }

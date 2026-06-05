@@ -51,6 +51,8 @@ public interface ITokenisationProvider
 /// Checkout, Yoco Inline, Paystack Inline, MercadoPago SDK.js) — the payer's browser sends PAN
 /// directly to the provider and your server only ever sees a short-lived token. SAQ stays at A.</para>
 /// </summary>
+[System.Diagnostics.CodeAnalysis.Experimental("BHENGU_PCI_SAQ_D",
+    UrlFormat = "https://github.com/bhengubv/Bhengu.Finance.Payments/blob/master/docs/SECURITY.md#raw-card-tokenisation")]
 public interface IRawCardTokenisationProvider
 {
     /// <summary>The provider this raw-card tokenisation capability belongs to.</summary>

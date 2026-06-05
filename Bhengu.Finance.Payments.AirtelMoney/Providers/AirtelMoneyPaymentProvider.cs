@@ -9,6 +9,7 @@ using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.AirtelMoney.Configuration;
 using Bhengu.Finance.Payments.AirtelMoney.Internals;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -24,6 +25,7 @@ namespace Bhengu.Finance.Payments.AirtelMoney.Providers;
 /// Airtel Money provider. Implements Collect (charge), Disbursement (payout), and Refund.
 /// Inbound callbacks are HMAC-SHA256 signed with <see cref="AirtelMoneyOptions.WebhookSecret"/>.
 /// </summary>
+[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
 public sealed class AirtelMoneyPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;

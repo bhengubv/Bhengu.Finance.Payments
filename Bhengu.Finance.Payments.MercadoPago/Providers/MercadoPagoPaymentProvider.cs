@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -23,6 +24,7 @@ namespace Bhengu.Finance.Payments.MercadoPago.Providers;
 /// (<c>https://api.mercadopago.com</c>) for card, PIX, boleto and wallet payments, refunds and money-out payouts.
 /// PIX charges return the QR code + copy-paste string under <c>point_of_interaction.transaction_data</c>.
 /// </summary>
+[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
 public sealed class MercadoPagoPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;

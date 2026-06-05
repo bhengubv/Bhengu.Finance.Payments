@@ -7,6 +7,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Validation;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
@@ -26,6 +27,7 @@ namespace Bhengu.Finance.Payments.TymeBank.Providers;
 /// (when <c>request.Metadata["mode"]="qr"</c> a QR is generated instead). Refund and payout (PayShap or EFT)
 /// are supported via dedicated endpoints. Webhook authenticity uses HMAC-SHA256 in <c>X-Tyme-Signature</c>.
 /// </summary>
+[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
 public sealed class TymeBankPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
