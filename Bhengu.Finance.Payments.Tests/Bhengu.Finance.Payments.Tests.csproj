@@ -80,6 +80,6 @@
     <ProjectReference Include="..\Bhengu.Finance.Payments.Redis\Bhengu.Finance.Payments.Redis.csproj" />
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="Microsoft.Extensions.Http" Version="9.0.6" />
+    <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.9" />
   </ItemGroup>
 </Project>
