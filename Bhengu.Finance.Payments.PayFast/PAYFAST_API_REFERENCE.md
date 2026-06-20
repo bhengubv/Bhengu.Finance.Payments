@@ -79,8 +79,8 @@ Annually=6. Bi-weekly is unsupported and throws.
 
 **Status:** all providers remain `DocsOnly` until verified against live PayFast. Charges / subscriptions /
 transaction-history are sandbox-verifiable (`?testing=true`); **refunds and onsite are production-only** (PayFast
-blocks them in sandbox). One small intentional omission: refund `acc_type` (EFT account type) is not exposed —
-`RefundRequest` is a shared Core type with no PayFast-specific field; add it only if an EFT-refund need arises.
+blocks them in sandbox). Refund `acc_type` (the EFT bank-account type) is exposed via the PayFast-specific
+overload `ProcessRefundAsync(request, accType, ct)` — optional; card refunds omit it and follow the original payment.
 
 ## Sources
 - PayFast official PHP SDK: https://github.com/Payfast/payfast-php-sdk

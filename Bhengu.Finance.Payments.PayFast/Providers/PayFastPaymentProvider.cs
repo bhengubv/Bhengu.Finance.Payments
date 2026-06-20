@@ -174,10 +174,22 @@ public sealed class PayFastPaymentProvider : BhenguProviderBase, IPaymentGateway
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct), ct);
+        return RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, null, ct), ct);
     }
 
-    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    /// <summary>
+    /// Refund a PayFast payment, optionally specifying PayFast's <c>acc_type</c> — the bank-account type
+    /// (<c>current</c> or <c>savings</c>) for EFT refunds. PayFast-specific overload; card refunds don't
+    /// need it (the refund follows the original payment), so the parameterless overload omits it.
+    /// </summary>
+    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, string accType, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentException.ThrowIfNullOrEmpty(accType);
+        return RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, accType, ct), ct);
+    }
+
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, string? accType, CancellationToken ct)
     {
         // PayFast refunds run against the authenticated REST API: POST /refunds/{pf_payment_id}.
         // The refund endpoint is NOT available in sandbox — PayFast only processes refunds in production.
@@ -194,6 +206,8 @@ public sealed class PayFastPaymentProvider : BhenguProviderBase, IPaymentGateway
             ["reason"] = request.Reason,
             ["notify_buyer"] = "1"
         };
+        if (!string.IsNullOrEmpty(accType))
+            body["acc_type"] = accType;
 
         var timestamp = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss");
         var signature = PayFastSignatureHelper.ComputeApiSignature(

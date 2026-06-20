@@ -74,6 +74,17 @@ public class PayFastRefundTests
         Assert.Contains("sandbox", ex.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Empty(requests);
     }
+
+    [Fact]
+    public async Task ProcessRefundAsync_WithAccType_SendsAccTypeInBody()
+    {
+        var (provider, requests) = MakeProvider(sandbox: false);
+
+        await provider.ProcessRefundAsync(
+            new RefundRequest { GatewayReference = "PF-PAY-1", Amount = 100m, Reason = "EFT refund" }, "savings");
+
+        Assert.Contains("acc_type=savings", Assert.Single(requests).Body);
+    }
 }
 
 /// <summary>Subscription update, pause-cycles, and frequency-mapping tests for PayFast.</summary>
