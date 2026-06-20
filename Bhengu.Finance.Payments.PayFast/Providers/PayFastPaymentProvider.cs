@@ -14,6 +14,7 @@ using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Security;
 using Bhengu.Finance.Payments.PayFast.Configuration;
 using Bhengu.Finance.Payments.PayFast.Internals;
+using Bhengu.Finance.Payments.PayFast.Models;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -70,9 +71,10 @@ public sealed class PayFastPaymentProvider : BhenguProviderBase, IPaymentGateway
 
         if (_httpClient.BaseAddress is null)
         {
-            _httpClient.BaseAddress = new Uri(_options.UseSandbox
-                ? "https://sandbox.payfast.co.za/"
-                : "https://api.payfast.co.za/");
+            // PayFast's REST API is ALWAYS served from api.payfast.co.za. Sandbox is selected per-request
+            // via the "?testing=true" query suffix (see ProcessPaymentCoreAsync), NOT a different host —
+            // sandbox.payfast.co.za only serves the /eng/process & /onsite/process browser-redirect flows.
+            _httpClient.BaseAddress = new Uri("https://api.payfast.co.za/");
         }
     }
 
@@ -171,25 +173,66 @@ public sealed class PayFastPaymentProvider : BhenguProviderBase, IPaymentGateway
         return RunRefundAsync(request.GatewayReference, () => ProcessRefundCoreAsync(request, ct), ct);
     }
 
-    private Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
+    private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
     {
-        // PayFast does not expose a refund API — refunds are processed manually via merchant dashboard.
-        // We return a deterministic tracking reference so the caller can match this entry to the manual
-        // action when reconciling. Consumers requiring automated refunds must use a different provider.
-        Logger.LogWarning(
-            "PayFast refund requested for {GatewayReference} amount={Amount}. PayFast has no refund API; manual dashboard processing required.",
-            request.GatewayReference, request.Amount);
+        // PayFast refunds run against the authenticated REST API: POST /refunds/{pf_payment_id}.
+        // The refund endpoint is NOT available in sandbox — PayFast only processes refunds in production.
+        if (_options.UseSandbox)
+            throw new BhenguPaymentException(ProviderName,
+                "PayFast refunds are not available in sandbox mode — PayFast only processes refunds in production.",
+                "refund_sandbox_unsupported");
 
-        var trackingReference = $"PAYFAST-MANUAL-REFUND-{request.GatewayReference}-{DateTime.UtcNow:yyyyMMddHHmmss}";
-
-        return Task.FromResult(new RefundResponse
+        // REST money values are in CENTS (integer).
+        var amountInCents = (long)Math.Round(request.Amount * 100m, MidpointRounding.AwayFromZero);
+        var body = new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            GatewayReference = trackingReference,
+            ["amount"] = amountInCents.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            ["reason"] = request.Reason,
+            ["notify_buyer"] = "1"
+        };
+
+        var timestamp = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss");
+        var signature = PayFastSignatureHelper.ComputeApiSignature(
+            _options.MerchantId, _options.Passphrase ?? string.Empty, timestamp, body);
+
+        using var http = new HttpRequestMessage(HttpMethod.Post, $"refunds/{Uri.EscapeDataString(request.GatewayReference)}")
+        {
+            Content = new FormUrlEncodedContent(body)
+        };
+        http.Headers.Add("merchant-id", _options.MerchantId);
+        http.Headers.Add("version", "v1");
+        http.Headers.Add("timestamp", timestamp);
+        http.Headers.Add("signature", signature);
+
+        var response = await _httpClient.SendAsync(http, ct).ConfigureAwait(false);
+        var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+
+        if (response.StatusCode == HttpStatusCode.TooManyRequests)
+        {
+            var retryAfter = response.Headers.RetryAfter?.Delta?.TotalSeconds is double d ? (int)d : (int?)null;
+            throw new ProviderRateLimitException(ProviderName, retryAfter, responseBody);
+        }
+
+        if (!response.IsSuccessStatusCode)
+        {
+            Logger.LogError("PayFast refund failed for {GatewayReference}: {Status} {Body}",
+                request.GatewayReference, response.StatusCode, responseBody);
+            if ((int)response.StatusCode is >= 400 and < 500)
+                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), responseBody);
+            throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
+        }
+
+        Logger.LogInformation("PayFast refund submitted for {GatewayReference} amount={Amount}", request.GatewayReference, request.Amount);
+
+        return new RefundResponse
+        {
+            // PayFast correlates the refund to the original transaction's pf_payment_id.
+            GatewayReference = request.GatewayReference,
             Amount = request.Amount,
-            Status = PaymentStatus.Pending,
+            Status = PaymentStatus.Pending, // accepted by PayFast; settlement completes asynchronously
             ProcessedAt = DateTime.UtcNow,
-            Message = "PayFast refunds require manual processing via the merchant dashboard."
-        });
+            Message = "Refund submitted to PayFast."
+        };
     }
 
     /// <summary>
@@ -216,6 +259,166 @@ public sealed class PayFastPaymentProvider : BhenguProviderBase, IPaymentGateway
             var canonical = string.Join("&", sorted);
             return SignatureHelpers.VerifyMd5(canonical, signature);
         });
+    }
+
+    /// <summary>
+    /// Fully validate a PayFast ITN (Instant Transaction Notification) before treating it as a settled
+    /// payment. Runs PayFast's four-step verification — and you MUST run all four; a valid signature
+    /// alone does not prove a real payment:
+    /// <list type="number">
+    ///   <item>Signature — the ITN's MD5 signature matches (same algorithm as <see cref="VerifyWebhookSignature"/>).</item>
+    ///   <item>Source — when <paramref name="sourceIp"/> is supplied, it must resolve to one of PayFast's
+    ///         published ITN hosts (<see cref="PayFastOptions.ValidItnHosts"/>).</item>
+    ///   <item>Server confirm — the raw ITN is POSTed back to PayFast's <c>/eng/query/validate</c> and must
+    ///         return <c>VALID</c>. This is the step that defeats replayed or forged notifications.</item>
+    ///   <item>Amount — when <paramref name="expectedAmount"/> is supplied, the ITN's <c>amount_gross</c>
+    ///         must equal it (guards against a tampered amount).</item>
+    /// </list>
+    /// Only treat the payment as settled when <see cref="PayFastItnValidationResult.IsValid"/> is true.
+    /// </summary>
+    /// <param name="payload">The raw <c>application/x-www-form-urlencoded</c> ITN body exactly as PayFast posted it.</param>
+    /// <param name="sourceIp">The remote IP the ITN POST came from (e.g. <c>HttpContext.Connection.RemoteIpAddress</c>).
+    /// When null/empty the source gate is skipped (reported as not-checked; does not fail validation).</param>
+    /// <param name="expectedAmount">The amount the order is expected to cost. When null the amount gate is skipped.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task<PayFastItnValidationResult> ValidateItnAsync(
+        string payload,
+        string? sourceIp = null,
+        decimal? expectedAmount = null,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(payload);
+
+        var parameters = ParseFormUrlEncoded(payload);
+        var pfPaymentId = parameters.GetValueOrDefault("pf_payment_id");
+        var mPaymentId = parameters.GetValueOrDefault("m_payment_id");
+        var paymentStatus = parameters.GetValueOrDefault("payment_status");
+        var amountGross = decimal.TryParse(parameters.GetValueOrDefault("amount_gross", "0"),
+            System.Globalization.NumberStyles.Number, System.Globalization.CultureInfo.InvariantCulture, out var ag) ? ag : 0m;
+
+        PayFastItnValidationResult Fail(string reason, bool sig = false, bool? src = null, bool confirmed = false, bool? amt = null) =>
+            new()
+            {
+                IsValid = false,
+                Reason = reason,
+                SignatureValid = sig,
+                SourceValid = src,
+                ServerConfirmed = confirmed,
+                AmountMatched = amt,
+                PfPaymentId = pfPaymentId,
+                MPaymentId = mPaymentId,
+                PaymentStatus = paymentStatus,
+                AmountGross = amountGross
+            };
+
+        // Gate 1 — signature (alphabetical-sort MD5, matching the production PayfastAPI implementation).
+        var signature = parameters.GetValueOrDefault("signature", string.Empty);
+        if (string.IsNullOrEmpty(signature) || !VerifyWebhookSignature(payload, signature))
+            return Fail("ITN signature verification failed");
+
+        // Gate 2 — source IP (only when the caller supplies one).
+        bool? sourceValid = null;
+        if (!string.IsNullOrWhiteSpace(sourceIp))
+        {
+            sourceValid = await IsValidPayFastSourceAsync(sourceIp!, ct).ConfigureAwait(false);
+            if (sourceValid == false)
+                return Fail($"ITN source IP '{sourceIp}' is not a known PayFast host", sig: true, src: false);
+        }
+
+        // Gate 3 — PayFast server confirmation (REQUIRED). Defeats replay/forgery.
+        var confirmed = await ConfirmItnWithPayFastAsync(payload, ct).ConfigureAwait(false);
+        if (!confirmed)
+            return Fail("PayFast did not confirm the ITN as VALID", sig: true, src: sourceValid);
+
+        // Gate 4 — amount reconciliation (only when the caller supplies an expected amount).
+        bool? amountMatched = null;
+        if (expectedAmount is { } expected)
+        {
+            amountMatched = amountGross == expected;
+            if (amountMatched == false)
+                return Fail($"ITN amount_gross {amountGross} does not match expected {expected}",
+                    sig: true, src: sourceValid, confirmed: true, amt: false);
+        }
+
+        return new PayFastItnValidationResult
+        {
+            IsValid = true,
+            Reason = "valid",
+            SignatureValid = true,
+            SourceValid = sourceValid,
+            ServerConfirmed = true,
+            AmountMatched = amountMatched,
+            PfPaymentId = pfPaymentId,
+            MPaymentId = mPaymentId,
+            PaymentStatus = paymentStatus,
+            AmountGross = amountGross
+        };
+    }
+
+    /// <summary>
+    /// Resolve PayFast's published ITN hosts (<see cref="PayFastOptions.ValidItnHosts"/>) and confirm
+    /// <paramref name="sourceIp"/> is one of their addresses.
+    /// </summary>
+    private async Task<bool> IsValidPayFastSourceAsync(string sourceIp, CancellationToken ct)
+    {
+        if (!IPAddress.TryParse(sourceIp, out var remote))
+        {
+            Logger.LogWarning("PayFast ITN source '{SourceIp}' is not a valid IP address", sourceIp);
+            return false;
+        }
+
+        foreach (var host in _options.ValidItnHosts)
+        {
+            try
+            {
+                var addresses = await Dns.GetHostAddressesAsync(host, ct).ConfigureAwait(false);
+                if (addresses.Any(a => a.Equals(remote)))
+                    return true;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                Logger.LogWarning(ex, "Failed to resolve PayFast ITN host {Host} during source validation", host);
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// POST the raw ITN back to PayFast's <c>/eng/query/validate</c> endpoint. PayFast replies with the
+    /// literal text <c>VALID</c> (or <c>INVALID</c>). The validate host is the website host
+    /// (www / sandbox), NOT the REST API host.
+    /// </summary>
+    private async Task<bool> ConfirmItnWithPayFastAsync(string payload, CancellationToken ct)
+    {
+        try
+        {
+            var host = (_options.UseSandbox
+                ? (_options.SandboxUrl ?? "https://sandbox.payfast.co.za")
+                : (_options.BaseUrl ?? "https://www.payfast.co.za")).TrimEnd('/');
+
+            // Absolute URI — HttpClient ignores BaseAddress (which points at the REST api host) when the
+            // request URI is absolute, so this correctly hits the website host.
+            using var content = new StringContent(payload, System.Text.Encoding.UTF8, "application/x-www-form-urlencoded");
+            using var req = new HttpRequestMessage(HttpMethod.Post, $"{host}/eng/query/validate") { Content = content };
+
+            var resp = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
+            var body = (await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false)).Trim();
+
+            if (!resp.IsSuccessStatusCode)
+            {
+                Logger.LogError("PayFast ITN validate returned {Status}: {Body}", resp.StatusCode, body);
+                return false;
+            }
+
+            // PayFast returns "VALID" on the first line when the ITN is genuine.
+            return body.StartsWith("VALID", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Logger.LogError(ex, "PayFast ITN server confirmation failed");
+            return false;
+        }
     }
 
     /// <summary>

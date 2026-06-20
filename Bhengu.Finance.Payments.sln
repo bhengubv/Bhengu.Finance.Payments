@@ -7,7 +7,7 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Bhengu.Finance.Payments.Cor
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Bhengu.Finance.Payments.PayFast", "Bhengu.Finance.Payments.PayFast\Bhengu.Finance.Payments.PayFast.csproj", "{232AEC5A-2780-4E4E-BB25-30CC899BFF87}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Bhengu.Finance.Payments.GooglePay", "Bhengu.Finance.Payments.Google\Bhengu.Finance.Payments.GooglePay.csproj", "{B046CCE6-0398-420F-AD95-380966E1377E}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Bhengu.Finance.Payments.GooglePay", "Bhengu.Finance.Payments.GooglePay\Bhengu.Finance.Payments.GooglePay.csproj", "{B046CCE6-0398-420F-AD95-380966E1377E}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Bhengu.Finance.Payments.ApplePay", "Bhengu.Finance.Payments.ApplePay\Bhengu.Finance.Payments.ApplePay.csproj", "{4718CAAA-FCC4-4F7A-8D37-42AD4ABDD5C7}"
 EndProject

@@ -38,7 +38,7 @@ namespace Bhengu.Finance.Payments.PayFast.Providers;
 /// add-on contract so consumers can pattern-match support at compile time instead of catching
 /// runtime "not supported" exceptions.</para>
 /// </remarks>
-public sealed class PayFastSubscriptionProvider : BhenguProviderBase, ISubscriptionProvider, ISubscriptionPauseSupport
+public sealed class PayFastSubscriptionProvider : BhenguProviderBase, ISubscriptionProvider, ISubscriptionPauseSupport, ISubscriptionUpdateSupport
 {
     private readonly HttpClient _httpClient;
     private readonly PayFastOptions _options;
@@ -64,9 +64,10 @@ public sealed class PayFastSubscriptionProvider : BhenguProviderBase, ISubscript
 
         if (_httpClient.BaseAddress is null)
         {
-            _httpClient.BaseAddress = new Uri(_options.UseSandbox
-                ? "https://sandbox.payfast.co.za/"
-                : "https://api.payfast.co.za/");
+            // PayFast's REST API is ALWAYS served from api.payfast.co.za. Sandbox is selected per-request
+            // via the "?testing=true" query suffix, NOT a different host — sandbox.payfast.co.za only
+            // serves the /eng/process & /onsite/process browser-redirect flows.
+            _httpClient.BaseAddress = new Uri("https://api.payfast.co.za/");
         }
     }
 
@@ -222,15 +223,32 @@ public sealed class PayFastSubscriptionProvider : BhenguProviderBase, ISubscript
     public Task<Subscription> PauseSubscriptionAsync(string subscriptionReference, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
-        return RunOperationAsync("pause_subscription", () => PauseSubscriptionCoreAsync(subscriptionReference, ct), ct);
+        return RunOperationAsync("pause_subscription", () => PauseSubscriptionCoreAsync(subscriptionReference, null, ct), ct);
     }
 
-    private async Task<Subscription> PauseSubscriptionCoreAsync(string subscriptionReference, CancellationToken ct)
+    /// <summary>
+    /// Pause a subscription for a specific number of billing cycles — PayFast's optional pause duration
+    /// (<c>cycles</c> on <c>PUT subscriptions/{token}/pause</c>). The parameterless overload pauses for
+    /// PayFast's default of 1 cycle.
+    /// </summary>
+    public Task<Subscription> PauseSubscriptionAsync(string subscriptionReference, int cycles, CancellationToken ct = default)
     {
+        ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
+        if (cycles < 1)
+            throw new BhenguPaymentException(ProviderName, "Pause cycles must be at least 1.", "invalid_pause_cycles");
+        return RunOperationAsync("pause_subscription", () => PauseSubscriptionCoreAsync(subscriptionReference, cycles, ct), ct);
+    }
+
+    private async Task<Subscription> PauseSubscriptionCoreAsync(string subscriptionReference, int? cycles, CancellationToken ct)
+    {
+        var body = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (cycles is { } c)
+            body["cycles"] = c.ToString(CultureInfo.InvariantCulture);
+
         await SendSignedAsync<object>(
-            HttpMethod.Put, $"subscriptions/{Uri.EscapeDataString(subscriptionReference)}/pause", new Dictionary<string, string>(), ct)
+            HttpMethod.Put, $"subscriptions/{Uri.EscapeDataString(subscriptionReference)}/pause", body, ct)
             .ConfigureAwait(false);
-        Logger.LogInformation("PayFast subscription paused: {Reference}", subscriptionReference);
+        Logger.LogInformation("PayFast subscription paused: {Reference} cycles={Cycles}", subscriptionReference, cycles);
         var existing = await SafeGetAsync(subscriptionReference, ct).ConfigureAwait(false);
         return existing with { Status = SubscriptionStatus.Paused };
     }
@@ -250,6 +268,38 @@ public sealed class PayFastSubscriptionProvider : BhenguProviderBase, ISubscript
         Logger.LogInformation("PayFast subscription resumed: {Reference}", subscriptionReference);
         var existing = await SafeGetAsync(subscriptionReference, ct).ConfigureAwait(false);
         return existing with { Status = SubscriptionStatus.Active };
+    }
+
+    /// <inheritdoc/>
+    public Task<Subscription> UpdateSubscriptionAsync(string subscriptionReference, SubscriptionUpdateRequest request, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(subscriptionReference);
+        ArgumentNullException.ThrowIfNull(request);
+        return RunOperationAsync("update_subscription", () => UpdateSubscriptionCoreAsync(subscriptionReference, request, ct), ct);
+    }
+
+    private async Task<Subscription> UpdateSubscriptionCoreAsync(string subscriptionReference, SubscriptionUpdateRequest request, CancellationToken ct)
+    {
+        // PayFast: PATCH subscriptions/{token}/update — cycles / frequency / run_date / amount (cents).
+        var body = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (request.Amount is { } amount)
+            body["amount"] = ((long)Math.Round(amount * 100m, MidpointRounding.AwayFromZero)).ToString(CultureInfo.InvariantCulture);
+        if (request.Interval is { } interval)
+            body["frequency"] = MapFrequency(interval).ToString(CultureInfo.InvariantCulture);
+        if (request.NextBillingDate is { } runDate)
+            body["run_date"] = runDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        if (request.RemainingCycles is { } cycles)
+            body["cycles"] = cycles.ToString(CultureInfo.InvariantCulture);
+
+        if (body.Count == 0)
+            throw new BhenguPaymentException(ProviderName, "SubscriptionUpdateRequest specified no fields to update.", "no_update_fields");
+
+        await SendSignedAsync<object>(
+            HttpMethod.Patch, $"subscriptions/{Uri.EscapeDataString(subscriptionReference)}/update", body, ct)
+            .ConfigureAwait(false);
+        Logger.LogInformation("PayFast subscription updated: {Reference} fields=[{Fields}]", subscriptionReference, string.Join(",", body.Keys));
+
+        return await SafeGetAsync(subscriptionReference, ct).ConfigureAwait(false);
     }
 
     private async Task<Subscription> SafeGetAsync(string subscriptionReference, CancellationToken ct)
@@ -339,14 +389,17 @@ public sealed class PayFastSubscriptionProvider : BhenguProviderBase, ISubscript
 
     private static int MapFrequency(SubscriptionInterval interval) => interval switch
     {
-        SubscriptionInterval.Daily => 3,        // PayFast has no daily — closest is monthly = 3
-        SubscriptionInterval.Weekly => 3,       // ditto
-        SubscriptionInterval.BiWeekly => 3,     // ditto
+        SubscriptionInterval.Daily => 1,
+        SubscriptionInterval.Weekly => 2,
         SubscriptionInterval.Monthly => 3,
         SubscriptionInterval.Quarterly => 4,
         SubscriptionInterval.BiAnnually => 5,
         SubscriptionInterval.Annually => 6,
-        _ => 3
+        // PayFast has no fortnightly/bi-weekly cadence — fail loudly rather than silently bill at the wrong interval.
+        SubscriptionInterval.BiWeekly => throw new BhenguPaymentException(ProviderNames.PayFast,
+            "PayFast does not support bi-weekly (fortnightly) billing. Use Weekly or Monthly.", "frequency_unsupported"),
+        _ => throw new BhenguPaymentException(ProviderNames.PayFast,
+            $"Unsupported PayFast subscription interval '{interval}'.", "frequency_unsupported")
     };
 
     private static SubscriptionStatus MapSubscriptionStatus(int? status) => status switch

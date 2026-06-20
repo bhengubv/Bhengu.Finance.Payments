@@ -35,4 +35,18 @@ public sealed class PayFastOptions
 
     /// <summary>Override of the sandbox PayFast base URL — leave null to use the default https://sandbox.payfast.co.za.</summary>
     public string? SandboxUrl { get; set; }
+
+    /// <summary>
+    /// PayFast's published ITN-origin hosts, used by the source-IP gate of <c>ValidateItnAsync</c>. That gate
+    /// only runs when a source IP is supplied: the host names below are DNS-resolved and the ITN's source IP
+    /// must match one of their addresses. Defaults to PayFast's documented hosts; override only if PayFast
+    /// changes them.
+    /// </summary>
+    public IReadOnlyList<string> ValidItnHosts { get; set; } = new[]
+    {
+        "www.payfast.co.za",
+        "w1w.payfast.co.za",
+        "w2w.payfast.co.za",
+        "sandbox.payfast.co.za"
+    };
 }

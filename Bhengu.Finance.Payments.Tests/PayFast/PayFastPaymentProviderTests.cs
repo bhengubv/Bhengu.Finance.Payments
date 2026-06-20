@@ -132,10 +132,19 @@ public class PayFastPaymentProviderTests
     }
 
     [Fact]
-    public async Task ProcessRefundAsync_ReturnsManualTrackingReference()
+    public async Task ProcessRefundAsync_PostsToRefundApi_ReturnsPending()
     {
-        var handler = new StubHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK));
-        var provider = CreateProvider(handler);
+        // PayFast has a real refund API: POST /refunds/{pf_payment_id} (production only — the sandbox-throws
+        // case lives in PayFastRefundTests). The old manual-tracking-reference behaviour is gone.
+        HttpMethod? method = null;
+        string? uri = null;
+        var handler = new StubHandler((req, _) =>
+        {
+            method = req.Method;
+            uri = req.RequestUri!.ToString();
+            return new HttpResponseMessage(HttpStatusCode.OK);
+        });
+        var provider = CreateProvider(handler, new PayFastOptions { MerchantId = "10000100", Passphrase = "jt7NOE43FZPn", UseSandbox = false });
 
         var refund = await provider.ProcessRefundAsync(new RefundRequest
         {
@@ -144,10 +153,11 @@ public class PayFastPaymentProviderTests
             Reason = "Customer requested"
         });
 
-        Assert.StartsWith("PAYFAST-MANUAL-REFUND-PF-12345", refund.GatewayReference);
+        Assert.Equal("PF-12345", refund.GatewayReference);
         Assert.Equal(PaymentStatus.Pending, refund.Status);
         Assert.Equal(50m, refund.Amount);
-        Assert.Contains("manual", refund.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(HttpMethod.Post, method);
+        Assert.Contains("refunds/PF-12345", uri);
     }
 
     [Fact]

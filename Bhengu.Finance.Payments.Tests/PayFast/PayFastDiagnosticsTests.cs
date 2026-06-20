@@ -35,6 +35,7 @@ public class PayFastDiagnosticsTests
             Description = "diag"
         });
 
-        Assert.Equal(1, recorder.CounterTotalFor("bhengu_payments_charges_total", "payfast"));
+        // Global meter: parallel same-provider charge tests can add to this — assert >= 1, not == 1.
+        Assert.True(recorder.CounterTotalFor("bhengu_payments_charges_total", "payfast") >= 1);
     }
 }

@@ -36,7 +36,8 @@ public class PaystackDiagnosticsTests
             Description = "diag"
         });
 
-        Assert.Equal(1, recorder.CounterTotalFor("bhengu_payments_charges_total", "paystack"));
+        // Global meter: parallel same-provider charge tests can add to this — assert >= 1, not == 1.
+        Assert.True(recorder.CounterTotalFor("bhengu_payments_charges_total", "paystack") >= 1);
         Assert.True(recorder.HistogramObservationsFor("bhengu_payments_charge_duration_ms", "paystack") >= 1);
     }
 }

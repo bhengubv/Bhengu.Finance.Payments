@@ -49,9 +49,13 @@ internal static class PayFastSignatureHelper
         foreach (var (k, v) in bodyParams)
             allParams[k] = v;
 
+        // PayFast form-encodes signed values (space => '+', reserved chars => uppercase %XX), the same
+        // encoding used by the redirect flow below. Uri.EscapeDataString encodes space as %20, which
+        // produces a different canonical string and a signature PayFast cannot reproduce — so any body
+        // value containing a space (e.g. item_name "Card Tokenisation") would fail validation.
         var sorted = allParams
             .OrderBy(p => p.Key, StringComparer.Ordinal)
-            .Select(p => $"{p.Key}={Uri.EscapeDataString(p.Value ?? string.Empty)}");
+            .Select(p => $"{p.Key}={WebUtility.UrlEncode(p.Value ?? string.Empty)}");
 
         var paramString = string.Join("&", sorted);
         var hashBytes = MD5.HashData(Encoding.UTF8.GetBytes(paramString));

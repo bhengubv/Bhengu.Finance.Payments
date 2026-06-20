@@ -60,9 +60,10 @@ public sealed class PayFastMandateProvider : BhenguProviderBase, IMandateProvide
 
         if (_httpClient.BaseAddress is null)
         {
-            _httpClient.BaseAddress = new Uri(_options.UseSandbox
-                ? "https://sandbox.payfast.co.za/"
-                : "https://api.payfast.co.za/");
+            // PayFast's REST API is ALWAYS served from api.payfast.co.za. Sandbox is selected per-request
+            // via the "?testing=true" query suffix, NOT a different host — sandbox.payfast.co.za only
+            // serves the /eng/process & /onsite/process browser-redirect flows.
+            _httpClient.BaseAddress = new Uri("https://api.payfast.co.za/");
         }
     }
 
