@@ -17,7 +17,11 @@ Two distinct algorithms (PayFast `lib/Auth.php`):
   `md5(...)`. PHP `urlencode` encodes **space as `+`** ⇒ .NET `WebUtility.UrlEncode` (NOT `Uri.EscapeDataString`,
   which uses `%20`). Passphrase participates in the sort (it is NOT appended last).
 - **Redirect / form** (`generateSignature`): fixed PayFast field order (not alphabetical), `urlencode(trim(value))`,
-  `md5(...)`. Subscriptions require a passphrase.
+  `md5(...)`. Subscriptions require a passphrase. Onsite (`/onsite/process`) uses this same signer.
+- **ITN / Notification** (`Notification::dataToString`): MD5 over the posted fields **in the exact order PayFast
+  posted them — NOT sorted**, stopping at the `signature` field, then `&passphrase=urlencode(pass)` appended last.
+  ⚠️ This differs from the REST signer (which DOES sort). Do not sort the ITN, or you may reject a genuine
+  notification. (`PayFastPaymentProvider.VerifyWebhookSignature`.)
 
 ## Hosts
 
@@ -57,11 +61,26 @@ REST headers on every call: `merchant-id`, `version` (`v1`), `timestamp`, `signa
 
 PayFast has **no fortnightly / bi-weekly** option — callers requesting it must be failed loudly, not silently re-mapped.
 
-## Other current services (not yet wired in our SDK)
+## Coverage status — everything PayFast exposes is now implemented
 
-- `lib/Services/CreditCardTransactions.php` — card transactions.
-- `lib/Services/TransactionHistory.php` — transaction history (our SDK is missing this).
-- `lib/PaymentIntegrations/OnsiteIntegration.php` — onsite (in-page) checkout.
+| PayFast capability | Our SDK |
+|---|---|
+| Refund create / fetch | `PayFastPaymentProvider.ProcessRefundAsync` / `FetchRefundAsync` (production-only) |
+| Subscriptions: fetch/pause(+cycles)/unpause/cancel/update/adhoc | `PayFastSubscriptionProvider` (+ adhoc on `PayFastPaymentProvider`) |
+| Transaction query | `PayFastPaymentProvider.QueryTransactionAsync` |
+| Transaction History (range/daily/weekly/monthly) | `PayFastTransactionHistoryProvider` (raw CSV) |
+| Redirect / custom checkout | `PayFastFormBuilder` |
+| Onsite (in-page popup) | `PayFastOnsiteProvider` (production-only) |
+| Card-update link | `PayFastFormBuilder.BuildCardUpdateUrl` (production-only) |
+| ITN / Notification | `PayFastPaymentProvider.ValidateItnAsync` (4 gates, posted-order signature) |
+
+Frequency map (`SubscriptionInterval` → PayFast code): Daily=1, Weekly=2, Monthly=3, Quarterly=4, BiAnnually=5,
+Annually=6. Bi-weekly is unsupported and throws.
+
+**Status:** all providers remain `DocsOnly` until verified against live PayFast. Charges / subscriptions /
+transaction-history are sandbox-verifiable (`?testing=true`); **refunds and onsite are production-only** (PayFast
+blocks them in sandbox). One small intentional omission: refund `acc_type` (EFT account type) is not exposed —
+`RefundRequest` is a shared Core type with no PayFast-specific field; add it only if an EFT-refund need arises.
 
 ## Sources
 - PayFast official PHP SDK: https://github.com/Payfast/payfast-php-sdk

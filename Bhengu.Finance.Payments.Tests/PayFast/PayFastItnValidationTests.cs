@@ -27,23 +27,22 @@ public class PayFastItnValidationTests
         string mPaymentId = "11111111-1111-1111-1111-111111111111",
         string pfPaymentId = "PF-TEST-1")
     {
-        // Simple values only (no chars that change under URL-encode) so the canonical string is stable.
-        var fields = new Dictionary<string, string>
+        // Ordered list (not a dict): PayFast hashes ITN fields in POSTED ORDER, so the payload order must
+        // equal the canonical order. Simple values only (no chars that change under URL-encode).
+        var fields = new List<KeyValuePair<string, string>>
         {
-            ["m_payment_id"] = mPaymentId,
-            ["pf_payment_id"] = pfPaymentId,
-            ["payment_status"] = status,
-            ["item_name"] = "Order1",
-            ["amount_gross"] = amountGross,
+            new("m_payment_id", mPaymentId),
+            new("pf_payment_id", pfPaymentId),
+            new("payment_status", status),
+            new("item_name", "Order1"),
+            new("amount_gross", amountGross),
         };
 
-        var canonical = string.Join("&", fields
-            .OrderBy(p => p.Key, StringComparer.Ordinal)
-            .Select(p => $"{p.Key}={WebUtility.UrlEncode(p.Value)}")
-            .Append($"passphrase={WebUtility.UrlEncode(Passphrase)}"));
+        var canonical = string.Join("&", fields.Select(p => $"{p.Key}={WebUtility.UrlEncode(p.Value)}"))
+            + $"&passphrase={WebUtility.UrlEncode(Passphrase)}";
         var signature = Convert.ToHexString(MD5.HashData(Encoding.UTF8.GetBytes(canonical))).ToLowerInvariant();
 
-        return string.Join("&", fields.Select(p => $"{p.Key}={p.Value}").Append($"signature={signature}"));
+        return string.Join("&", fields.Select(p => $"{p.Key}={p.Value}")) + $"&signature={signature}";
     }
 
     private static PayFastPaymentProvider ProviderReturning(string validateReply, HttpStatusCode code = HttpStatusCode.OK)

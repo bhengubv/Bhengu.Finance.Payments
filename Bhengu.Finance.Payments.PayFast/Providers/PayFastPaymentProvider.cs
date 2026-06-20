@@ -111,6 +111,10 @@ public sealed class PayFastPaymentProvider : BhenguProviderBase, IPaymentGateway
                 formData["m_payment_id"] = paymentId;
             else if (request.Metadata.TryGetValue("transaction_id", out var transactionId))
                 formData["m_payment_id"] = transactionId;
+
+            // Optional CVV re-check for the ad-hoc (tokenised) charge — passed through when the caller supplies it.
+            if (request.Metadata.TryGetValue("cc_cvv", out var ccCvv) && !string.IsNullOrEmpty(ccCvv))
+                formData["cc_cvv"] = ccCvv;
         }
 
         var signature = PayFastSignatureHelper.ComputeApiSignature(
@@ -236,6 +240,48 @@ public sealed class PayFastPaymentProvider : BhenguProviderBase, IPaymentGateway
     }
 
     /// <summary>
+    /// Fetch a PayFast refund's current status by the original transaction's <c>pf_payment_id</c>. Returns
+    /// PayFast's raw JSON response (PayFast's refund schema is not part of this SDK's typed surface, so the
+    /// caller parses it). Like refund creation, this is NOT available in sandbox.
+    /// </summary>
+    public Task<string> FetchRefundAsync(string pfPaymentId, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(pfPaymentId);
+        return RunOperationAsync("fetch_refund", () => FetchRefundCoreAsync(pfPaymentId, ct), ct);
+    }
+
+    private async Task<string> FetchRefundCoreAsync(string pfPaymentId, CancellationToken ct)
+    {
+        if (_options.UseSandbox)
+            throw new BhenguPaymentException(ProviderName,
+                "PayFast refunds are not available in sandbox mode — PayFast only processes refunds in production.",
+                "refund_sandbox_unsupported");
+
+        var timestamp = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss");
+        var signature = PayFastSignatureHelper.ComputeApiSignature(
+            _options.MerchantId, _options.Passphrase ?? string.Empty, timestamp, new Dictionary<string, string>());
+
+        using var req = new HttpRequestMessage(HttpMethod.Get, $"refunds/{Uri.EscapeDataString(pfPaymentId)}");
+        req.Headers.Add("merchant-id", _options.MerchantId);
+        req.Headers.Add("version", "v1");
+        req.Headers.Add("timestamp", timestamp);
+        req.Headers.Add("signature", signature);
+
+        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            Logger.LogError("PayFast refund fetch failed for {GatewayReference}: {Status} {Body}", pfPaymentId, response.StatusCode, body);
+            if ((int)response.StatusCode is >= 400 and < 500)
+                throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(), body);
+            throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {body}");
+        }
+
+        return body;
+    }
+
+    /// <summary>
     /// Verifies a PayFast ITN webhook signature using MD5 of alphabetically-sorted parameters + passphrase.
     /// </summary>
     public bool VerifyWebhookSignature(string payload, string signature)
@@ -245,18 +291,25 @@ public sealed class PayFastPaymentProvider : BhenguProviderBase, IPaymentGateway
 
         return RunWebhookVerify(() =>
         {
-            var parameters = ParseFormUrlEncoded(payload);
-            parameters.Remove("signature");
+            // PayFast ITN signature: hash the posted fields IN THE ORDER PayFast POSTED THEM (NOT sorted),
+            // stopping at the 'signature' field, then append the passphrase. This is PayFast's official
+            // Notification::dataToString algorithm — and it differs from the REST API signer, which DOES
+            // sort alphabetically. (Sorting the ITN, as this code used to, can reject a genuine notification.)
+            var parts = new List<string>();
+            foreach (var pair in payload.Split('&'))
+            {
+                var kv = pair.Split('=', 2);
+                var key = WebUtility.UrlDecode(kv[0]);
+                if (key == "signature")
+                    break;
+                var value = kv.Length == 2 ? WebUtility.UrlDecode(kv[1]) : string.Empty;
+                parts.Add($"{key}={WebUtility.UrlEncode(value)}");
+            }
 
-            var sorted = parameters
-                .OrderBy(p => p.Key, StringComparer.Ordinal)
-                .Select(p => $"{p.Key}={WebUtility.UrlEncode(p.Value)}")
-                .ToList();
-
+            var canonical = string.Join("&", parts);
             if (!string.IsNullOrEmpty(_options.Passphrase))
-                sorted.Add($"passphrase={WebUtility.UrlEncode(_options.Passphrase)}");
+                canonical += $"&passphrase={WebUtility.UrlEncode(_options.Passphrase)}";
 
-            var canonical = string.Join("&", sorted);
             return SignatureHelpers.VerifyMd5(canonical, signature);
         });
     }

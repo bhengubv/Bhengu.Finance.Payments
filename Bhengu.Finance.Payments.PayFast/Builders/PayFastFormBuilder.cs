@@ -4,6 +4,8 @@ using System.Globalization;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
+using Bhengu.Finance.Payments.Core;
+using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.PayFast.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -105,9 +107,9 @@ public sealed class PayFastFormBuilder
         string? cancelUrl = null,
         string currency = "ZAR")
     {
-        if (frequency is < 3 or > 6)
+        if (frequency is < 1 or > 6)
         {
-            _logger.LogWarning("Invalid frequency {Frequency} — defaulting to 3 (monthly)", frequency);
+            _logger.LogWarning("Invalid PayFast frequency {Frequency} — defaulting to 3 (monthly). Valid: 1=Daily, 2=Weekly, 3=Monthly, 4=Quarterly, 5=Biannually, 6=Annual", frequency);
             frequency = 3;
         }
 
@@ -164,6 +166,61 @@ public sealed class PayFastFormBuilder
         formData["signature"] = GenerateSignature(formData);
 
         return $"{GetBaseUrl()}/eng/process?{BuildQueryString(formData)}";
+    }
+
+    /// <summary>
+    /// Build the link a buyer follows to update the card behind a tokenised agreement / subscription
+    /// (PayFast's <c>/eng/recurring/update/{token}</c>). Not available in sandbox.
+    /// </summary>
+    public string BuildCardUpdateUrl(string token, string? returnUrl = null)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(token);
+        if (_options.UseSandbox)
+            throw new BhenguPaymentException(ProviderNames.PayFast,
+                "PayFast card-update links are not available in sandbox mode.", "card_update_sandbox_unsupported");
+
+        var url = $"{GetBaseUrl()}/eng/recurring/update/{Uri.EscapeDataString(token)}";
+        if (!string.IsNullOrEmpty(returnUrl))
+            url += $"?return={Uri.EscapeDataString(returnUrl)}";
+        return url;
+    }
+
+    /// <summary>The PayFast Onsite (in-page popup) process endpoint for the current environment.</summary>
+    public string OnsiteProcessUrl => $"{GetBaseUrl()}/onsite/process";
+
+    /// <summary>
+    /// Build the signed, form-encoded request body for an Onsite (in-page popup) payment. POST this body
+    /// to <see cref="OnsiteProcessUrl"/> to obtain a payment UUID. Amount is in rands (major unit).
+    /// Used by <see cref="Providers.PayFastOnsiteProvider"/>.
+    /// </summary>
+    public string BuildOnsitePaymentBody(
+        string mPaymentId, decimal amount, string itemName, string? description = null,
+        string? emailAddress = null, string? returnUrl = null, string? cancelUrl = null,
+        string? nameFirst = null, string? nameLast = null, string? cellNumber = null,
+        string? customStr1 = null, string? customStr2 = null, string currency = "ZAR")
+    {
+        var formData = new Dictionary<string, string>
+        {
+            ["merchant_id"] = _options.MerchantId,
+            ["merchant_key"] = _options.MerchantKey,
+            ["return_url"] = returnUrl ?? _options.ReturnUrl ?? "",
+            ["cancel_url"] = cancelUrl ?? _options.CancelUrl ?? "",
+            ["notify_url"] = _options.NotifyUrl ?? "",
+            ["name_first"] = nameFirst ?? "",
+            ["name_last"] = nameLast ?? "",
+            ["email_address"] = emailAddress ?? "",
+            ["cell_number"] = cellNumber ?? "",
+            ["m_payment_id"] = mPaymentId,
+            ["amount"] = amount.ToString("F2", CultureInfo.InvariantCulture),
+            ["item_name"] = itemName,
+            ["item_description"] = description ?? "",
+            ["custom_str1"] = customStr1 ?? "",
+            ["custom_str2"] = customStr2 ?? "",
+            ["currency"] = currency
+        };
+
+        formData["signature"] = GenerateSignature(formData);
+        return BuildQueryString(formData);
     }
 
     private string GetBaseUrl() => _options.UseSandbox
