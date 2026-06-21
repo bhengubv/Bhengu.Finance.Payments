@@ -3,7 +3,6 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Bhengu.Finance.Payments.Core;
@@ -15,7 +14,7 @@ namespace Bhengu.Finance.Payments.Interswitch.Internals;
 
 /// <summary>
 /// Shared HTTP-call helper for Interswitch's auxiliary providers (tokenisation / settlement / etc.).
-/// Centralises OAuth2 token caching, Interswitch's HMAC-SHA512 signature scheme, JSON shaping,
+/// Centralises OAuth2 token caching, Interswitch's SHA-512/Base64 request-signature scheme, JSON shaping,
 /// error translation and logging. Internal — consumers depend on the typed provider classes,
 /// not this helper. The main <c>InterswitchPaymentProvider</c> keeps its own equivalent logic
 /// to avoid breaking external behaviour; this helper exists for the new contract classes.
@@ -23,10 +22,16 @@ namespace Bhengu.Finance.Payments.Interswitch.Internals;
 internal sealed class InterswitchHttpClient
 {
     /// <summary>Default production base URL when <see cref="InterswitchOptions.BaseUrl"/> is unset.</summary>
+    /// <remarks>Source: https://docs.interswitchgroup.com/docs/authentication (production OAuth host <c>passport.interswitchng.com</c>).</remarks>
     public const string DefaultProductionUrl = "https://passport.interswitchng.com";
 
     /// <summary>Default sandbox base URL when <see cref="InterswitchOptions.SandboxUrl"/> is unset.</summary>
-    public const string DefaultSandboxUrl = "https://qa.interswitchng.com";
+    /// <remarks>
+    /// Source: https://sandbox.interswitchng.com/docbase/docs/access-token-request/get-access-token/ and
+    /// https://docs.interswitchgroup.com/docs/authentication — the sandbox passport host is
+    /// <c>sandbox.interswitchng.com</c> (the legacy <c>qa.interswitchng.com</c> host was incorrect).
+    /// </remarks>
+    public const string DefaultSandboxUrl = "https://sandbox.interswitchng.com";
 
     /// <summary>JSON serializer options for Interswitch payloads.</summary>
     public static readonly JsonSerializerOptions Json = new()
@@ -80,15 +85,21 @@ internal sealed class InterswitchHttpClient
             req.Content = new StringContent(json, Encoding.UTF8, "application/json");
         }
 
-        var timestampMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture);
+        // Interswitch "InterswitchAuth" security headers. Verified scheme (see InterswitchSignature):
+        //   signature = Base64( SHA512( method & percent_encode(absoluteUrl) & timestampSeconds & nonce & clientId & clientSecret ) )
+        //   timestamp = Unix SECONDS (NOT milliseconds); SignatureMethod header = "SHA512".
+        // Sources: https://sandbox.interswitchng.com/docbase/docs/interswitch-sec-headers/sample-code/
+        //          https://interswitch-docs.readme.io/reference/header-computation
+        var timestampSeconds = InterswitchSignature.UnixTimestampSeconds();
         var nonce = Guid.NewGuid().ToString("N");
-        var resourceUrl = path.StartsWith('/') ? path : "/" + path;
-        var signature = ComputeRequestSignature(method.Method, resourceUrl, timestampMs, nonce);
+        var resourceUrl = BuildSignedResourceUrl(path);
+        var signature = InterswitchSignature.ComputeSignature(
+            method.Method, resourceUrl, timestampSeconds, nonce, _options.ClientId, _options.ClientSecret);
 
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         req.Headers.TryAddWithoutValidation("Signature", signature);
-        req.Headers.TryAddWithoutValidation("SignatureMethod", "SHA-512");
-        req.Headers.TryAddWithoutValidation("Timestamp", timestampMs);
+        req.Headers.TryAddWithoutValidation("SignatureMethod", InterswitchSignature.SignatureMethod);
+        req.Headers.TryAddWithoutValidation("Timestamp", timestampSeconds);
         req.Headers.TryAddWithoutValidation("Nonce", nonce);
 
         HttpResponseMessage response;
@@ -180,11 +191,18 @@ internal sealed class InterswitchHttpClient
         }
     }
 
-    private string ComputeRequestSignature(string method, string resource, string timestampMs, string nonce)
+    /// <summary>
+    /// Build the percent-encoded ABSOLUTE resource URL that Interswitch signs. The documented
+    /// signature cipher uses <c>percent_encode(url)</c> over the full URL (scheme + host + path),
+    /// not just the path. Source: https://interswitch-docs.readme.io/reference/header-computation
+    /// </summary>
+    private string BuildSignedResourceUrl(string path)
     {
-        // Interswitch documented format: SHA-512 hex of clientId+method+resource+timestamp+nonce+secretKey
-        var raw = _options.ClientId + method + resource + timestampMs + nonce + _options.ClientSecret;
-        return Convert.ToHexString(SHA512.HashData(Encoding.UTF8.GetBytes(raw))).ToLowerInvariant();
+        var relative = path.StartsWith('/') ? path[1..] : path;
+        var absolute = _httpClient.BaseAddress is { } baseAddress
+            ? new Uri(baseAddress, relative).AbsoluteUri
+            : (relative.StartsWith("http", StringComparison.OrdinalIgnoreCase) ? relative : "/" + relative);
+        return Uri.EscapeDataString(absolute);
     }
 
     private sealed class InterswitchTokenResponse

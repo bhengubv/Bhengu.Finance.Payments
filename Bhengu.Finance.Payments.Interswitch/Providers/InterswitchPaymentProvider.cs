@@ -3,7 +3,6 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -30,8 +29,12 @@ namespace Bhengu.Finance.Payments.Interswitch.Providers;
 [ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
 public sealed class InterswitchPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
+    // Verified hosts. Sources:
+    //   Production passport: https://docs.interswitchgroup.com/docs/authentication
+    //   Sandbox passport:    https://sandbox.interswitchng.com/docbase/docs/access-token-request/get-access-token/
+    // The legacy "qa.interswitchng.com" sandbox host was incorrect.
     private const string ProductionBaseUrl = "https://passport.interswitchng.com";
-    private const string SandboxBaseUrl = "https://qa.interswitchng.com";
+    private const string SandboxBaseUrl = "https://sandbox.interswitchng.com";
 
     private readonly HttpClient _httpClient;
     private readonly InterswitchOptions _options;
@@ -416,15 +419,21 @@ public sealed class InterswitchPaymentProvider : BhenguProviderBase, IPaymentGat
             Content = new StringContent(json, Encoding.UTF8, "application/json")
         };
 
-        var timestampMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture);
+        // Interswitch "InterswitchAuth" security headers. Verified scheme (see InterswitchSignature):
+        //   signature = Base64( SHA512( method & percent_encode(absoluteUrl) & timestampSeconds & nonce & clientId & clientSecret ) )
+        //   timestamp = Unix SECONDS (NOT milliseconds); SignatureMethod header = "SHA512".
+        // Sources: https://sandbox.interswitchng.com/docbase/docs/interswitch-sec-headers/sample-code/
+        //          https://interswitch-docs.readme.io/reference/header-computation
+        var timestampSeconds = InterswitchSignature.UnixTimestampSeconds();
         var nonce = Guid.NewGuid().ToString("N");
-        var resourceUrl = path.StartsWith('/') ? path : "/" + path;
-        var signature = ComputeRequestSignature(method.Method, resourceUrl, timestampMs, nonce);
+        var resourceUrl = BuildSignedResourceUrl(path);
+        var signature = InterswitchSignature.ComputeSignature(
+            method.Method, resourceUrl, timestampSeconds, nonce, _options.ClientId, _options.ClientSecret);
 
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
         req.Headers.TryAddWithoutValidation("Signature", signature);
-        req.Headers.TryAddWithoutValidation("SignatureMethod", "SHA-512");
-        req.Headers.TryAddWithoutValidation("Timestamp", timestampMs);
+        req.Headers.TryAddWithoutValidation("SignatureMethod", InterswitchSignature.SignatureMethod);
+        req.Headers.TryAddWithoutValidation("Timestamp", timestampSeconds);
         req.Headers.TryAddWithoutValidation("Nonce", nonce);
 
         var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
@@ -480,11 +489,17 @@ public sealed class InterswitchPaymentProvider : BhenguProviderBase, IPaymentGat
         return _cachedAccessToken;
     }
 
-    private string ComputeRequestSignature(string method, string resource, string timestampMs, string nonce)
+    /// <summary>
+    /// Build the percent-encoded ABSOLUTE resource URL Interswitch signs (scheme + host + path, not
+    /// just the path). Source: https://interswitch-docs.readme.io/reference/header-computation
+    /// </summary>
+    private string BuildSignedResourceUrl(string path)
     {
-        // Interswitch documented format: SHA-512 hex of clientId+method+resource+timestamp+nonce+secretKey
-        var raw = _options.ClientId + method + resource + timestampMs + nonce + _options.ClientSecret;
-        return Convert.ToHexString(SHA512.HashData(Encoding.UTF8.GetBytes(raw))).ToLowerInvariant();
+        var relative = path.StartsWith('/') ? path[1..] : path;
+        var absolute = _httpClient.BaseAddress is { } baseAddress
+            ? new Uri(baseAddress, relative).AbsoluteUri
+            : (relative.StartsWith("http", StringComparison.OrdinalIgnoreCase) ? relative : "/" + relative);
+        return Uri.EscapeDataString(absolute);
     }
 
     private static PaymentStatus MapResponseCode(string? code) => code switch
