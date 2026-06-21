@@ -83,8 +83,6 @@ using Bhengu.Finance.Payments.Slydepay.Providers;
 using Bhengu.Finance.Payments.Stitch.Configuration;
 using Bhengu.Finance.Payments.Stitch.Providers;
 using Bhengu.Finance.Payments.Tests.TestHelpers;
-using Bhengu.Finance.Payments.TymeBank.Configuration;
-using Bhengu.Finance.Payments.TymeBank.Providers;
 using Bhengu.Finance.Payments.UnionPay.Configuration;
 using Bhengu.Finance.Payments.UnionPay.Providers;
 using Bhengu.Finance.Payments.Wave.Configuration;
@@ -356,21 +354,6 @@ public sealed class WebhookTimingAttackTests
             }),
             NullLogger<MukuruPaymentProvider>.Instance,
             new MukuruIdempotencyCache(new InMemoryBhenguDistributedCache()));
-        var sig = TimingAttackHelpers.HmacSha256Hex(Payload, Secret);
-        TimingAttackHelpers.AssertConstantTimeVerification(provider.VerifyWebhookSignature, Payload, sig);
-    }
-
-    // --- TymeBank: HMAC SHA256 hex ---
-    [Fact]
-    public void TymeBank_VerifyWebhookSignature_IsConstantTime()
-    {
-        var provider = new TymeBankPaymentProvider(StubHttp(),
-            Options.Create(new TymeBankOptions
-            {
-                ClientId = "c", ClientSecret = "s", MerchantId = "M",
-                WebhookSecret = Secret, Currency = "ZAR", CallbackUrl = "https://example.com/cb"
-            }),
-            NullLogger<TymeBankPaymentProvider>.Instance);
         var sig = TimingAttackHelpers.HmacSha256Hex(Payload, Secret);
         TimingAttackHelpers.AssertConstantTimeVerification(provider.VerifyWebhookSignature, Payload, sig);
     }

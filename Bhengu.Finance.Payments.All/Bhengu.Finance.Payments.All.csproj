@@ -7,7 +7,7 @@
     <Authors>T.M. Bengu</Authors>
     <Company>Bhengu B.V.</Company>
     <Description>All Bhengu payment providers bundled together — install one package to get every provider in the Bhengu.Finance.Payments family.</Description>
-    <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;PayFast;GooglePay;ApplePay;BricsPay;PayShap;Stripe;Yoco;Paystack;PayJustNow;Ozow;MPesa;MTN;MoMo;AirtelMoney;OrangeMoney;Interswitch;OPay;Moniepoint;ChipperCash;Wave;EcoCash;Flutterwave;Cellulant;DPO;Onafriq;Fawry;Paymob;Kashier;CMI;Remita;Mukuru;TymeBank;Stitch;Pesapal;IPay;JamboPay;Hubtel;ExpressPay;Slydepay;MercadoPago;PagSeguro;PagBank;Brazil;LatinAmerica;PIX;Boleto;Alipay;WeChatPay;UnionPay;China;Razorpay;PayUIndia;Paytm;UPI;India;BRICS;CrossBorder;MobileMoney;Africa;NorthAfrica;Egypt;Morocco;Nigeria;SouthAfrica;Kenya;Ghana;Uganda;Tanzania;Remittance;OpenBanking;Neobank</PackageTags>
+    <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;PayFast;GooglePay;ApplePay;BricsPay;PayShap;Stripe;Yoco;Paystack;PayJustNow;Ozow;MPesa;MTN;MoMo;AirtelMoney;OrangeMoney;Interswitch;OPay;Moniepoint;ChipperCash;Wave;EcoCash;Flutterwave;Cellulant;DPO;Onafriq;Fawry;Paymob;Kashier;CMI;Remita;Mukuru;Stitch;Pesapal;IPay;JamboPay;Hubtel;ExpressPay;Slydepay;MercadoPago;PagSeguro;PagBank;Brazil;LatinAmerica;PIX;Boleto;Alipay;WeChatPay;UnionPay;China;Razorpay;PayUIndia;Paytm;UPI;India;BRICS;CrossBorder;MobileMoney;Africa;NorthAfrica;Egypt;Morocco;Nigeria;SouthAfrica;Kenya;Ghana;Uganda;Tanzania;Remittance;OpenBanking;Neobank</PackageTags>
     <RepositoryUrl>https://github.com/bhengubv/Bhengu.Finance.Payments</RepositoryUrl>
   </PropertyGroup>
   <ItemGroup>
@@ -44,7 +44,6 @@
     <PackageReference Include="Bhengu.Finance.Payments.CMI" Version="$(BhenguPaymentsVersion)" />
     <PackageReference Include="Bhengu.Finance.Payments.Remita" Version="$(BhenguPaymentsVersion)" />
     <PackageReference Include="Bhengu.Finance.Payments.Mukuru" Version="$(BhenguPaymentsVersion)" />
-    <PackageReference Include="Bhengu.Finance.Payments.TymeBank" Version="$(BhenguPaymentsVersion)" />
     <PackageReference Include="Bhengu.Finance.Payments.Stitch" Version="$(BhenguPaymentsVersion)" />
     <PackageReference Include="Bhengu.Finance.Payments.Pesapal" Version="$(BhenguPaymentsVersion)" />
     <PackageReference Include="Bhengu.Finance.Payments.IPay" Version="$(BhenguPaymentsVersion)" />

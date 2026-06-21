@@ -18,8 +18,6 @@ using Bhengu.Finance.Payments.Pesapal.Providers;
 using Bhengu.Finance.Payments.Stitch.Configuration;
 using Bhengu.Finance.Payments.Stitch.Providers;
 using Bhengu.Finance.Payments.Tests.TestHelpers;
-using Bhengu.Finance.Payments.TymeBank.Configuration;
-using Bhengu.Finance.Payments.TymeBank.Providers;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Xunit;
@@ -41,35 +39,6 @@ public sealed class Stitch_MalformedJsonTests
                 BeneficiaryName = "n", Currency = "ZAR"
             }),
             NullLogger<StitchPaymentProvider>.Instance);
-
-    [Theory]
-    [MemberData(nameof(MalformedJsonWaveA.NonEmptyMalformed), MemberType = typeof(MalformedJsonWaveA))]
-    public async Task ParseWebhookAsync_DoesNotThrow_OnMalformedInput(string payload)
-    {
-        var provider = Create();
-        _ = await provider.ParseWebhookAsync(payload);
-    }
-
-    [Fact]
-    public async Task ParseWebhookAsync_HandlesHugeNestedJson_Within5Seconds()
-    {
-        var provider = Create();
-        await MalformedJsonWaveA.AssertParsesWithinBudget(
-            async () => _ = await provider.ParseWebhookAsync(MalformedJsonWaveA.BuildHugeNestedJson()),
-            TimeSpan.FromSeconds(5));
-    }
-}
-
-public sealed class TymeBank_MalformedJsonTests
-{
-    private static TymeBankPaymentProvider Create() =>
-        new(new HttpClient(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK))),
-            Options.Create(new TymeBankOptions
-            {
-                ClientId = "c", ClientSecret = "s", MerchantId = "M",
-                WebhookSecret = "wh", Currency = "ZAR", CallbackUrl = "https://example.com/cb"
-            }),
-            NullLogger<TymeBankPaymentProvider>.Instance);
 
     [Theory]
     [MemberData(nameof(MalformedJsonWaveA.NonEmptyMalformed), MemberType = typeof(MalformedJsonWaveA))]

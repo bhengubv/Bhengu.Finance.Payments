@@ -17,7 +17,6 @@ public static class ProviderNames
     public const string PayJustNow = "payjustnow";
     public const string PayShap = "payshap";
     public const string Mukuru = "mukuru";
-    public const string TymeBank = "tymebank";
     public const string Stitch = "stitch";
 
     // Mobile money

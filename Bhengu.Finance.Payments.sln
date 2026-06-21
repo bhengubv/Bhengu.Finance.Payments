@@ -75,8 +75,6 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Bhengu.Finance.Payments.Rem
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Bhengu.Finance.Payments.Mukuru", "Bhengu.Finance.Payments.Mukuru\Bhengu.Finance.Payments.Mukuru.csproj", "{E05EE61B-9E4F-4735-917D-AC342240B02F}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Bhengu.Finance.Payments.TymeBank", "Bhengu.Finance.Payments.TymeBank\Bhengu.Finance.Payments.TymeBank.csproj", "{96F2ADA3-BC34-4173-AF7C-77F6FFE2EEFA}"
-EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Bhengu.Finance.Payments.Stitch", "Bhengu.Finance.Payments.Stitch\Bhengu.Finance.Payments.Stitch.csproj", "{CAA5F102-4CD5-4123-BA45-5AFE829476B8}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Bhengu.Finance.Payments.Pesapal", "Bhengu.Finance.Payments.Pesapal\Bhengu.Finance.Payments.Pesapal.csproj", "{029B57FA-EA6A-4A9A-B092-B509F6939118}"
@@ -549,18 +547,6 @@ Global
 		{E05EE61B-9E4F-4735-917D-AC342240B02F}.Release|x64.Build.0 = Release|Any CPU
 		{E05EE61B-9E4F-4735-917D-AC342240B02F}.Release|x86.ActiveCfg = Release|Any CPU
 		{E05EE61B-9E4F-4735-917D-AC342240B02F}.Release|x86.Build.0 = Release|Any CPU
-		{96F2ADA3-BC34-4173-AF7C-77F6FFE2EEFA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{96F2ADA3-BC34-4173-AF7C-77F6FFE2EEFA}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{96F2ADA3-BC34-4173-AF7C-77F6FFE2EEFA}.Debug|x64.ActiveCfg = Debug|Any CPU
-		{96F2ADA3-BC34-4173-AF7C-77F6FFE2EEFA}.Debug|x64.Build.0 = Debug|Any CPU
-		{96F2ADA3-BC34-4173-AF7C-77F6FFE2EEFA}.Debug|x86.ActiveCfg = Debug|Any CPU
-		{96F2ADA3-BC34-4173-AF7C-77F6FFE2EEFA}.Debug|x86.Build.0 = Debug|Any CPU
-		{96F2ADA3-BC34-4173-AF7C-77F6FFE2EEFA}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{96F2ADA3-BC34-4173-AF7C-77F6FFE2EEFA}.Release|Any CPU.Build.0 = Release|Any CPU
-		{96F2ADA3-BC34-4173-AF7C-77F6FFE2EEFA}.Release|x64.ActiveCfg = Release|Any CPU
-		{96F2ADA3-BC34-4173-AF7C-77F6FFE2EEFA}.Release|x64.Build.0 = Release|Any CPU
-		{96F2ADA3-BC34-4173-AF7C-77F6FFE2EEFA}.Release|x86.ActiveCfg = Release|Any CPU
-		{96F2ADA3-BC34-4173-AF7C-77F6FFE2EEFA}.Release|x86.Build.0 = Release|Any CPU
 		{CAA5F102-4CD5-4123-BA45-5AFE829476B8}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{CAA5F102-4CD5-4123-BA45-5AFE829476B8}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{CAA5F102-4CD5-4123-BA45-5AFE829476B8}.Debug|x64.ActiveCfg = Debug|Any CPU

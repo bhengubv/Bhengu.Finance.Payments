@@ -52,7 +52,6 @@
     <ProjectReference Include="..\Bhengu.Finance.Payments.CMI\Bhengu.Finance.Payments.CMI.csproj" />
     <ProjectReference Include="..\Bhengu.Finance.Payments.Remita\Bhengu.Finance.Payments.Remita.csproj" />
     <ProjectReference Include="..\Bhengu.Finance.Payments.Mukuru\Bhengu.Finance.Payments.Mukuru.csproj" />
-    <ProjectReference Include="..\Bhengu.Finance.Payments.TymeBank\Bhengu.Finance.Payments.TymeBank.csproj" />
     <ProjectReference Include="..\Bhengu.Finance.Payments.Stitch\Bhengu.Finance.Payments.Stitch.csproj" />
     <ProjectReference Include="..\Bhengu.Finance.Payments.Pesapal\Bhengu.Finance.Payments.Pesapal.csproj" />
     <ProjectReference Include="..\Bhengu.Finance.Payments.IPay\Bhengu.Finance.Payments.IPay.csproj" />

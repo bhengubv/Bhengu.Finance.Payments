@@ -27,8 +27,6 @@ using Bhengu.Finance.Payments.Stripe.Configuration;
 using Bhengu.Finance.Payments.Stripe.Providers;
 using Bhengu.Finance.Payments.Tests.Stripe;
 using Bhengu.Finance.Payments.Tests.TestHelpers;
-using Bhengu.Finance.Payments.TymeBank.Configuration;
-using Bhengu.Finance.Payments.TymeBank.Providers;
 using Bhengu.Finance.Payments.Wave.Configuration;
 using Bhengu.Finance.Payments.Wave.Providers;
 using Bhengu.Finance.Payments.Yoco.Configuration;
@@ -426,72 +424,6 @@ public sealed class CancellationTests
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             provider.ProcessPaymentAsync(SimplePayment("stitch-mid", "ZAR"), cts.Token));
-    }
-
-    // -------------------------------------------------------------------
-    //  TymeBank — OAuth provider with documented oauth2/token endpoint
-    // -------------------------------------------------------------------
-    private static TymeBankPaymentProvider TymeBankProvider(HttpMessageHandler handler) =>
-        new(new HttpClient(handler),
-            Options.Create(new TymeBankOptions
-            {
-                ClientId = "c", ClientSecret = "s", MerchantId = "M",
-                WebhookSecret = "wh", Currency = "ZAR", CallbackUrl = "https://example.com/cb"
-            }),
-            NullLogger<TymeBankPaymentProvider>.Instance);
-
-    [Fact]
-    public async Task TymeBank_ProcessPaymentAsync_PreCancelled_DoesNotCallHandler()
-    {
-        var handler = new ThrowingHandler();
-        var provider = TymeBankProvider(handler);
-        var cts = new CancellationTokenSource();
-        cts.Cancel();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
-            provider.ProcessPaymentAsync(new PaymentRequest
-            {
-                PaymentMethodToken = "pay-ref-1",
-                Amount = 100m,
-                Currency = "ZAR",
-                Description = "tyme-cancel",
-                Metadata = new Dictionary<string, string>
-                {
-                    ["debtor_account"] = "1234567890",
-                    ["debtor_branch_code"] = "678910",
-                    ["creditor_account"] = "0987654321",
-                    ["creditor_branch_code"] = "123456",
-                    ["creditor_name"] = "M"
-                }
-            }, cts.Token));
-        Assert.Equal(0, handler.CallCount);
-    }
-
-    [Fact]
-    public async Task TymeBank_CancelAfterOAuthFetch_PropagatesOperationCanceled()
-    {
-        var handler = new OAuthThenBlockHandler(
-            u => u.PathAndQuery.Contains("oauth2/token", StringComparison.OrdinalIgnoreCase),
-            "{\"access_token\":\"tyme-tok-123\",\"token_type\":\"Bearer\",\"expires_in\":3600}");
-        var provider = TymeBankProvider(handler);
-
-        using var cts = new CancellationTokenSource();
-        var payTask = Task.Run(() => provider.ProcessPaymentAsync(new PaymentRequest
-        {
-            PaymentMethodToken = "pay-ref-oauth",
-            Amount = 100m, Currency = "ZAR", Description = "tyme-cancel-oauth",
-            Metadata = new Dictionary<string, string>
-            {
-                ["debtor_account"] = "1234567890",
-                ["debtor_branch_code"] = "678910",
-                ["creditor_account"] = "0987654321",
-                ["creditor_branch_code"] = "123456",
-                ["creditor_name"] = "M"
-            }
-        }, cts.Token));
-        Assert.True(handler.AuthCalled.Wait(TimeSpan.FromSeconds(5)), "OAuth did not complete in time");
-        cts.Cancel();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => payTask);
-        Assert.Equal(1, handler.AuthCount);
     }
 
     // -------------------------------------------------------------------
