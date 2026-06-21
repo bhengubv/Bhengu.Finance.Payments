@@ -3,7 +3,6 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -23,15 +22,37 @@ using Microsoft.Extensions.Options;
 namespace Bhengu.Finance.Payments.OPay.Providers;
 
 /// <summary>
-/// OPay (Nigeria/Egypt/Pakistan) payment gateway provider. Wraps the OPay International
-/// cashier, refund and payout REST APIs. Requests are HMAC-SHA512 signed with the merchant
-/// SecretKey and the signature is carried in the <c>Authorization</c> header.
+/// OPay (Nigeria/Egypt/Pakistan) payment gateway provider. Wraps the OPay International Cashier
+/// (Checkout) REST API: create a hosted-checkout order, query its status, and refund it.
+///
+/// <para><b>Auth has two modes</b> (see <see cref="Internals.OPaySignature"/>):
+/// the hosted Cashier <c>cashier/create</c> call authenticates with
+/// <c>Authorization: Bearer {PublicKey}</c> + a <c>MerchantId</c> header
+/// (https://documentation.opaycheckout.com/cashier-create); the signed server-to-server APIs
+/// (refund, status) authenticate with an HMAC-SHA512 (hex) signature of the alphabetically
+/// key-sorted JSON body, carried as <c>Authorization: Bearer {signature}</c> + <c>MerchantId</c>
+/// (https://documentation.opaycheckout.com/api-signature).</para>
+///
+/// <para>Inbound callbacks carry an HMAC-SHA3-512 <c>sha512</c> field over a fixed format string —
+/// see <see cref="VerifyWebhookSignature"/> (https://documentation.opaycheckout.com/callback-signature).</para>
 /// </summary>
 [ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
 public sealed class OPayPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
+    // Hosts verified verbatim from the OPay docs' "Request URL" lines:
+    //   production: https://liveapi.opaycheckout.com/...  (cashier-create, payment-refund, query-payment-status)
+    //   sandbox:    https://testapi.opaycheckout.com/...   (NOT sandboxapi.*)
     private const string ProductionBaseUrl = "https://liveapi.opaycheckout.com";
-    private const string SandboxBaseUrl = "https://sandboxapi.opaycheckout.com";
+    private const string SandboxBaseUrl = "https://testapi.opaycheckout.com";
+
+    /// <summary>How the <c>Authorization</c> header is populated for a given OPay endpoint.</summary>
+    private enum AuthMode
+    {
+        /// <summary>cashier/create: <c>Authorization: Bearer {PublicKey}</c>, no body signature.</summary>
+        PublicKeyBearer,
+        /// <summary>refund/status/etc.: <c>Authorization: Bearer {HMAC-SHA512(sorted body, SecretKey)}</c>.</summary>
+        SignedBody
+    }
 
     private readonly HttpClient _httpClient;
     private readonly OPayOptions _options;
@@ -104,33 +125,26 @@ public sealed class OPayPaymentProvider : BhenguProviderBase, IPaymentGatewayPro
         var userName = request.Metadata?.GetValueOrDefault("userName") ?? "Bhengu Customer";
 
         var amountTotal = (long)(request.Amount * 100);
+        // Cashier create body per https://documentation.opaycheckout.com/cashier-create —
+        // amount.total is in the minor unit (kobo/cent); userInfo and product are the documented
+        // shapes (a single "product" object, not a "productList"). PublicKey + MerchantId travel in
+        // the headers (AuthMode.PublicKeyBearer), so they are NOT repeated in the body.
         var requestBody = new
         {
-            publicKey = _options.PublicKey,
             country = _options.Country,
             reference,
             amount = new { total = amountTotal, currency = request.Currency.ToUpperInvariant() },
             returnUrl = _options.ReturnUrl,
             callbackUrl = _options.CallbackUrl,
+            cancelUrl = _options.ReturnUrl,
             expireAt = 30,
-            sn = _options.MerchantId,
-            productList = new[]
-            {
-                new
-                {
-                    name = request.Description,
-                    description = request.Description,
-                    quantity = 1,
-                    price = amountTotal,
-                    currency = request.Currency.ToUpperInvariant()
-                }
-            },
+            payMethod = request.PaymentMethodToken,
             userInfo = new { userId, userEmail, userMobile, userName },
-            payMethod = request.PaymentMethodToken
+            product = new { name = request.Description, description = request.Description }
         };
 
         var body = await SendAsync(HttpMethod.Post, "api/v1/international/cashier/create",
-            requestBody, ct, "ProcessPayment").ConfigureAwait(false);
+            requestBody, AuthMode.PublicKeyBearer, ct, "ProcessPayment").ConfigureAwait(false);
         var resp = JsonSerializer.Deserialize<OPayResponse<OPayCashierData>>(body);
 
         Logger.LogInformation("OPay cashier created: {OrderNo} code={Code}",
@@ -162,28 +176,40 @@ public sealed class OPayPaymentProvider : BhenguProviderBase, IPaymentGatewayPro
     private async Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
     {
         var amount = (long)(request.Amount * 100);
+        // Refund body + path per https://documentation.opaycheckout.com/payment-refund — a SIGNED
+        // server API (AuthMode.SignedBody). OPay keys the refund off the merchant's ORIGINAL order
+        // reference (originalReference) and uses its own fresh "reference" for the refund itself.
+        // refundWay="Original" returns funds to the original instrument where supported (BankAccount /
+        // OpayWallet); BankCard/BankTransfer/BankUssd require a "RefundToBankAccount" with receiver
+        // bank details — not modelled here, so we request "Original".
+        // UNVERIFIED: the SDK stores the OPay orderNo in RefundRequest.GatewayReference, but OPay's
+        // refund request matches on the merchant's original reference. Callers must pass the original
+        // merchant reference as GatewayReference for the refund to resolve. Left as-is pending a
+        // sandbox round-trip.
         var requestBody = new
         {
-            publicKey = _options.PublicKey,
             country = _options.Country,
             reference = request.IdempotencyKey ?? $"refund-{Guid.NewGuid():N}",
-            orderNo = request.GatewayReference,
-            refundAmount = new { total = amount, currency = "NGN" },
-            reason = request.Reason,
+            originalReference = request.GatewayReference,
+            amount = new { total = amount, currency = CurrencyForCountry(_options.Country) },
+            refundWay = "Original",
+            refundReason = request.Reason,
             callbackUrl = _options.CallbackUrl
         };
 
-        var body = await SendAsync(HttpMethod.Post, "api/v1/international/refund/create",
-            requestBody, ct, "ProcessRefund").ConfigureAwait(false);
+        var body = await SendAsync(HttpMethod.Post, "api/v1/international/payment/refund/create",
+            requestBody, AuthMode.SignedBody, ct, "ProcessRefund").ConfigureAwait(false);
         var resp = JsonSerializer.Deserialize<OPayResponse<OPayRefundData>>(body);
 
-        Logger.LogInformation("OPay refund created: {RefundId} for order {OrderNo}",
-            resp?.Data?.RefundId, request.GatewayReference);
+        Logger.LogInformation("OPay refund created: order={OrderNo} status={Status}",
+            resp?.Data?.OrderNo, resp?.Data?.OrderStatus);
 
-        var status = MapResponseCode(resp?.Code, resp?.Data?.Status);
+        var status = MapResponseCode(resp?.Code, resp?.Data?.OrderStatus);
         return new RefundResponse
         {
-            GatewayReference = resp?.Data?.RefundId ?? string.Empty,
+            // OPay's refund response echoes the refund's own reference/orderNo rather than a discrete
+            // refundId; surface the orderNo (falling back to the refund reference) as the handle.
+            GatewayReference = resp?.Data?.OrderNo ?? resp?.Data?.Reference ?? string.Empty,
             Amount = request.Amount,
             Status = status,
             ProcessedAt = DateTime.UtcNow,
@@ -204,9 +230,16 @@ public sealed class OPayPaymentProvider : BhenguProviderBase, IPaymentGatewayPro
     private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
     {
         var amountTotal = (long)(request.Amount * 100);
+        // UNVERIFIED: OPay's PUBLIC Cashier/Checkout documentation
+        // (https://documentation.opaycheckout.com/) covers collection (create / status / refund /
+        // close) and callbacks only — it does NOT document a generic merchant payout/disbursement
+        // endpoint. The path "api/v1/international/payout/create" and this body shape are unverified
+        // and likely belong to a separate (gated) OPay disbursement product. Left as-is rather than
+        // invented to a different-but-wrong shape; the request is still HMAC-SHA512 signed per the
+        // documented scheme. Treat ProcessPayoutAsync as unsupported until verified against the
+        // real disbursement docs / a sandbox key.
         var requestBody = new
         {
-            publicKey = _options.PublicKey,
             country = _options.Country,
             reference = request.IdempotencyKey ?? $"payout-{Guid.NewGuid():N}",
             amount = new { total = amountTotal, currency = request.Currency.ToUpperInvariant() },
@@ -216,7 +249,7 @@ public sealed class OPayPaymentProvider : BhenguProviderBase, IPaymentGatewayPro
         };
 
         var body = await SendAsync(HttpMethod.Post, "api/v1/international/payout/create",
-            requestBody, ct, "ProcessPayout").ConfigureAwait(false);
+            requestBody, AuthMode.SignedBody, ct, "ProcessPayout").ConfigureAwait(false);
         var resp = JsonSerializer.Deserialize<OPayResponse<OPayPayoutData>>(body);
 
         Logger.LogInformation("OPay payout created: {OrderNo} code={Code}",
@@ -233,26 +266,75 @@ public sealed class OPayPaymentProvider : BhenguProviderBase, IPaymentGatewayPro
         };
     }
 
-    /// <inheritdoc />
+    /// <summary>
+    /// Verify an OPay payment-notification callback.
+    ///
+    /// <para>OPay does NOT sign the raw body, and the signature is NOT an HTTP header — instead the
+    /// callback JSON carries a <c>sha512</c> field that is an <b>HMAC-SHA3-512</b> (hex) of a fixed
+    /// "sign content" string built from eight fields of the <c>payload</c> object, keyed on the
+    /// merchant Private Key (SecretKey). Source (verbatim):
+    /// https://documentation.opaycheckout.com/callback-signature.</para>
+    ///
+    /// <para>Call this with <paramref name="payload"/> = the raw callback JSON body, and
+    /// <paramref name="signature"/> = the callback's <c>sha512</c> value. As a convenience, if
+    /// <paramref name="signature"/> is empty/whitespace the <c>sha512</c> field is read from the body.</para>
+    ///
+    /// <para><b>Runtime note:</b> HMAC-SHA3-512 requires a host with SHA-3 support (modern OpenSSL /
+    /// Windows CNG). On a runtime without it (<see cref="Internals.OPaySignature.IsSha3Available"/>
+    /// is false) verification cannot be performed and returns <c>false</c> after a warning — it never
+    /// throws and never silently passes.</para>
+    /// </summary>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        ArgumentException.ThrowIfNullOrEmpty(signature);
 
         return RunWebhookVerify(() =>
         {
             if (string.IsNullOrWhiteSpace(_options.SecretKey))
             {
-                Logger.LogWarning("OPay SecretKey not configured — signature verification cannot succeed.");
+                Logger.LogWarning("OPay SecretKey not configured — callback signature verification cannot succeed.");
                 return false;
             }
 
-            // OPay typically prefixes "Bearer " on the Authorization webhook header — strip if present.
-            var normalised = signature.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
-                ? signature["Bearer ".Length..]
-                : signature;
+            if (!OPaySignature.IsSha3Available)
+            {
+                Logger.LogWarning(
+                    "OPay callbacks are signed with HMAC-SHA3-512 but this runtime has no SHA-3 support; " +
+                    "callback signature cannot be verified here.");
+                return false;
+            }
 
-            return SignatureHelpers.VerifyHmacSha512(payload, normalised, _options.SecretKey);
+            OPayWebhookEvent? evt;
+            try
+            {
+                evt = JsonSerializer.Deserialize<OPayWebhookEvent>(payload);
+            }
+            catch (JsonException)
+            {
+                return false;
+            }
+
+            var data = evt?.Payload;
+            if (data is null) return false;
+
+            // The supplied signature wins; otherwise fall back to the sha512 carried in the body.
+            var provided = string.IsNullOrWhiteSpace(signature) ? evt?.Sha512 : signature;
+            if (string.IsNullOrWhiteSpace(provided)) return false;
+
+            var signContent = OPaySignature.BuildCallbackSignContent(
+                amount: data.Amount?.Total.ToString(CultureInfo.InvariantCulture) ?? "0",
+                currency: data.Amount?.Currency ?? string.Empty,
+                reference: data.Reference ?? string.Empty,
+                refunded: data.Refunded,
+                status: data.Status ?? string.Empty,
+                timestamp: data.Timestamp ?? string.Empty,
+                token: data.Token ?? string.Empty,
+                transactionId: data.TransactionId ?? string.Empty);
+
+            var expected = OPaySignature.HmacSha3_512Hex(signContent, _options.SecretKey);
+
+            // Constant-time, case-insensitive hex comparison (normalise both sides to lowercase).
+            return SignatureHelpers.ConstantTimeEquals(expected, provided.ToLowerInvariant());
         });
     }
 
@@ -282,73 +364,26 @@ public sealed class OPayPaymentProvider : BhenguProviderBase, IPaymentGatewayPro
 
     private static WebhookEvent? MapWebhookEvent(OPayWebhookEvent webhookEvent)
     {
-        var eventType = webhookEvent.Type?.ToLowerInvariant() ?? string.Empty;
+        // OPay's real payment-notification callback has a single envelope type, "transaction-status"
+        // (https://documentation.opaycheckout.com/payment-notifications-callbacks). The lifecycle
+        // lives in payload.status ∈ {INITIAL, PENDING, SUCCESS, FAIL, CLOSE}
+        // (https://documentation.opaycheckout.com/query-payment-status), and payload.refunded marks
+        // a refund notification. We classify off (refunded, status) rather than off the envelope type.
         var data = webhookEvent.Payload;
         var rawReference = data?.Reference ?? data?.OrderNo;
-        if (string.IsNullOrEmpty(rawReference)) return null;
+        if (data is null || string.IsNullOrEmpty(rawReference)) return null;
 
-        var amount = (data?.Amount?.Total ?? 0L) / 100m;
-        var currency = data?.Amount?.Currency ?? "NGN";
+        var amount = (data.Amount?.Total ?? 0L) / 100m;
+        var currency = data.Amount?.Currency ?? "NGN";
+        var statusRaw = data.Status?.ToUpperInvariant() ?? string.Empty;
+        var isSuccess = statusRaw is "SUCCESS" or "SUCCESSFUL";
+        var isFailure = statusRaw is "FAIL" or "FAILED" or "CLOSE" or "CLOSED";
 
-        switch (eventType)
+        // Refund notification: payload.refunded == true.
+        if (data.Refunded)
         {
-            case "transaction.success":
-            case "payment.success":
-            case "transaction.completed":
-                return new ChargeSucceededEvent
-                {
-                    GatewayReference = rawReference,
-                    Status = PaymentStatus.Completed,
-                    EventType = webhookEvent.Type,
-                    Category = WebhookEventCategory.ChargeSucceeded,
-                    Amount = amount,
-                    Currency = currency,
-                    CustomerId = data?.UserId,
-                    PaymentMethodToken = data?.PayMethod
-                };
-
-            case "transaction.failed":
-            case "payment.failed":
-                return new ChargeFailedEvent
-                {
-                    GatewayReference = rawReference,
-                    Status = PaymentStatus.Failed,
-                    EventType = webhookEvent.Type,
-                    Category = WebhookEventCategory.ChargeFailed,
-                    Amount = amount,
-                    Currency = currency,
-                    FailureCode = data?.Status,
-                    FailureMessage = data?.FailureReason
-                };
-
-            case "transaction.pending":
-            case "payment.pending":
-                return new ChargePendingEvent
-                {
-                    GatewayReference = rawReference,
-                    Status = PaymentStatus.Pending,
-                    EventType = webhookEvent.Type,
-                    Category = WebhookEventCategory.ChargePending,
-                    Amount = amount,
-                    Currency = currency
-                };
-
-            case "refund.success":
-            case "refund.completed":
-                return new RefundSucceededEvent
-                {
-                    GatewayReference = rawReference,
-                    Status = PaymentStatus.Refunded,
-                    EventType = webhookEvent.Type,
-                    Category = WebhookEventCategory.RefundSucceeded,
-                    RefundReference = data?.RefundId ?? rawReference,
-                    Amount = amount,
-                    Currency = currency,
-                    IsPartial = false
-                };
-
-            case "refund.failed":
-                return new RefundFailedEvent
+            return isFailure
+                ? new RefundFailedEvent
                 {
                     GatewayReference = rawReference,
                     Status = PaymentStatus.Failed,
@@ -356,66 +391,62 @@ public sealed class OPayPaymentProvider : BhenguProviderBase, IPaymentGatewayPro
                     Category = WebhookEventCategory.RefundFailed,
                     Amount = amount,
                     Currency = currency,
-                    FailureCode = data?.Status,
-                    FailureMessage = data?.FailureReason
-                };
-
-            case "payout.success":
-            case "transfer.success":
-                return new PayoutCompletedEvent
+                    FailureCode = data.FailureCode ?? data.Status,
+                    FailureMessage = data.FailureReason ?? data.DisplayedFailure
+                }
+                : new RefundSucceededEvent
                 {
                     GatewayReference = rawReference,
-                    Status = PaymentStatus.Completed,
+                    Status = PaymentStatus.Refunded,
                     EventType = webhookEvent.Type,
-                    Category = WebhookEventCategory.PayoutCompleted,
-                    PayoutReference = rawReference,
+                    Category = WebhookEventCategory.RefundSucceeded,
+                    RefundReference = data.TransactionId ?? rawReference,
                     Amount = amount,
                     Currency = currency,
-                    DestinationToken = data?.ReceiverId
-                };
-
-            case "payout.failed":
-            case "transfer.failed":
-                return new PayoutFailedEvent
-                {
-                    GatewayReference = rawReference,
-                    Status = PaymentStatus.Failed,
-                    EventType = webhookEvent.Type,
-                    Category = WebhookEventCategory.PayoutFailed,
-                    PayoutReference = rawReference,
-                    Amount = amount,
-                    Currency = currency,
-                    FailureCode = data?.Status,
-                    FailureMessage = data?.FailureReason
-                };
-
-            case "settlement.success":
-            case "settlement.completed":
-                return new SettlementCompletedEvent
-                {
-                    GatewayReference = rawReference,
-                    Status = PaymentStatus.Completed,
-                    EventType = webhookEvent.Type,
-                    Category = WebhookEventCategory.SettlementCompleted,
-                    SettlementReference = rawReference,
-                    NetAmount = amount,
-                    Currency = currency
-                };
-
-            default:
-                // Unrecognised but verified event — surface as Category=Unknown so consumers can log
-                // and act on new upstream types even before the SDK is taught to classify them.
-                return new WebhookEvent
-                {
-                    GatewayReference = rawReference,
-                    Status = PaymentStatus.Pending,
-                    EventType = webhookEvent.Type,
-                    Category = WebhookEventCategory.Unknown
+                    IsPartial = false
                 };
         }
+
+        if (isSuccess)
+            return new ChargeSucceededEvent
+            {
+                GatewayReference = rawReference,
+                Status = PaymentStatus.Completed,
+                EventType = webhookEvent.Type,
+                Category = WebhookEventCategory.ChargeSucceeded,
+                Amount = amount,
+                Currency = currency,
+                CustomerId = data.UserId,
+                PaymentMethodToken = data.InstrumentType ?? data.PayMethod
+            };
+
+        if (isFailure)
+            return new ChargeFailedEvent
+            {
+                GatewayReference = rawReference,
+                Status = PaymentStatus.Failed,
+                EventType = webhookEvent.Type,
+                Category = WebhookEventCategory.ChargeFailed,
+                Amount = amount,
+                Currency = currency,
+                FailureCode = data.FailureCode ?? data.Status,
+                FailureMessage = data.FailureReason ?? data.DisplayedFailure
+            };
+
+        // INITIAL / PENDING (or anything unrecognised) — surface as a pending charge so consumers can
+        // wait for a terminal callback rather than dropping the event.
+        return new ChargePendingEvent
+        {
+            GatewayReference = rawReference,
+            Status = PaymentStatus.Pending,
+            EventType = webhookEvent.Type,
+            Category = WebhookEventCategory.ChargePending,
+            Amount = amount,
+            Currency = currency
+        };
     }
 
-    private async Task<string> SendAsync(HttpMethod method, string path, object body, CancellationToken ct, string operation)
+    private async Task<string> SendAsync(HttpMethod method, string path, object body, AuthMode authMode, CancellationToken ct, string operation)
     {
         var json = JsonSerializer.Serialize(body);
         using var req = new HttpRequestMessage(method, path)
@@ -423,10 +454,15 @@ public sealed class OPayPaymentProvider : BhenguProviderBase, IPaymentGatewayPro
             Content = new StringContent(json, Encoding.UTF8, "application/json")
         };
 
-        // HMAC-SHA512 of the request body using SecretKey, lowercase hex, sent as Authorization: Bearer <sig>
-        using var hmac = new HMACSHA512(Encoding.UTF8.GetBytes(_options.SecretKey));
-        var signature = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(json))).ToLowerInvariant();
-        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", signature);
+        // Two documented auth modes (see OPaySignature):
+        //   PublicKeyBearer — cashier/create: Authorization: Bearer {PublicKey}
+        //     (https://documentation.opaycheckout.com/cashier-create)
+        //   SignedBody — refund/status/…: Authorization: Bearer {HMAC-SHA512(sorted-body, SecretKey)}
+        //     (https://documentation.opaycheckout.com/api-signature)
+        var bearer = authMode == AuthMode.PublicKeyBearer
+            ? _options.PublicKey
+            : OPaySignature.HmacSha512Hex(OPaySignature.CanonicaliseForSigning(json), _options.SecretKey);
+        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearer);
         req.Headers.TryAddWithoutValidation("MerchantId", _options.MerchantId);
 
         var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
@@ -449,6 +485,14 @@ public sealed class OPayPaymentProvider : BhenguProviderBase, IPaymentGatewayPro
 
         return responseBody;
     }
+
+    /// <summary>ISO currency for an OPay International country (NG→NGN, EG→EGP, PK→PKR), defaulting to NGN.</summary>
+    private static string CurrencyForCountry(string? country) => country?.ToUpperInvariant() switch
+    {
+        "EG" => "EGP",
+        "PK" => "PKR",
+        _ => "NGN"
+    };
 
     private static PaymentStatus MapResponseCode(string? code, string? status)
     {
@@ -486,10 +530,16 @@ public sealed class OPayPaymentProvider : BhenguProviderBase, IPaymentGatewayPro
         [JsonPropertyName("amount")] public OPayAmount? Amount { get; set; }
     }
 
+    // Refund response shape per https://documentation.opaycheckout.com/payment-refund:
+    // { reference, originalReference, orderNo, originalOrderNo, country, refundAmount, orderStatus }.
     private sealed class OPayRefundData
     {
-        [JsonPropertyName("refundId")] public string? RefundId { get; set; }
-        [JsonPropertyName("status")] public string? Status { get; set; }
+        [JsonPropertyName("reference")] public string? Reference { get; set; }
+        [JsonPropertyName("originalReference")] public string? OriginalReference { get; set; }
+        [JsonPropertyName("orderNo")] public string? OrderNo { get; set; }
+        [JsonPropertyName("originalOrderNo")] public string? OriginalOrderNo { get; set; }
+        [JsonPropertyName("refundAmount")] public OPayAmount? RefundAmount { get; set; }
+        [JsonPropertyName("orderStatus")] public string? OrderStatus { get; set; }
     }
 
     private sealed class OPayPayoutData
@@ -504,22 +554,44 @@ public sealed class OPayPaymentProvider : BhenguProviderBase, IPaymentGatewayPro
         [JsonPropertyName("currency")] public string? Currency { get; set; }
     }
 
+    // Callback envelope per https://documentation.opaycheckout.com/payment-notifications-callbacks:
+    // { "payload": { … }, "sha512": "<hmac-sha3-512 hex>", "type": "transaction-status" }.
     private sealed class OPayWebhookEvent
     {
         [JsonPropertyName("type")] public string? Type { get; set; }
+        [JsonPropertyName("sha512")] public string? Sha512 { get; set; }
         [JsonPropertyName("payload")] public OPayWebhookPayload? Payload { get; set; }
     }
 
+    // Callback payload fields per the notifications doc:
+    // amount, channel, country, currency, displayedFailure, fee, feeCurrency, instrumentType,
+    // reference, refunded, status, timestamp, token, transactionId, updated_at.
+    // amount is a scalar (minor units) with a sibling currency field (this is the callback shape;
+    // the cashier/status RESPONSE nests amount as {total,currency} instead).
     private sealed class OPayWebhookPayload
     {
+        [JsonPropertyName("amount")] public long AmountMinor { get; set; }
+        [JsonPropertyName("currency")] public string? Currency { get; set; }
         [JsonPropertyName("reference")] public string? Reference { get; set; }
-        [JsonPropertyName("orderNo")] public string? OrderNo { get; set; }
+        [JsonPropertyName("refunded")] public bool Refunded { get; set; }
         [JsonPropertyName("status")] public string? Status { get; set; }
-        [JsonPropertyName("amount")] public OPayAmount? Amount { get; set; }
+        [JsonPropertyName("timestamp")] public string? Timestamp { get; set; }
+        [JsonPropertyName("token")] public string? Token { get; set; }
+        [JsonPropertyName("transactionId")] public string? TransactionId { get; set; }
+        [JsonPropertyName("instrumentType")] public string? InstrumentType { get; set; }
+        [JsonPropertyName("channel")] public string? Channel { get; set; }
+        [JsonPropertyName("displayedFailure")] public string? DisplayedFailure { get; set; }
+        [JsonPropertyName("country")] public string? Country { get; set; }
+
+        // Tolerant extras — present on some OPay notification variants but not the core spec.
+        [JsonPropertyName("orderNo")] public string? OrderNo { get; set; }
         [JsonPropertyName("userId")] public string? UserId { get; set; }
         [JsonPropertyName("payMethod")] public string? PayMethod { get; set; }
-        [JsonPropertyName("refundId")] public string? RefundId { get; set; }
-        [JsonPropertyName("receiverId")] public string? ReceiverId { get; set; }
+        [JsonPropertyName("failureCode")] public string? FailureCode { get; set; }
         [JsonPropertyName("failureReason")] public string? FailureReason { get; set; }
+
+        /// <summary>Convenience accessor exposing amount as the SDK's {Total,Currency} shape.</summary>
+        [JsonIgnore]
+        public OPayAmount Amount => new() { Total = AmountMinor, Currency = Currency };
     }
 }

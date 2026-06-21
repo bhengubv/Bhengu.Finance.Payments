@@ -20,11 +20,16 @@ namespace Bhengu.Finance.Payments.OPay.Internals;
 /// </summary>
 internal sealed class OPayHttpClient
 {
+    // Hosts verified against OPay's public docs (verbatim "Request URL" lines):
+    //   https://documentation.opaycheckout.com/cashier-create
+    //   https://documentation.opaycheckout.com/query-payment-status
+    // Production is liveapi.*; sandbox/staging is testapi.* (NOT sandboxapi.*).
+
     /// <summary>Default production base URL when <see cref="OPayOptions.BaseUrl"/> is unset.</summary>
     public const string DefaultProductionUrl = "https://liveapi.opaycheckout.com";
 
-    /// <summary>Default sandbox base URL when <see cref="OPayOptions.SandboxUrl"/> is unset.</summary>
-    public const string DefaultSandboxUrl = "https://sandboxapi.opaycheckout.com";
+    /// <summary>Default sandbox/staging base URL when <see cref="OPayOptions.SandboxUrl"/> is unset.</summary>
+    public const string DefaultSandboxUrl = "https://testapi.opaycheckout.com";
 
     /// <summary>JSON serializer options for OPay payloads.</summary>
     public static readonly JsonSerializerOptions Json = new()
@@ -70,8 +75,14 @@ internal sealed class OPayHttpClient
         if (body is not null)
             req.Content = new StringContent(json, Encoding.UTF8, "application/json");
 
-        using var hmac = new HMACSHA512(Encoding.UTF8.GetBytes(_options.SecretKey));
-        var signature = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(json))).ToLowerInvariant();
+        // Signed server-to-server APIs: sign the request body with HMAC-SHA512 (lowercase hex) using
+        // the merchant secret/private key, carried as "Authorization: Bearer {signature}" plus a
+        // "MerchantId" header. The body MUST be sorted by top-level key alphabetically before signing.
+        // Source (verbatim): https://documentation.opaycheckout.com/api-signature
+        //   "Sort your request payload JSON according to the alphabetical order of the request keys.
+        //    Sign the sorted JSON with your secret key using HMAC SHA-512 algorithm."  (hash_hmac('sha512', ...))
+        var toSign = OPaySignature.CanonicaliseForSigning(json);
+        var signature = OPaySignature.HmacSha512Hex(toSign, _options.SecretKey);
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", signature);
         req.Headers.TryAddWithoutValidation("MerchantId", _options.MerchantId);
 

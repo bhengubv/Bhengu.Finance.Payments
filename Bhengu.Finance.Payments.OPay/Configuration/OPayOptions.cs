@@ -12,7 +12,12 @@ public sealed class OPayOptions
     /// <summary>OPay public key (sent in request body).</summary>
     public string PublicKey { get; set; } = string.Empty;
 
-    /// <summary>OPay secret key used to sign requests with HMAC-SHA512 and to verify webhooks.</summary>
+    /// <summary>
+    /// OPay merchant Private Key. Used to sign server-to-server requests with HMAC-SHA512 (over the
+    /// alphabetically key-sorted body) and to verify callbacks with HMAC-SHA3-512 (over OPay's fixed
+    /// sign-content string). See https://documentation.opaycheckout.com/api-signature and
+    /// https://documentation.opaycheckout.com/callback-signature.
+    /// </summary>
     public string SecretKey { get; set; } = string.Empty;
 
     /// <summary>Merchant id (the OPay "sn" short name) used in cashier requests.</summary>
@@ -33,6 +38,6 @@ public sealed class OPayOptions
     /// <summary>Override the production base URL (defaults to https://liveapi.opaycheckout.com).</summary>
     public string? BaseUrl { get; set; }
 
-    /// <summary>Override the sandbox base URL (defaults to https://sandboxapi.opaycheckout.com).</summary>
+    /// <summary>Override the sandbox/staging base URL (defaults to https://testapi.opaycheckout.com).</summary>
     public string? SandboxUrl { get; set; }
 }

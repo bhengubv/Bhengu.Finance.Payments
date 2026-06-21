@@ -21,6 +21,9 @@ namespace Bhengu.Finance.Payments.OPay.Providers;
 /// <remarks>
 /// Pass the bank-account number via <see cref="CardDetails.CardNumber"/> and the 3-digit CBN
 /// bank code via <see cref="CardDetails.BillingAddressLine1"/>.
+/// <para>UNVERIFIED: <c>api/v1/international/cashier/savedBankAccount/register</c> is not in OPay's
+/// public Cashier docs; the signing scheme is the documented HMAC-SHA512 but the endpoint/payload
+/// are unverified.</para>
 /// </remarks>
 public sealed class OPayRawCardTokenisationProvider : BhenguProviderBase, IRawCardTokenisationProvider
 {

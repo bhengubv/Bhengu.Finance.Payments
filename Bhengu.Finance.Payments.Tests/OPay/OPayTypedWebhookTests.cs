@@ -28,23 +28,28 @@ public class OPayTypedWebhookTests
         }),
         NullLogger<OPayPaymentProvider>.Instance);
 
+    // OPay's real payment-notification callback (https://documentation.opaycheckout.com/payment-notifications-callbacks)
+    // has a single envelope type "transaction-status"; outcome lives in payload.status, and a refund
+    // is flagged by payload.refunded == true. amount is a scalar in minor units with a sibling currency.
+
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsChargeSucceededEvent_ForTransactionSuccess()
+    public async Task ParseWebhookAsync_ReturnsChargeSucceededEvent_ForSuccessStatus()
     {
         var evt = await Create().ParseWebhookAsync("""
-            {"type":"transaction.success","payload":{"reference":"R-1","amount":{"total":250000,"currency":"NGN"},"userId":"U-1","payMethod":"card"}}
+            {"type":"transaction-status","payload":{"reference":"R-1","amount":250000,"currency":"NGN","status":"SUCCESS","refunded":false,"userId":"U-1","instrumentType":"BankCard"}}
             """);
         var typed = Assert.IsType<ChargeSucceededEvent>(evt);
         Assert.Equal(WebhookEventCategory.ChargeSucceeded, typed.Category);
         Assert.Equal(2500m, typed.Amount);
         Assert.Equal("U-1", typed.CustomerId);
+        Assert.Equal("BankCard", typed.PaymentMethodToken);
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsChargeFailedEvent_ForTransactionFailed()
+    public async Task ParseWebhookAsync_ReturnsChargeFailedEvent_ForFailStatus()
     {
         var evt = await Create().ParseWebhookAsync("""
-            {"type":"transaction.failed","payload":{"reference":"R-2","amount":{"total":100000,"currency":"NGN"},"status":"failed","failureReason":"insufficient_funds"}}
+            {"type":"transaction-status","payload":{"reference":"R-2","amount":100000,"currency":"NGN","status":"FAIL","refunded":false,"failureReason":"insufficient_funds"}}
             """);
         var typed = Assert.IsType<ChargeFailedEvent>(evt);
         Assert.Equal(WebhookEventCategory.ChargeFailed, typed.Category);
@@ -52,35 +57,34 @@ public class OPayTypedWebhookTests
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsRefundSucceededEvent_ForRefundSuccess()
+    public async Task ParseWebhookAsync_ReturnsRefundSucceededEvent_WhenRefundedTrue()
     {
         var evt = await Create().ParseWebhookAsync("""
-            {"type":"refund.success","payload":{"reference":"R-3","amount":{"total":50000,"currency":"NGN"},"refundId":"RF-1"}}
+            {"type":"transaction-status","payload":{"reference":"R-3","amount":50000,"currency":"NGN","status":"SUCCESS","refunded":true,"transactionId":"TX-3"}}
             """);
         var typed = Assert.IsType<RefundSucceededEvent>(evt);
         Assert.Equal(WebhookEventCategory.RefundSucceeded, typed.Category);
-        Assert.Equal("RF-1", typed.RefundReference);
+        Assert.Equal("TX-3", typed.RefundReference);
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsPayoutCompletedEvent_ForPayoutSuccess()
+    public async Task ParseWebhookAsync_ReturnsRefundFailedEvent_WhenRefundedTrueAndFail()
     {
         var evt = await Create().ParseWebhookAsync("""
-            {"type":"payout.success","payload":{"reference":"R-4","amount":{"total":1000000,"currency":"NGN"},"receiverId":"USR-9000"}}
+            {"type":"transaction-status","payload":{"reference":"R-3b","amount":50000,"currency":"NGN","status":"FAIL","refunded":true,"failureReason":"refund_rejected"}}
             """);
-        var typed = Assert.IsType<PayoutCompletedEvent>(evt);
-        Assert.Equal(WebhookEventCategory.PayoutCompleted, typed.Category);
-        Assert.Equal("USR-9000", typed.DestinationToken);
-        Assert.Equal(10000m, typed.Amount);
+        var typed = Assert.IsType<RefundFailedEvent>(evt);
+        Assert.Equal(WebhookEventCategory.RefundFailed, typed.Category);
+        Assert.Equal("refund_rejected", typed.FailureMessage);
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsUnknownCategory_ForUnknownEvent()
+    public async Task ParseWebhookAsync_ReturnsPending_ForInitialStatus()
     {
         var evt = await Create().ParseWebhookAsync("""
-            {"type":"some.random","payload":{"reference":"X"}}
+            {"type":"transaction-status","payload":{"reference":"X","status":"INITIAL"}}
             """);
         Assert.NotNull(evt);
-        Assert.Equal(WebhookEventCategory.Unknown, evt!.Category);
+        Assert.Equal(WebhookEventCategory.ChargePending, evt!.Category);
     }
 }

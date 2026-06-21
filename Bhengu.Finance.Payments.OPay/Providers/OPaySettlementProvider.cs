@@ -23,6 +23,9 @@ namespace Bhengu.Finance.Payments.OPay.Providers;
 /// <remarks>
 /// OPay returns wire amounts in the smallest currency unit (kobo for NGN, piastre for EGP);
 /// the SDK divides by 100 before returning.
+/// <para>UNVERIFIED: the <c>api/v1/international/settlement/*</c> paths are not in OPay's public
+/// Cashier docs (https://documentation.opaycheckout.com/). Signing follows the documented
+/// HMAC-SHA512 scheme, but the endpoints/payloads are unverified — treat as untested.</para>
 /// </remarks>
 public sealed class OPaySettlementProvider : BhenguProviderBase, ISettlementProvider
 {

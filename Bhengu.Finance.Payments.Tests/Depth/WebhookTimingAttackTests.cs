@@ -415,7 +415,11 @@ public sealed class WebhookTimingAttackTests
         TimingAttackHelpers.AssertConstantTimeVerification(provider.VerifyWebhookSignature, Payload, sig);
     }
 
-    // --- OPay: HMAC SHA256 hex (or HMAC SHA512) ---
+    // --- OPay: callback sig is HMAC-SHA3-512 hex of a fixed sign-content string, carried as the
+    //     body's `sha512` field (https://documentation.opaycheckout.com/callback-signature). The
+    //     verifier compares via CryptographicOperations.FixedTimeEquals. SHA-3 is required to reach
+    //     that comparison, so the constant-time assertion only runs where the runtime supports it;
+    //     elsewhere the verifier degrades to a safe early `false` (still timing-flat: no byte compare).
     [Fact]
     public void OPay_VerifyWebhookSignature_IsConstantTime()
     {
@@ -426,9 +430,27 @@ public sealed class WebhookTimingAttackTests
                 Country = "NG", CallbackUrl = "https://example.com/cb", ReturnUrl = "https://example.com/r"
             }),
             NullLogger<OPayPaymentProvider>.Instance);
-        // OPay uses HMAC SHA512 hex against the SecretKey on the wire body.
-        var sig = TimingAttackHelpers.HmacSha512Hex(Payload, Secret);
-        TimingAttackHelpers.AssertConstantTimeVerification(provider.VerifyWebhookSignature, Payload, sig);
+
+        const string body =
+            "{\"payload\":{\"amount\":250000,\"currency\":\"NGN\",\"reference\":\"ref_timing\",\"refunded\":false," +
+            "\"status\":\"SUCCESS\",\"timestamp\":\"2026-06-21T10:00:00Z\",\"token\":\"TOK\",\"transactionId\":\"TX\"},\"type\":\"transaction-status\"}";
+
+        if (!System.Security.Cryptography.HMACSHA3_512.IsSupported)
+        {
+            // No SHA-3 on this runtime: any signature must be rejected, and rejection must not depend
+            // on the signature bytes (early return before any comparison).
+            Assert.False(provider.VerifyWebhookSignature(body, new string('a', 128)));
+            Assert.False(provider.VerifyWebhookSignature(body, new string('b', 128)));
+            return;
+        }
+
+        var signContent =
+            "{Amount:\"250000\",Currency:\"NGN\",Reference:\"ref_timing\",Refunded:f,Status:\"SUCCESS\"," +
+            "Timestamp:\"2026-06-21T10:00:00Z\",Token:\"TOK\",TransactionID:\"TX\"}";
+        var mac = System.Security.Cryptography.HMACSHA3_512.HashData(
+            System.Text.Encoding.UTF8.GetBytes(Secret), System.Text.Encoding.UTF8.GetBytes(signContent));
+        var sig = System.Convert.ToHexString(mac).ToLowerInvariant();
+        TimingAttackHelpers.AssertConstantTimeVerification(provider.VerifyWebhookSignature, body, sig);
     }
 
     // --- PagSeguro: HMAC SHA256 hex ---

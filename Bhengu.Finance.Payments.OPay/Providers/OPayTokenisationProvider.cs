@@ -19,6 +19,12 @@ namespace Bhengu.Finance.Payments.OPay.Providers;
 /// READ-side OPay tokenisation provider — saved-bank-account fetch / list / delete. The
 /// WRITE-side counterpart that registers raw bank-account credentials lives in
 /// <see cref="OPayRawCardTokenisationProvider"/>.
+///
+/// <para>UNVERIFIED: the <c>api/v1/international/cashier/savedBankAccount/*</c> paths are NOT present
+/// in OPay's public Cashier/Checkout documentation (https://documentation.opaycheckout.com/, which
+/// covers create / status / refund / close / notifications only). Signing follows the documented
+/// HMAC-SHA512 scheme, but the endpoints and payloads here are unverified — treat as untested until
+/// confirmed against the real saved-instrument docs or a sandbox key.</para>
 /// </summary>
 public sealed class OPayTokenisationProvider : BhenguProviderBase, ITokenisationProvider
 {

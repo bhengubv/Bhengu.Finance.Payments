@@ -131,9 +131,10 @@ public class OPayPaymentProviderTests
     {
         var handler = new StubHttpMessageHandler((req, _) =>
         {
-            Assert.Contains("refund/create", req.RequestUri!.PathAndQuery);
+            // Verified path: https://documentation.opaycheckout.com/payment-refund
+            Assert.Contains("payment/refund/create", req.RequestUri!.PathAndQuery);
             return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
-                {"code":"00000","message":"OK","data":{"refundId":"OPAY-RF-1","status":"success"}}
+                {"code":"00000","message":"OK","data":{"reference":"REFUND-1","originalReference":"OPAY-ORD-1","orderNo":"OPAY-RF-1","orderStatus":"SUCCESS"}}
                 """);
         });
         var provider = Create(handler);
@@ -172,61 +173,103 @@ public class OPayPaymentProviderTests
         Assert.Equal(PaymentStatus.Completed, payout.Status);
     }
 
-    [Fact]
-    public void VerifyWebhookSignature_ReturnsTrue_ForValidSignature()
-    {
-        const string secret = "opay-secret-key";
-        const string payload = """{"type":"transaction.success","payload":{"reference":"OPAY-1"}}""";
-        using var hmac = new HMACSHA512(Encoding.UTF8.GetBytes(secret));
-        var validSig = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant();
+    // OPay callbacks carry an HMAC-SHA3-512 (hex) `sha512` over a fixed sign-content string built
+    // from 8 payload fields, keyed on the merchant Private Key (SecretKey).
+    // Source: https://documentation.opaycheckout.com/callback-signature
+    private const string CallbackSecret = "opay-secret-key";
 
-        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
-        Assert.True(provider.VerifyWebhookSignature(payload, validSig));
+    // A real OPay payment-notification callback body. `amount` is a scalar (minor units) with a
+    // sibling `currency`; `refunded` is a bool; `status` is SUCCESS/FAIL/... ; the signed fields are
+    // Amount, Currency, Reference, Refunded, Status, Timestamp, Token, TransactionID.
+    private const string CallbackBody =
+        """{"payload":{"amount":250000,"currency":"NGN","reference":"OPAY-1","refunded":false,"status":"SUCCESS","timestamp":"2026-06-21T10:00:00Z","token":"TOK-1","transactionId":"TX-1","instrumentType":"BankCard"},"type":"transaction-status"}""";
+
+    /// <summary>Compute the exact `sha512` value OPay would send for <see cref="CallbackBody"/>.</summary>
+    private static string ValidCallbackSha512()
+    {
+        // {Amount:"%s",Currency:"%s",Reference:"%s",Refunded:%s,Status:"%s",Timestamp:"%s",Token:"%s",TransactionID:"%s"}
+        var signContent =
+            "{Amount:\"250000\",Currency:\"NGN\",Reference:\"OPAY-1\",Refunded:f,Status:\"SUCCESS\",Timestamp:\"2026-06-21T10:00:00Z\",Token:\"TOK-1\",TransactionID:\"TX-1\"}";
+        var mac = HMACSHA3_512.HashData(Encoding.UTF8.GetBytes(CallbackSecret), Encoding.UTF8.GetBytes(signContent));
+        return Convert.ToHexString(mac).ToLowerInvariant();
     }
 
     [Fact]
-    public void VerifyWebhookSignature_StripsBearerPrefix_AndReturnsTrue()
+    public void VerifyWebhookSignature_ReturnsTrue_ForValidSignature()
     {
-        const string secret = "opay-secret-key";
-        const string payload = """{"type":"transaction.success","payload":{"reference":"OPAY-1"}}""";
-        using var hmac = new HMACSHA512(Encoding.UTF8.GetBytes(secret));
-        var validSig = "Bearer " + Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant();
-
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
-        Assert.True(provider.VerifyWebhookSignature(payload, validSig));
+
+        if (!HMACSHA3_512.IsSupported)
+        {
+            // No SHA-3 on this runtime: the verifier degrades safely to false (never throws / passes
+            // blindly). We cannot compute a valid signature here, so assert the safe-reject contract.
+            Assert.False(provider.VerifyWebhookSignature(CallbackBody, new string('a', 128)));
+            return;
+        }
+
+        Assert.True(provider.VerifyWebhookSignature(CallbackBody, ValidCallbackSha512()));
+    }
+
+    [Fact]
+    public void VerifyWebhookSignature_ReturnsTrue_WhenSignatureReadFromBody()
+    {
+        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+
+        if (!HMACSHA3_512.IsSupported)
+        {
+            Assert.False(provider.VerifyWebhookSignature(CallbackBody, ""));
+            return;
+        }
+
+        // Embed the sha512 in the body and call with an empty signature arg — the verifier reads it.
+        var body = CallbackBody.Replace(
+            "\"type\":\"transaction-status\"",
+            $"\"sha512\":\"{ValidCallbackSha512()}\",\"type\":\"transaction-status\"",
+            StringComparison.Ordinal);
+        Assert.True(provider.VerifyWebhookSignature(body, ""));
     }
 
     [Fact]
     public void VerifyWebhookSignature_ReturnsFalse_ForTamperedSignature()
     {
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
-        Assert.False(provider.VerifyWebhookSignature("anything", "deadbeef"));
+        // A wrong signature must never verify (true regardless of SHA-3 availability: no-support → false).
+        Assert.False(provider.VerifyWebhookSignature(CallbackBody, new string('a', 128)));
+    }
+
+    [Fact]
+    public void VerifyWebhookSignature_ReturnsFalse_ForMalformedBody()
+    {
+        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+        Assert.False(provider.VerifyWebhookSignature("not json", "deadbeef"));
     }
 
     [Fact]
     public async Task ParseWebhookAsync_ReturnsEvent_ForTransactionSuccess()
     {
+        // Real OPay callback: single envelope type "transaction-status", outcome in payload.status.
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
         var evt = await provider.ParseWebhookAsync("""
-            {"type":"transaction.success","payload":{"reference":"OPAY-99","status":"success"}}
+            {"type":"transaction-status","payload":{"reference":"OPAY-99","status":"SUCCESS","amount":250000,"currency":"NGN"}}
             """);
         Assert.NotNull(evt);
         Assert.Equal("OPAY-99", evt!.GatewayReference);
         Assert.Equal(PaymentStatus.Completed, evt.Status);
-        Assert.Equal("transaction.success", evt.EventType);
+        Assert.Equal("transaction-status", evt.EventType);
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsUnknownCategory_ForUnknownEventType()
+    public async Task ParseWebhookAsync_ReturnsPending_ForInitialStatus()
     {
-        // OPay surfaces unrecognised but verified events as Category=Unknown so consumers can log
-        // and act on new upstream types even before the SDK is taught to classify them.
+        // OPay's only envelope type is "transaction-status"; an INITIAL/PENDING status is surfaced as
+        // a pending charge (there is no separate "unknown event type" concept in the real callback).
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
         var evt = await provider.ParseWebhookAsync("""
-            {"type":"some.weird.event","payload":{"reference":"X"}}
+            {"type":"transaction-status","payload":{"reference":"X","status":"INITIAL"}}
             """);
         Assert.NotNull(evt);
-        Assert.Equal(Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.Unknown, evt!.Category);
+        Assert.Equal(Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.ChargePending, evt!.Category);
+        Assert.Equal(PaymentStatus.Pending, evt.Status);
     }
 
     [Fact]
