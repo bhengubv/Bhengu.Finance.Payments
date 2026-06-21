@@ -16,5 +16,6 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Bhengu.Finance.Payments.Core\Bhengu.Finance.Payments.Core.csproj" />
+    <ProjectReference Include="..\Bhengu.Finance.Payments.PayFast\Bhengu.Finance.Payments.PayFast.csproj" />
   </ItemGroup>
 </Project>

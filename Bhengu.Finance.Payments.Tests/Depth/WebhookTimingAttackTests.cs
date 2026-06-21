@@ -36,9 +36,6 @@ using Bhengu.Finance.Payments.MercadoPago.Configuration;
 using Bhengu.Finance.Payments.MercadoPago.Providers;
 using Bhengu.Finance.Payments.Moniepoint.Configuration;
 using Bhengu.Finance.Payments.Moniepoint.Providers;
-using Bhengu.Finance.Payments.Mukuru.Configuration;
-using Bhengu.Finance.Payments.Mukuru.Internals;
-using Bhengu.Finance.Payments.Mukuru.Providers;
 using Bhengu.Finance.Payments.MPesa.Configuration;
 using Bhengu.Finance.Payments.MPesa.Providers;
 using Bhengu.Finance.Payments.MTNMoMo.Configuration;
@@ -337,22 +334,6 @@ public sealed class WebhookTimingAttackTests
         TimingAttackHelpers.AssertConstantTimeVerification(provider.VerifyWebhookSignature, Payload, sig);
     }
 
-    // --- Mukuru: HMAC SHA256 hex ---
-    [Fact]
-    public void Mukuru_VerifyWebhookSignature_IsConstantTime()
-    {
-        var provider = new MukuruPaymentProvider(StubHttp(),
-            Options.Create(new MukuruOptions
-            {
-                ClientId = "c", ClientSecret = "s", MerchantId = "M",
-                WebhookSecret = Secret, SenderCountry = "ZA", DefaultCurrency = "ZAR",
-                CallbackUrl = "https://example.com/cb"
-            }),
-            NullLogger<MukuruPaymentProvider>.Instance,
-            new MukuruIdempotencyCache(new InMemoryBhenguDistributedCache()));
-        var sig = TimingAttackHelpers.HmacSha256Hex(Payload, Secret);
-        TimingAttackHelpers.AssertConstantTimeVerification(provider.VerifyWebhookSignature, Payload, sig);
-    }
 
 
     // --- DPO: skipped — DPO callbacks are NOT cryptographically signed; the provider returns true

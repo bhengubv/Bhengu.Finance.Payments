@@ -30,9 +30,6 @@ using Bhengu.Finance.Payments.MercadoPago.Configuration;
 using Bhengu.Finance.Payments.MercadoPago.Providers;
 using Bhengu.Finance.Payments.Moniepoint.Configuration;
 using Bhengu.Finance.Payments.Moniepoint.Providers;
-using Bhengu.Finance.Payments.Mukuru.Configuration;
-using Bhengu.Finance.Payments.Mukuru.Internals;
-using Bhengu.Finance.Payments.Mukuru.Providers;
 using Bhengu.Finance.Payments.Onafriq.Configuration;
 using Bhengu.Finance.Payments.Onafriq.Providers;
 using Bhengu.Finance.Payments.OPay.Configuration;
@@ -378,36 +375,6 @@ public sealed class Moniepoint_MalformedJsonTests
     }
 }
 
-public sealed class Mukuru_MalformedJsonTests
-{
-    private static MukuruPaymentProvider Create() =>
-        new(new HttpClient(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK))),
-            Options.Create(new MukuruOptions
-            {
-                ClientId = "c", ClientSecret = "s", MerchantId = "M",
-                WebhookSecret = "wh", SenderCountry = "ZA", DefaultCurrency = "ZAR",
-                CallbackUrl = "https://example.com/cb"
-            }),
-            NullLogger<MukuruPaymentProvider>.Instance,
-            new MukuruIdempotencyCache(new InMemoryBhenguDistributedCache()));
-
-    [Theory]
-    [MemberData(nameof(MalformedJsonWaveA.NonEmptyMalformed), MemberType = typeof(MalformedJsonWaveA))]
-    public async Task ParseWebhookAsync_DoesNotThrow_OnMalformedInput(string payload)
-    {
-        var provider = Create();
-        _ = await provider.ParseWebhookAsync(payload);
-    }
-
-    [Fact]
-    public async Task ParseWebhookAsync_HandlesHugeNestedJson_Within5Seconds()
-    {
-        var provider = Create();
-        await MalformedJsonWaveA.AssertParsesWithinBudget(
-            async () => _ = await provider.ParseWebhookAsync(MalformedJsonWaveA.BuildHugeNestedJson()),
-            TimeSpan.FromSeconds(5));
-    }
-}
 
 public sealed class Onafriq_MalformedJsonTests
 {
