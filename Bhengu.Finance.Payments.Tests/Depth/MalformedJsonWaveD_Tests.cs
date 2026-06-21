@@ -1,8 +1,8 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
 using System.Net;
+using System.Security.Cryptography;
 using Bhengu.Finance.Payments.BricsPay.Configuration;
-using Bhengu.Finance.Payments.BricsPay.Currency;
 using Bhengu.Finance.Payments.BricsPay.Providers;
 using Bhengu.Finance.Payments.ChipperCash.Configuration;
 using Bhengu.Finance.Payments.ChipperCash.Providers;
@@ -54,7 +54,6 @@ using Bhengu.Finance.Payments.Slydepay.Providers;
 using Bhengu.Finance.Payments.Tests.TestHelpers;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
-using Moq;
 using Xunit;
 
 namespace Bhengu.Finance.Payments.Tests.Depth;
@@ -670,30 +669,32 @@ public sealed class CMI_MalformedJsonTests
 
 public sealed class BricsPay_MalformedJsonTests
 {
-    private static BricsPayPaymentProvider Create() =>
-        new(new HttpClient(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK))),
+    private static BricsPayPaymentProvider Create()
+    {
+        using var ec = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        return new(new HttpClient(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK))),
             Options.Create(new BricsPayOptions
             {
-                MerchantId = "BRICS_TEST", SecretKey = "secret",
-                WebhookSecret = "wh", UseSandbox = true
+                TerminalId = "POS-1", BaseUrl = "https://terminal.brics.example",
+                PrivateKeyPem = ec.ExportPkcs8PrivateKeyPem()
             }),
-            new Mock<ICurrencyExchangeService>().Object,
             NullLogger<BricsPayPaymentProvider>.Instance);
+    }
 
     [Theory]
     [MemberData(nameof(MalformedJsonWaveA.NonEmptyMalformed), MemberType = typeof(MalformedJsonWaveA))]
-    public async Task ParseWebhookAsync_DoesNotThrow_OnMalformedInput(string payload)
+    public void ParseCallback_DoesNotThrow_OnMalformedInput(string payload)
     {
         var provider = Create();
-        _ = await provider.ParseWebhookAsync(payload);
+        _ = provider.ParseCallback(payload);
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_HandlesHugeNestedJson_Within5Seconds()
+    public async Task ParseCallback_HandlesHugeNestedJson_Within5Seconds()
     {
         var provider = Create();
         await MalformedJsonWaveA.AssertParsesWithinBudget(
-            async () => _ = await provider.ParseWebhookAsync(MalformedJsonWaveA.BuildHugeNestedJson()),
+            () => { _ = provider.ParseCallback(MalformedJsonWaveA.BuildHugeNestedJson()); return Task.CompletedTask; },
             TimeSpan.FromSeconds(5));
     }
 }

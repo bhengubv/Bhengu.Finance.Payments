@@ -2,377 +2,244 @@
 
 using System.Globalization;
 using System.Net;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Bhengu.Finance.Payments.BricsPay.Configuration;
-using Bhengu.Finance.Payments.BricsPay.Currency;
+using Bhengu.Finance.Payments.BricsPay.Internals;
+using Bhengu.Finance.Payments.BricsPay.Models;
 using Bhengu.Finance.Payments.Core;
 using Bhengu.Finance.Payments.Core.Validation;
-using Bhengu.Finance.Payments.Core.Caching;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Models;
-using Bhengu.Finance.Payments.Core.Models.Webhooks;
+using Bhengu.Finance.Payments.Core.Models.QrCode;
 using Bhengu.Finance.Payments.Core.Providers;
-using Bhengu.Finance.Payments.Core.Security;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace Bhengu.Finance.Payments.BricsPay.Providers;
 
 /// <summary>
-/// BRICS Pay cross-border payments. Supports payments and payouts within BRICS nations
-/// (South Africa, Brazil, Russia, India, China) with automatic currency conversion. Honours
-/// per-call <c>IdempotencyKey</c> via the shared <see cref="IBhenguDistributedCache"/> for 24
-/// hours.
+/// BRICS Pay e-commerce acquiring — "Internet Acquiring" QR payments on the Joys processing platform.
+/// The customer pays by scanning a QR on a hosted payment page; there is no card token.
+/// <para>
+/// This provider creates a transaction (<c>POST /ia/api</c> → hosted payment-page URL containing the QR),
+/// polls status (<c>GET /ia/get</c>), refunds (<c>POST /ia/refund</c>) and parses callbacks. Every request
+/// is signed with the merchant's private key (ECDSA/RSA); BRICS Pay verifies with the public key registered
+/// at onboarding. See <c>BRICS_PAY_API_REFERENCE.md</c>.
+/// </para>
 /// </summary>
-[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
-public sealed class BricsPayPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
+[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Built from BRICS Pay's published E-Commerce protocol; never verified against a live terminal (onboarding required).")]
+public sealed class BricsPayPaymentProvider : BhenguProviderBase, IQrCodeProvider
 {
-    private static readonly JsonSerializerOptions s_jsonOptions = new()
+    private static readonly JsonSerializerOptions s_json = new()
     {
-        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
-        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        PropertyNameCaseInsensitive = true
     };
 
     private readonly HttpClient _httpClient;
     private readonly BricsPayOptions _options;
-    private readonly ICurrencyExchangeService _exchangeService;
-    private readonly IBhenguDistributedCache _cache;
     private readonly string _baseUrl;
-    private static readonly TimeSpan s_idempotencyTtl = TimeSpan.FromHours(24);
 
     /// <inheritdoc/>
     public override string ProviderName => ProviderNames.BricsPay;
-
-    /// <inheritdoc/>
-    public ProviderCapabilities Capabilities =>
-        ProviderCapabilities.Charge |
-        ProviderCapabilities.Refund |
-        ProviderCapabilities.PartialRefund |
-        ProviderCapabilities.Payout |
-        ProviderCapabilities.Webhook |
-        ProviderCapabilities.CrossBorder |
-        ProviderCapabilities.Settlement |
-        ProviderCapabilities.Idempotency |
-        ProviderCapabilities.TypedWebhooks;
 
     /// <summary>Construct the provider. Designed to be registered via DI.</summary>
     public BricsPayPaymentProvider(
         HttpClient httpClient,
         IOptions<BricsPayOptions> options,
-        ICurrencyExchangeService exchangeService,
-        ILogger<BricsPayPaymentProvider> logger,
-        IBhenguDistributedCache? cache = null)
+        ILogger<BricsPayPaymentProvider> logger)
         : base(logger)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _exchangeService = exchangeService ?? throw new ArgumentNullException(nameof(exchangeService));
-        _cache = cache ?? new InMemoryBhenguDistributedCache();
 
-        if (string.IsNullOrWhiteSpace(_options.MerchantId))
-            throw new ProviderConfigurationException(ProviderName, $"{nameof(BricsPayOptions.MerchantId)} is required");
-        if (string.IsNullOrWhiteSpace(_options.SecretKey))
-            throw new ProviderConfigurationException(ProviderName, $"{nameof(BricsPayOptions.SecretKey)} is required");
+        if (string.IsNullOrWhiteSpace(_options.TerminalId))
+            throw new ProviderConfigurationException(ProviderName, $"{nameof(BricsPayOptions.TerminalId)} is required");
+        if (string.IsNullOrWhiteSpace(_options.BaseUrl))
+            throw new ProviderConfigurationException(ProviderName, $"{nameof(BricsPayOptions.BaseUrl)} is required (provisioned per terminal at onboarding)");
+        if (string.IsNullOrWhiteSpace(_options.PrivateKeyPem))
+            throw new ProviderConfigurationException(ProviderName, $"{nameof(BricsPayOptions.PrivateKeyPem)} is required to sign requests");
 
-        _baseUrl = _options.UseSandbox
-            ? (_options.SandboxUrl ?? "https://sandbox.bricspay.org/api/v1")
-            : (_options.BaseUrl ?? "https://api.bricspay.org/api/v1");
+        _baseUrl = _options.BaseUrl.TrimEnd('/');
     }
 
     /// <inheritdoc/>
-    public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
+    public Task<QrCode> GenerateQrAsync(QrCodeRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return RunChargeAsync(request.Currency, async () =>
+        return RunOperationAsync("generate_qr", () => GenerateQrCoreAsync(request, ct), ct);
+    }
+
+    private async Task<QrCode> GenerateQrCoreAsync(QrCodeRequest request, CancellationToken ct)
+    {
+        if (request.Amount is not { } amount)
+            throw new BhenguPaymentException(ProviderName,
+                "BRICS Pay requires a fixed amount — amount-less (static) QR codes are not supported by the e-commerce protocol.");
+        if (string.IsNullOrWhiteSpace(request.PayerIdentifier))
+            throw new BhenguPaymentException(ProviderName,
+                "BRICS Pay requires the buyer's SHA-256(IP + User-Agent) supplied via QrCodeRequest.PayerIdentifier (the 'User' field).");
+
+        var requestBody = new CreateTransactionBody
         {
-            var cached = await TryGetCachedAsync<PaymentResponse>(request.IdempotencyKey, "charge", ct).ConfigureAwait(false);
-            if (cached is not null) return cached;
+            Pos = _options.TerminalId,
+            Sequence = request.MerchantReference,
+            Amount = amount.ToString(CultureInfo.InvariantCulture),
+            User = request.PayerIdentifier,
+            Callback = _options.CallbackUrl,
+            CSS = _options.CssUrl,
+            Return = _options.ReturnUrl,
+            TTL = ResolveTtl(request.ExpiresAt)
+        };
 
-            var sourceCurrency = ParseCurrency(request.Currency);
-            var targetCurrency = request.Metadata?.TryGetValue("target_currency", out var tc) == true
-                ? ParseCurrency(tc)
-                : sourceCurrency;
+        var json = JsonSerializer.Serialize(requestBody, s_json);
+        var url = $"{_baseUrl}/ia/api/?signature={Uri.EscapeDataString(BricsPaySigner.Sign(json, _options))}";
 
-            ConversionResult? conversion = null;
-            if (sourceCurrency != targetCurrency)
-            {
-                conversion = await _exchangeService.LockRateAsync(request.Amount, sourceCurrency, targetCurrency, ct: ct).ConfigureAwait(false);
-                Logger.LogInformation("Currency conversion {Amount} {From} -> {Final} {To} @ {Rate}",
-                    request.Amount, sourceCurrency, conversion.FinalAmount, targetCurrency, conversion.ExchangeRate);
-            }
+        var responseBody = await SendAsync(HttpMethod.Post, url, json, ct, "GenerateQr").ConfigureAwait(false);
+        var created = JsonSerializer.Deserialize<CreateTransactionResponse>(responseBody, s_json);
 
-            var transactionId = request.IdempotencyKey ?? GenerateTransactionId();
-            var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        if (string.IsNullOrWhiteSpace(created?.URL))
+            throw new BhenguPaymentException(ProviderName, "BRICS Pay did not return a payment-page URL.");
 
-            var requestBody = new BricsPayChargeRequest
-            {
-                MerchantId = _options.MerchantId,
-                TransactionId = transactionId,
-                PaymentMethodToken = request.PaymentMethodToken,
-                Amount = conversion?.FinalAmount ?? request.Amount,
-                Currency = targetCurrency.ToString(),
-                SourceCurrency = sourceCurrency.ToString(),
-                SourceAmount = request.Amount,
-                ExchangeRate = conversion?.ExchangeRate ?? 1m,
-                QuoteId = conversion?.QuoteId,
-                Description = request.Description,
-                Metadata = request.Metadata,
-                Timestamp = timestamp
-            };
+        Logger.LogInformation("BRICS Pay transaction created: sequence={Sequence} amount={Amount} {Currency}",
+            request.MerchantReference, amount, request.Currency);
 
-            var body = await SendSignedRequestAsync($"{_baseUrl}/payments", requestBody, timestamp, request.IdempotencyKey, ct).ConfigureAwait(false);
-            var result = JsonSerializer.Deserialize<BricsPayApiResponse>(body, s_jsonOptions);
+        return new QrCode
+        {
+            Reference = request.MerchantReference,
+            Format = QrFormat.Payload,
+            Payload = created.URL,
+            Amount = amount,
+            Currency = request.Currency,
+            ExpiresAt = request.ExpiresAt
+        };
+    }
 
-            var pr = new PaymentResponse
-            {
-                GatewayReference = result?.PaymentId ?? transactionId,
-                Status = MapStatus(result?.Status ?? "pending"),
-                Amount = conversion?.FinalAmount ?? request.Amount,
-                Currency = targetCurrency.ToString(),
-                ProcessedAt = DateTime.UtcNow,
-                Message = result?.Message
-            };
-
-            await TrySetCachedAsync(request.IdempotencyKey, "charge", pr, ct).ConfigureAwait(false);
-            return pr;
+    /// <inheritdoc/>
+    public Task<PaymentStatus> GetQrStatusAsync(string qrReference, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(qrReference);
+        return RunOperationAsync("get_qr_status", async () =>
+        {
+            var status = await FetchStatusAsync(qrReference, ct).ConfigureAwait(false);
+            return status.Status;
         }, ct);
     }
 
-    /// <inheritdoc/>
-    public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
+    /// <summary>
+    /// Fetch the full transaction status for a previously-created QR, keyed by its <c>Sequence</c>
+    /// (the <see cref="QrCodeRequest.MerchantReference"/> you passed to <see cref="GenerateQrAsync"/>).
+    /// </summary>
+    public Task<BricsPayTransactionStatus> GetTransactionAsync(string sequence, CancellationToken ct = default)
     {
-        ArgumentNullException.ThrowIfNull(request);
-        return RunRefundAsync(request.GatewayReference, async () =>
+        ArgumentException.ThrowIfNullOrEmpty(sequence);
+        return RunOperationAsync("get_transaction", () => FetchStatusAsync(sequence, ct), ct);
+    }
+
+    private async Task<BricsPayTransactionStatus> FetchStatusAsync(string sequence, CancellationToken ct)
+    {
+        // The signed message for a GET is the query parameters as they appear in the URL.
+        var query = $"pos={Uri.EscapeDataString(_options.TerminalId)}&sequence={Uri.EscapeDataString(sequence)}";
+        var url = $"{_baseUrl}/ia/get/?{query}&signature={Uri.EscapeDataString(BricsPaySigner.Sign(query, _options))}";
+
+        var body = await SendAsync(HttpMethod.Get, url, null, ct, "GetTransaction").ConfigureAwait(false);
+        var dto = JsonSerializer.Deserialize<TransactionStatusResponse>(body, s_json)
+                  ?? throw new BhenguPaymentException(ProviderName, "BRICS Pay returned an unparseable status response.");
+        return MapStatus(dto);
+    }
+
+    /// <summary>
+    /// Full or partial refund of a settled BRICS Pay transaction.
+    /// </summary>
+    /// <param name="originalTransaction">The <c>Transaction</c> number returned by the original payment.</param>
+    /// <param name="refundSequence">A NEW unique per-terminal operation number for this refund (not the original's Sequence).</param>
+    /// <param name="amount">Refund amount; must not exceed the original.</param>
+    public Task<BricsPayTransactionStatus> RefundAsync(string originalTransaction, string refundSequence, decimal amount, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(originalTransaction);
+        ArgumentException.ThrowIfNullOrEmpty(refundSequence);
+        return RunOperationAsync("refund", async () =>
         {
-            var cached = await TryGetCachedAsync<RefundResponse>(request.IdempotencyKey, "refund", ct).ConfigureAwait(false);
-            if (cached is not null) return cached;
-
-            var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            var requestBody = new BricsPayRefundRequest
+            var requestBody = new RefundBody
             {
-                MerchantId = _options.MerchantId,
-                OriginalPaymentId = request.GatewayReference,
-                RefundAmount = request.Amount,
-                Reason = request.Reason,
-                Timestamp = timestamp
+                POS = _options.TerminalId,
+                Sequence = refundSequence,
+                Reference = originalTransaction,
+                Amount = amount.ToString(CultureInfo.InvariantCulture)
             };
 
-            var body = await SendSignedRequestAsync($"{_baseUrl}/refunds", requestBody, timestamp, request.IdempotencyKey, ct).ConfigureAwait(false);
-            var result = JsonSerializer.Deserialize<BricsPayApiResponse>(body, s_jsonOptions);
+            var json = JsonSerializer.Serialize(requestBody, s_json);
+            var url = $"{_baseUrl}/ia/refund?signature={Uri.EscapeDataString(BricsPaySigner.Sign(json, _options))}";
 
-            var rr = new RefundResponse
-            {
-                GatewayReference = result?.PaymentId ?? $"REFUND_{Guid.NewGuid():N}",
-                Amount = request.Amount,
-                Status = MapStatus(result?.Status ?? "pending"),
-                ProcessedAt = DateTime.UtcNow,
-                Message = result?.Message
-            };
-
-            await TrySetCachedAsync(request.IdempotencyKey, "refund", rr, ct).ConfigureAwait(false);
-            return rr;
+            var responseBody = await SendAsync(HttpMethod.Post, url, json, ct, "Refund").ConfigureAwait(false);
+            var dto = JsonSerializer.Deserialize<TransactionStatusResponse>(responseBody, s_json)
+                      ?? throw new BhenguPaymentException(ProviderName, "BRICS Pay returned an unparseable refund response.");
+            return MapStatus(dto);
         }, ct);
     }
 
-    /// <inheritdoc/>
-    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(request);
-        return RunPayoutAsync(request.Currency, async () =>
-        {
-            var cached = await TryGetCachedAsync<PayoutResponse>(request.IdempotencyKey, "payout", ct).ConfigureAwait(false);
-            if (cached is not null) return cached;
-
-            var transactionId = request.IdempotencyKey ?? GenerateTransactionId();
-            var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            var requestBody = new BricsPayPayoutRequest
-            {
-                MerchantId = _options.MerchantId,
-                TransactionId = transactionId,
-                DestinationToken = request.DestinationToken,
-                Amount = request.Amount,
-                Currency = request.Currency,
-                Description = request.Description,
-                Timestamp = timestamp
-            };
-
-            var body = await SendSignedRequestAsync($"{_baseUrl}/payouts", requestBody, timestamp, request.IdempotencyKey, ct).ConfigureAwait(false);
-            var result = JsonSerializer.Deserialize<BricsPayApiResponse>(body, s_jsonOptions);
-
-            var pr = new PayoutResponse
-            {
-                GatewayReference = result?.PaymentId ?? transactionId,
-                Status = MapStatus(result?.Status ?? "pending"),
-                Amount = request.Amount,
-                Currency = request.Currency,
-                ProcessedAt = DateTime.UtcNow
-            };
-
-            await TrySetCachedAsync(request.IdempotencyKey, "payout", pr, ct).ConfigureAwait(false);
-            return pr;
-        }, ct);
-    }
-
-    /// <inheritdoc/>
-    public bool VerifyWebhookSignature(string payload, string signature)
+    /// <summary>
+    /// Parse a BRICS Pay callback body. The captured protocol does not specify callback signing, so treat
+    /// the result as a signal to confirm the authoritative state via <see cref="GetTransactionAsync"/> —
+    /// do not trust these fields on their own. Returns null if the payload cannot be parsed.
+    /// </summary>
+    public BricsPayCallback? ParseCallback(string payload)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        ArgumentException.ThrowIfNullOrEmpty(signature);
-
-        return RunWebhookVerify(() =>
+        try
         {
-            if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
-            {
-                Logger.LogWarning("BRICS Pay WebhookSecret not configured — signature verification cannot succeed.");
-                return false;
-            }
-            // BRICS Pay signs the raw payload with HMAC-SHA256 and Base64-encodes the digest.
-            return SignatureHelpers.VerifyHmacSha256(payload, signature, _options.WebhookSecret, SignatureHelpers.Encoding.Base64);
-        });
-    }
+            var dto = JsonSerializer.Deserialize<CallbackBody>(payload, s_json);
+            if (dto is null) return null;
 
-    /// <inheritdoc/>
-    public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(payload);
-        return RunOperationAsync("parse_webhook", () =>
+            return new BricsPayCallback
+            {
+                Pos = dto.POS,
+                Sequence = dto.Sequence,
+                Transaction = dto.Transaction,
+                Paid = dto.Paid,
+                Processed = dto.Processed,
+                Status = MapPaymentStatus(dto.Paid, dto.Processed),
+                Amount = ParseAmount(dto.Amount),
+                CurrencyCode = dto.Currency?.Code ?? 0
+            };
+        }
+        catch (JsonException ex)
         {
-            try
-            {
-                var webhookEvent = JsonSerializer.Deserialize<BricsPayWebhookPayload>(payload, s_jsonOptions);
-                if (webhookEvent is null) return Task.FromResult<WebhookEvent?>(null);
-
-                var typed = MapWebhookEvent(webhookEvent);
-                return Task.FromResult(typed);
-            }
-            catch (Exception ex)
-            {
-                Logger.LogError(ex, "Failed to parse BRICS Pay webhook payload");
-                return Task.FromResult<WebhookEvent?>(null);
-            }
-        }, ct);
-    }
-
-    private static WebhookEvent? MapWebhookEvent(BricsPayWebhookPayload evt)
-    {
-        if (string.IsNullOrEmpty(evt.PaymentId)) return null;
-
-        var amount = evt.Amount;
-        var currency = string.IsNullOrEmpty(evt.Currency) ? "ZAR" : evt.Currency;
-        var category = evt.EventType?.ToLowerInvariant();
-
-        switch (category)
-        {
-            case "payment.completed":
-            case "payment.success":
-                return new ChargeSucceededEvent
-                {
-                    GatewayReference = evt.PaymentId,
-                    Status = PaymentStatus.Completed,
-                    EventType = evt.EventType,
-                    Category = WebhookEventCategory.ChargeSucceeded,
-                    Amount = amount,
-                    Currency = currency
-                };
-
-            case "payment.failed":
-                return new ChargeFailedEvent
-                {
-                    GatewayReference = evt.PaymentId,
-                    Status = PaymentStatus.Failed,
-                    EventType = evt.EventType,
-                    Category = WebhookEventCategory.ChargeFailed,
-                    Amount = amount,
-                    Currency = currency,
-                    FailureCode = evt.Status,
-                    FailureMessage = evt.Status
-                };
-
-            case "refund.completed":
-            case "refund.success":
-                return new RefundSucceededEvent
-                {
-                    GatewayReference = evt.PaymentId,
-                    Status = PaymentStatus.Refunded,
-                    EventType = evt.EventType,
-                    Category = WebhookEventCategory.RefundSucceeded,
-                    RefundReference = evt.PaymentId,
-                    Amount = amount,
-                    Currency = currency,
-                    IsPartial = false
-                };
-
-            case "payout.completed":
-            case "payout.success":
-                return new PayoutCompletedEvent
-                {
-                    GatewayReference = evt.PaymentId,
-                    Status = PaymentStatus.Completed,
-                    EventType = evt.EventType,
-                    Category = WebhookEventCategory.PayoutCompleted,
-                    PayoutReference = evt.PaymentId,
-                    Amount = amount,
-                    Currency = currency
-                };
-
-            case "payout.failed":
-                return new PayoutFailedEvent
-                {
-                    GatewayReference = evt.PaymentId,
-                    Status = PaymentStatus.Failed,
-                    EventType = evt.EventType,
-                    Category = WebhookEventCategory.PayoutFailed,
-                    PayoutReference = evt.PaymentId,
-                    Amount = amount,
-                    Currency = currency,
-                    FailureCode = evt.Status,
-                    FailureMessage = evt.Status
-                };
-
-            case "settlement.completed":
-                return new SettlementCompletedEvent
-                {
-                    GatewayReference = evt.PaymentId,
-                    Status = PaymentStatus.Completed,
-                    EventType = evt.EventType,
-                    Category = WebhookEventCategory.SettlementCompleted,
-                    SettlementReference = evt.PaymentId,
-                    NetAmount = amount,
-                    Currency = currency
-                };
-
-            default:
-                var status = MapStatus(evt.Status ?? string.Empty);
-                return new WebhookEvent
-                {
-                    GatewayReference = evt.PaymentId,
-                    Status = status,
-                    EventType = evt.EventType,
-                    Category = WebhookEventCategory.Unknown
-                };
+            Logger.LogError(ex, "Failed to parse BRICS Pay callback payload");
+            return null;
         }
     }
 
-    private async Task<string> SendSignedRequestAsync(string url, object body, long timestamp, string? idempotencyKey, CancellationToken ct)
+    private byte? ResolveTtl(DateTime? expiresAt)
     {
-        var json = JsonSerializer.Serialize(body, s_jsonOptions);
-        var signature = GenerateSignature(json, timestamp);
-
-        using var req = new HttpRequestMessage(HttpMethod.Post, url)
+        if (expiresAt is { } exp)
         {
-            Content = new StringContent(json, Encoding.UTF8, "application/json")
-        };
-        req.Headers.Add("X-Merchant-Id", _options.MerchantId);
-        req.Headers.Add("X-Signature", signature);
-        req.Headers.Add("X-Timestamp", timestamp.ToString(CultureInfo.InvariantCulture));
-        if (!string.IsNullOrWhiteSpace(idempotencyKey))
-            req.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
+            var minutes = (int)Math.Ceiling((exp - DateTime.UtcNow).TotalMinutes);
+            if (minutes < 1) minutes = 1;
+            if (minutes > 255) minutes = 255;
+            return (byte)minutes;
+        }
+        return _options.DefaultTtlMinutes;
+    }
 
-        var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
+    private async Task<string> SendAsync(HttpMethod method, string url, string? jsonBody, CancellationToken ct, string operation)
+    {
+        using var req = new HttpRequestMessage(method, url);
+        if (jsonBody is not null)
+            req.Content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
+
+        HttpResponseMessage response;
+        try
+        {
+            response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
+        }
+        catch (HttpRequestException ex)
+        {
+            throw new ProviderUnavailableException(ProviderName, "BRICS Pay request failed", ex);
+        }
+
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -383,7 +250,8 @@ public sealed class BricsPayPaymentProvider : BhenguProviderBase, IPaymentGatewa
 
         if (!response.IsSuccessStatusCode)
         {
-            Logger.LogError("BRICS Pay request failed: {StatusCode} {Body}", response.StatusCode, responseBody);
+            Logger.LogError("BRICS Pay {Operation} failed: {StatusCode} {Body}", operation, response.StatusCode, responseBody);
+            // 401 = signature rejected; other 4xx = request-level decline; 5xx/unknown = unavailable.
             if ((int)response.StatusCode is >= 400 and < 500)
                 throw new PaymentDeclinedException(ProviderName, ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture), responseBody);
             throw new ProviderUnavailableException(ProviderName, $"HTTP {(int)response.StatusCode}: {responseBody}");
@@ -392,98 +260,104 @@ public sealed class BricsPayPaymentProvider : BhenguProviderBase, IPaymentGatewa
         return responseBody;
     }
 
-    private string GenerateSignature(string serializedBody, long timestamp)
+    private static BricsPayTransactionStatus MapStatus(TransactionStatusResponse dto) => new()
     {
-        var payload = serializedBody + timestamp + _options.SecretKey;
-        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(payload));
-        return Convert.ToBase64String(hash);
-    }
+        Transaction = dto.Transaction,
+        Paid = dto.Paid,
+        Processed = dto.Processed,
+        Status = MapPaymentStatus(dto.Paid, dto.Processed),
+        Amount = ParseAmount(dto.Amount),
+        CurrencyCode = dto.Currency?.Code ?? 0,
+        CurrencyName = dto.Currency?.Name,
+        CreatedUtc = ParseDate(dto.Time?.Created),
+        ProcessedUtc = ParseDate(dto.Time?.Processed),
+        TimeoutUtc = ParseDate(dto.Time?.Timeout),
+        ErrorCode = dto.Error?.Code,
+        ErrorMessage = dto.Error?.Message
+    };
 
-    private async Task<T?> TryGetCachedAsync<T>(string? idempotencyKey, string operation, CancellationToken ct) where T : class
+    private static PaymentStatus MapPaymentStatus(bool paid, bool processed) => (paid, processed) switch
     {
-        if (string.IsNullOrWhiteSpace(idempotencyKey)) return null;
-        return await _cache.GetAsync<T>(BuildCacheKey(idempotencyKey, operation), ct).ConfigureAwait(false);
-    }
-
-    private async Task TrySetCachedAsync<T>(string? idempotencyKey, string operation, T value, CancellationToken ct) where T : class
-    {
-        if (string.IsNullOrWhiteSpace(idempotencyKey)) return;
-        await _cache.SetAsync(BuildCacheKey(idempotencyKey, operation), value, s_idempotencyTtl, ct).ConfigureAwait(false);
-    }
-
-    private static string BuildCacheKey(string idempotencyKey, string operation)
-    {
-        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(idempotencyKey))).ToLowerInvariant();
-        return $"bricspay:idem:{operation}:{hash}";
-    }
-
-    private static string GenerateTransactionId() =>
-        $"BRICS_{DateTime.UtcNow:yyyyMMddHHmmss}_{Guid.NewGuid():N}"[..32];
-
-    private static PaymentStatus MapStatus(string raw) => raw.ToLowerInvariant() switch
-    {
-        "success" or "completed" or "settled" => PaymentStatus.Completed,
-        "pending" or "processing" => PaymentStatus.Pending,
-        "failed" or "declined" or "error" => PaymentStatus.Failed,
-        "cancelled" or "voided" => PaymentStatus.Cancelled,
-        "refunded" => PaymentStatus.Refunded,
+        (true, true) => PaymentStatus.Completed,
+        (false, true) => PaymentStatus.Failed,
         _ => PaymentStatus.Pending
     };
 
-    private static BricsCurrency ParseCurrency(string currency) =>
-        Enum.TryParse<BricsCurrency>(currency, ignoreCase: true, out var result) ? result : BricsCurrency.ZAR;
+    private static decimal ParseAmount(string? raw) =>
+        decimal.TryParse(raw, NumberStyles.Number, CultureInfo.InvariantCulture, out var v) ? v : 0m;
 
-    private sealed record BricsPayChargeRequest
+    private static DateTime? ParseDate(string? raw) =>
+        DateTime.TryParse(raw, CultureInfo.InvariantCulture,
+            DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out var v) ? v : null;
+
+    // ---- wire models (BRICS Pay uses PascalCase JSON keys) ----
+
+    private sealed record CreateTransactionBody
     {
-        public string? MerchantId { get; init; }
-        public string? TransactionId { get; init; }
-        public string? PaymentMethodToken { get; init; }
-        public decimal Amount { get; init; }
-        public string? Currency { get; init; }
-        public string? SourceCurrency { get; init; }
-        public decimal SourceAmount { get; init; }
-        public decimal ExchangeRate { get; init; }
-        public string? QuoteId { get; init; }
-        public string? Description { get; init; }
-        public IReadOnlyDictionary<string, string>? Metadata { get; init; }
-        public long Timestamp { get; init; }
+        public string? Pos { get; init; }
+        public string? Sequence { get; init; }
+        public string? Amount { get; init; }
+        public string? User { get; init; }
+        public string? Callback { get; init; }
+        public string? CSS { get; init; }
+        public string? Return { get; init; }
+        public byte? TTL { get; init; }
     }
 
-    private sealed record BricsPayRefundRequest
+    private sealed record CreateTransactionResponse
     {
-        public string? MerchantId { get; init; }
-        public string? OriginalPaymentId { get; init; }
-        public decimal RefundAmount { get; init; }
-        public string? Reason { get; init; }
-        public long Timestamp { get; init; }
+        public string? URL { get; init; }
     }
 
-    private sealed record BricsPayPayoutRequest
+    private sealed record RefundBody
     {
-        public string? MerchantId { get; init; }
-        public string? TransactionId { get; init; }
-        public string? DestinationToken { get; init; }
-        public decimal Amount { get; init; }
-        public string? Currency { get; init; }
-        public string? Description { get; init; }
-        public long Timestamp { get; init; }
+        public string? POS { get; init; }
+        public string? Sequence { get; init; }
+        public string? Reference { get; init; }
+        public string? Amount { get; init; }
     }
 
-    // Responses come back from BRICS Pay in PascalCase, so override the global snake_case policy
-    // explicitly on these read-only shapes.
-    private sealed record BricsPayApiResponse
+    private sealed record TransactionStatusResponse
     {
-        [JsonPropertyName("PaymentId")] public string? PaymentId { get; init; }
-        [JsonPropertyName("Status")] public string? Status { get; init; }
-        [JsonPropertyName("Message")] public string? Message { get; init; }
+        public string? Transaction { get; init; }
+        public bool Paid { get; init; }
+        public bool Processed { get; init; }
+        public string? Amount { get; init; }
+        public CurrencyDto? Currency { get; init; }
+        public TimeDto? Time { get; init; }
+        public string? Reference { get; init; }
+        public ErrorDto? Error { get; init; }
     }
 
-    private sealed record BricsPayWebhookPayload
+    private sealed record CallbackBody
     {
-        [JsonPropertyName("EventType")] public string? EventType { get; init; }
-        [JsonPropertyName("PaymentId")] public string? PaymentId { get; init; }
-        [JsonPropertyName("Status")] public string? Status { get; init; }
-        [JsonPropertyName("Amount")] public decimal Amount { get; init; }
-        [JsonPropertyName("Currency")] public string? Currency { get; init; }
+        public string? POS { get; init; }
+        public string? Sequence { get; init; }
+        public string? Transaction { get; init; }
+        public bool Paid { get; init; }
+        public bool Processed { get; init; }
+        public string? Amount { get; init; }
+        public CurrencyDto? Currency { get; init; }
+    }
+
+    private sealed record CurrencyDto
+    {
+        public int Code { get; init; }
+        public int Precision { get; init; }
+        public string? Name { get; init; }
+        public string? Symbol { get; init; }
+    }
+
+    private sealed record TimeDto
+    {
+        public string? Created { get; init; }
+        public string? Processed { get; init; }
+        public string? Timeout { get; init; }
+    }
+
+    private sealed record ErrorDto
+    {
+        public string? Code { get; init; }
+        public string? Message { get; init; }
     }
 }

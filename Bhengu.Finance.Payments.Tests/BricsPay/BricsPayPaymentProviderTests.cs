@@ -2,278 +2,254 @@
 
 using System.Net;
 using System.Security.Cryptography;
-using System.Text;
 using Bhengu.Finance.Payments.BricsPay.Configuration;
-using Bhengu.Finance.Payments.BricsPay.Currency;
 using Bhengu.Finance.Payments.BricsPay.Providers;
 using Bhengu.Finance.Payments.Core.Exceptions;
 using Bhengu.Finance.Payments.Core.Models;
+using Bhengu.Finance.Payments.Core.Models.QrCode;
 using Bhengu.Finance.Payments.Tests.TestHelpers;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
-using Moq;
 using Xunit;
 
 namespace Bhengu.Finance.Payments.Tests.BricsPay;
 
+/// <summary>
+/// Tests the rebuilt BRICS Pay QR (Internet Acquiring) provider against its published protocol:
+/// create transaction (POST /ia/api), status (GET /ia/get), refund (POST /ia/refund), callback parsing,
+/// and asymmetric signing. See BRICS_PAY_API_REFERENCE.md.
+/// </summary>
 public class BricsPayPaymentProviderTests
 {
-    private static BricsPayPaymentProvider CreateProvider(StubHttpMessageHandler handler, Mock<ICurrencyExchangeService>? exchangeMock = null, BricsPayOptions? opts = null)
+    private static string TestKeyPem()
     {
+        using var ec = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        return ec.ExportPkcs8PrivateKeyPem();
+    }
+
+    private static (BricsPayPaymentProvider Provider, List<(HttpMethod Method, string Uri, string Body)> Requests)
+        MakeProvider(Func<HttpRequestMessage, HttpResponseMessage> respond, BricsPayOptions? opts = null)
+    {
+        var requests = new List<(HttpMethod, string, string)>();
+        var handler = new StubHttpMessageHandler((req, _) =>
+        {
+            var body = req.Content?.ReadAsStringAsync().GetAwaiter().GetResult() ?? string.Empty;
+            requests.Add((req.Method, req.RequestUri!.ToString(), body));
+            return respond(req);
+        });
+
         opts ??= new BricsPayOptions
         {
-            MerchantId = "BRICS_TEST",
-            SecretKey = "secret",
-            WebhookSecret = "webhook-secret",
-            UseSandbox = true
+            TerminalId = "POS-1",
+            BaseUrl = "https://terminal.brics.example",
+            PrivateKeyPem = TestKeyPem()
         };
-        var http = new HttpClient(handler);
-        var exchange = exchangeMock ?? new Mock<ICurrencyExchangeService>();
-        return new BricsPayPaymentProvider(http, Options.Create(opts), exchange.Object, NullLogger<BricsPayPaymentProvider>.Instance);
+
+        var provider = new BricsPayPaymentProvider(
+            new HttpClient(handler), Options.Create(opts), NullLogger<BricsPayPaymentProvider>.Instance);
+        return (provider, requests);
+    }
+
+    private static QrCodeRequest SampleRequest() => new()
+    {
+        Amount = 100m,
+        Currency = "ZAR",
+        Description = "Test order",
+        MerchantReference = "ORDER-1",
+        PayerIdentifier = "deadbeef"   // stands in for SHA256(IP + User-Agent)
+    };
+
+    [Fact]
+    public void Constructor_Throws_WhenTerminalIdMissing()
+    {
+        var ex = Assert.Throws<ProviderConfigurationException>(() => new BricsPayPaymentProvider(
+            new HttpClient(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK))),
+            Options.Create(new BricsPayOptions { BaseUrl = "https://x", PrivateKeyPem = TestKeyPem() }),
+            NullLogger<BricsPayPaymentProvider>.Instance));
+        Assert.Contains("TerminalId", ex.Message);
     }
 
     [Fact]
-    public void Constructor_Throws_WhenMerchantIdMissing()
+    public void Constructor_Throws_WhenBaseUrlMissing()
     {
-        var handler = new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK));
-        var ex = Assert.Throws<ProviderConfigurationException>(() =>
-            new BricsPayPaymentProvider(
-                new HttpClient(handler),
-                Options.Create(new BricsPayOptions { SecretKey = "x" }),
-                new Mock<ICurrencyExchangeService>().Object,
-                NullLogger<BricsPayPaymentProvider>.Instance));
-        Assert.Contains("MerchantId", ex.Message);
+        var ex = Assert.Throws<ProviderConfigurationException>(() => new BricsPayPaymentProvider(
+            new HttpClient(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK))),
+            Options.Create(new BricsPayOptions { TerminalId = "POS-1", PrivateKeyPem = TestKeyPem() }),
+            NullLogger<BricsPayPaymentProvider>.Instance));
+        Assert.Contains("BaseUrl", ex.Message);
     }
 
     [Fact]
-    public void Constructor_Throws_WhenSecretKeyMissing()
+    public void Constructor_Throws_WhenPrivateKeyMissing()
     {
-        var handler = new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK));
-        Assert.Throws<ProviderConfigurationException>(() =>
-            new BricsPayPaymentProvider(
-                new HttpClient(handler),
-                Options.Create(new BricsPayOptions { MerchantId = "x" }),
-                new Mock<ICurrencyExchangeService>().Object,
-                NullLogger<BricsPayPaymentProvider>.Instance));
+        var ex = Assert.Throws<ProviderConfigurationException>(() => new BricsPayPaymentProvider(
+            new HttpClient(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK))),
+            Options.Create(new BricsPayOptions { TerminalId = "POS-1", BaseUrl = "https://x" }),
+            NullLogger<BricsPayPaymentProvider>.Instance));
+        Assert.Contains("PrivateKeyPem", ex.Message);
     }
 
     [Fact]
-    public async Task ProcessPaymentAsync_SameCurrency_DoesNotInvokeExchange()
+    public async Task GenerateQrAsync_CreatesTransaction_ReturnsPaymentUrl_AndSigns()
     {
-        var exchange = new Mock<ICurrencyExchangeService>();
-        var handler = new StubHttpMessageHandler((_, _) =>
-            StubHttpMessageHandler.Json(HttpStatusCode.OK, """
-                {"PaymentId":"BRICS-123","Status":"completed","Message":"ok"}
-                """));
+        var (provider, requests) = MakeProvider(_ =>
+            StubHttpMessageHandler.Json(HttpStatusCode.OK, """{"URL":"https://pay.brics.example/qr/abc"}"""));
 
-        var provider = CreateProvider(handler, exchange);
-        var response = await provider.ProcessPaymentAsync(new PaymentRequest
-        {
-            PaymentMethodToken = "token-1",
-            Amount = 100m,
-            Currency = "ZAR",
-            Description = "test"
-        });
+        var qr = await provider.GenerateQrAsync(SampleRequest());
 
-        Assert.Equal("BRICS-123", response.GatewayReference);
-        Assert.Equal(PaymentStatus.Completed, response.Status);
-        Assert.Equal("ZAR", response.Currency);
-        exchange.Verify(e => e.LockRateAsync(It.IsAny<decimal>(), It.IsAny<BricsCurrency>(), It.IsAny<BricsCurrency>(), It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Never);
+        Assert.Equal("ORDER-1", qr.Reference);
+        Assert.Equal(QrFormat.Payload, qr.Format);
+        Assert.Equal("https://pay.brics.example/qr/abc", qr.Payload);
+        Assert.Equal(100m, qr.Amount);
+        Assert.Equal("ZAR", qr.Currency);
+
+        var req = Assert.Single(requests);
+        Assert.Equal(HttpMethod.Post, req.Method);
+        Assert.Contains("/ia/api/", req.Uri);
+        Assert.Contains("signature=", req.Uri);
+        Assert.Contains("\"Pos\":\"POS-1\"", req.Body);
+        Assert.Contains("\"Sequence\":\"ORDER-1\"", req.Body);
+        Assert.Contains("\"User\":\"deadbeef\"", req.Body);
     }
 
     [Fact]
-    public async Task ProcessPaymentAsync_CrossCurrency_LocksRateAndUsesConvertedAmount()
+    public async Task GenerateQrAsync_Throws_WhenAmountMissing_AndMakesNoCall()
     {
-        var exchange = new Mock<ICurrencyExchangeService>();
-        exchange.Setup(e => e.LockRateAsync(100m, BricsCurrency.ZAR, BricsCurrency.INR, It.IsAny<int>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new ConversionResult
-            {
-                OriginalAmount = 100m,
-                OriginalCurrency = BricsCurrency.ZAR,
-                TargetCurrency = BricsCurrency.INR,
-                ExchangeRate = 4.5m,
-                FinalAmount = 450m,
-                Fee = 0m,
-                QuoteId = "QID-1",
-                QuoteExpiry = DateTime.UtcNow.AddMinutes(15)
-            });
-
-        var handler = new StubHttpMessageHandler((_, _) =>
-            StubHttpMessageHandler.Json(HttpStatusCode.OK, """
-                {"PaymentId":"BRICS-X","Status":"completed"}
-                """));
-
-        var provider = CreateProvider(handler, exchange);
-        var response = await provider.ProcessPaymentAsync(new PaymentRequest
-        {
-            PaymentMethodToken = "tok",
-            Amount = 100m,
-            Currency = "ZAR",
-            Description = "cross-currency test",
-            Metadata = new Dictionary<string, string> { ["target_currency"] = "INR" }
-        });
-
-        Assert.Equal("INR", response.Currency);
-        Assert.Equal(450m, response.Amount);
-        exchange.Verify(e => e.LockRateAsync(100m, BricsCurrency.ZAR, BricsCurrency.INR, It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Once);
+        var (provider, requests) = MakeProvider(_ => new HttpResponseMessage(HttpStatusCode.OK));
+        var ex = await Assert.ThrowsAsync<BhenguPaymentException>(() =>
+            provider.GenerateQrAsync(SampleRequest() with { Amount = null }));
+        Assert.Contains("amount", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(requests);
     }
 
     [Fact]
-    public async Task ProcessPaymentAsync_Throws429AsProviderRateLimitException()
+    public async Task GenerateQrAsync_Throws_WhenPayerIdentifierMissing_AndMakesNoCall()
     {
-        var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "rate limited"));
-        var provider = CreateProvider(handler);
-        await Assert.ThrowsAsync<ProviderRateLimitException>(() => provider.ProcessPaymentAsync(new PaymentRequest
-        {
-            PaymentMethodToken = "x",
-            Amount = 1m,
-            Currency = "ZAR",
-            Description = "d"
-        }));
+        var (provider, requests) = MakeProvider(_ => new HttpResponseMessage(HttpStatusCode.OK));
+        var ex = await Assert.ThrowsAsync<BhenguPaymentException>(() =>
+            provider.GenerateQrAsync(SampleRequest() with { PayerIdentifier = null }));
+        Assert.Contains("PayerIdentifier", ex.Message);
+        Assert.Empty(requests);
     }
 
     [Fact]
-    public async Task ProcessPaymentAsync_Throws4xxAsPaymentDeclinedException()
+    public async Task GetQrStatusAsync_PaidAndProcessed_ReturnsCompleted_AndSignsGet()
     {
-        var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.BadRequest, "declined"));
-        var provider = CreateProvider(handler);
-        await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.ProcessPaymentAsync(new PaymentRequest
-        {
-            PaymentMethodToken = "x", Amount = 1m, Currency = "ZAR", Description = "d"
-        }));
+        var (provider, requests) = MakeProvider(_ =>
+            StubHttpMessageHandler.Json(HttpStatusCode.OK,
+                """{"Transaction":"T-1","Paid":true,"Processed":true,"Amount":"100.00","Currency":{"Code":710,"Precision":2,"Name":"Rand","Symbol":"R"}}"""));
+
+        var status = await provider.GetQrStatusAsync("ORDER-1");
+
+        Assert.Equal(PaymentStatus.Completed, status);
+        var req = Assert.Single(requests);
+        Assert.Equal(HttpMethod.Get, req.Method);
+        Assert.Contains("/ia/get/", req.Uri);
+        Assert.Contains("pos=POS-1", req.Uri);
+        Assert.Contains("sequence=ORDER-1", req.Uri);
+        Assert.Contains("signature=", req.Uri);
     }
 
     [Fact]
-    public async Task ProcessPaymentAsync_WrapsHttpRequestExceptionAsProviderUnavailableException()
+    public async Task GetQrStatusAsync_NotProcessed_ReturnsPending()
     {
-        var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("network down"));
-        var provider = CreateProvider(handler);
-        await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.ProcessPaymentAsync(new PaymentRequest
-        {
-            PaymentMethodToken = "x", Amount = 1m, Currency = "ZAR", Description = "d"
-        }));
+        var (provider, _) = MakeProvider(_ =>
+            StubHttpMessageHandler.Json(HttpStatusCode.OK, """{"Paid":false,"Processed":false,"Amount":"100.00"}"""));
+        Assert.Equal(PaymentStatus.Pending, await provider.GetQrStatusAsync("ORDER-1"));
     }
 
     [Fact]
-    public async Task ProcessRefundAsync_ReturnsResponse_OnSuccess()
+    public async Task GetTransactionAsync_MapsRichStatus()
     {
-        var handler = new StubHttpMessageHandler((req, _) =>
-        {
-            Assert.Contains("refunds", req.RequestUri!.PathAndQuery);
-            return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
-                {"PaymentId":"BRICS-RF-1","Status":"refunded"}
-                """);
-        });
-        var provider = CreateProvider(handler);
-        var refund = await provider.ProcessRefundAsync(new RefundRequest
-        {
-            GatewayReference = "BRICS-123", Amount = 50m, Reason = "Customer requested"
-        });
-        Assert.Equal("BRICS-RF-1", refund.GatewayReference);
-        Assert.Equal(PaymentStatus.Refunded, refund.Status);
+        var (provider, _) = MakeProvider(_ =>
+            StubHttpMessageHandler.Json(HttpStatusCode.OK,
+                """{"Transaction":"T-9","Paid":true,"Processed":true,"Amount":"250.50","Currency":{"Code":710,"Precision":2,"Name":"South African Rand","Symbol":"R"},"Time":{"Created":"2026-06-21T08:00:00Z","Processed":"2026-06-21T08:01:00Z","Timeout":"2026-06-21T08:05:00Z"}}"""));
+
+        var s = await provider.GetTransactionAsync("ORDER-9");
+
+        Assert.Equal("T-9", s.Transaction);
+        Assert.True(s.Paid);
+        Assert.True(s.Processed);
+        Assert.Equal(PaymentStatus.Completed, s.Status);
+        Assert.Equal(250.50m, s.Amount);
+        Assert.Equal(710, s.CurrencyCode);
+        Assert.Equal("South African Rand", s.CurrencyName);
+        Assert.NotNull(s.ProcessedUtc);
     }
 
     [Fact]
-    public async Task ProcessPayoutAsync_ReturnsResponse_OnSuccess()
+    public async Task GetTransactionAsync_FailedAuth_ReturnsFailedWithError()
     {
-        var handler = new StubHttpMessageHandler((req, _) =>
-        {
-            Assert.Contains("payouts", req.RequestUri!.PathAndQuery);
-            return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
-                {"PaymentId":"BRICS-PO-1","Status":"completed"}
-                """);
-        });
-        var provider = CreateProvider(handler);
-        var payout = await provider.ProcessPayoutAsync(new PayoutRequest
-        {
-            DestinationToken = "dest-1", Amount = 200m, Currency = "ZAR", Description = "Payout to merchant"
-        });
-        Assert.Equal("BRICS-PO-1", payout.GatewayReference);
-        Assert.Equal(PaymentStatus.Completed, payout.Status);
+        var (provider, _) = MakeProvider(_ =>
+            StubHttpMessageHandler.Json(HttpStatusCode.OK,
+                """{"Paid":false,"Processed":true,"Amount":"100.00","Error":{"Code":"51","Message":"Insufficient funds"}}"""));
+
+        var s = await provider.GetTransactionAsync("ORDER-2");
+        Assert.Equal(PaymentStatus.Failed, s.Status);
+        Assert.Equal("51", s.ErrorCode);
+        Assert.Equal("Insufficient funds", s.ErrorMessage);
     }
 
     [Fact]
-    public void VerifyWebhookSignature_ReturnsTrue_ForValidSignature()
+    public async Task RefundAsync_PostsRefund_WithReferenceAndNewSequence()
     {
-        const string secret = "webhook-secret";
-        const string payload = """{"EventType":"payment.completed","PaymentId":"x"}""";
-        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
-        var validSig = Convert.ToBase64String(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload)));
-        var provider = CreateProvider(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
-        Assert.True(provider.VerifyWebhookSignature(payload, validSig));
+        var (provider, requests) = MakeProvider(_ =>
+            StubHttpMessageHandler.Json(HttpStatusCode.OK,
+                """{"Transaction":"RF-1","Paid":false,"Processed":true,"Amount":"50.00","Reference":"T-1"}"""));
+
+        var s = await provider.RefundAsync(originalTransaction: "T-1", refundSequence: "REFUND-1", amount: 50m);
+
+        Assert.Equal("RF-1", s.Transaction);
+        var req = Assert.Single(requests);
+        Assert.Equal(HttpMethod.Post, req.Method);
+        Assert.Contains("/ia/refund", req.Uri);
+        Assert.Contains("signature=", req.Uri);
+        Assert.Contains("\"Reference\":\"T-1\"", req.Body);
+        Assert.Contains("\"Sequence\":\"REFUND-1\"", req.Body);
+        Assert.Contains("\"Amount\":\"50\"", req.Body);
     }
 
     [Fact]
-    public void VerifyWebhookSignature_ReturnsFalse_ForTamperedSignature()
+    public void ParseCallback_ParsesBody_AndMapsStatus()
     {
-        var provider = CreateProvider(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
-        Assert.False(provider.VerifyWebhookSignature("anything", "tampered=="));
+        var (provider, _) = MakeProvider(_ => new HttpResponseMessage(HttpStatusCode.OK));
+        var cb = provider.ParseCallback(
+            """{"POS":"POS-1","Sequence":"ORDER-1","Transaction":"T-1","Paid":true,"Processed":true,"Amount":"100.00","Currency":{"Code":710}}""");
+
+        Assert.NotNull(cb);
+        Assert.Equal("POS-1", cb!.Pos);
+        Assert.Equal("ORDER-1", cb.Sequence);
+        Assert.Equal("T-1", cb.Transaction);
+        Assert.Equal(PaymentStatus.Completed, cb.Status);
+        Assert.Equal(100m, cb.Amount);
+        Assert.Equal(710, cb.CurrencyCode);
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ValidPayload_ReturnsNormalisedEvent()
+    public void ParseCallback_ReturnsNull_ForInvalidJson()
     {
-        var provider = CreateProvider(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
-        var evt = await provider.ParseWebhookAsync("""
-            {"EventType":"payment.completed","PaymentId":"BRICS-99","Status":"completed","Amount":100,"Currency":"ZAR"}
-            """);
-
-        Assert.NotNull(evt);
-        Assert.Equal("BRICS-99", evt!.GatewayReference);
-        Assert.Equal(PaymentStatus.Completed, evt.Status);
-        Assert.Equal("payment.completed", evt.EventType);
+        var (provider, _) = MakeProvider(_ => new HttpResponseMessage(HttpStatusCode.OK));
+        Assert.Null(provider.ParseCallback("not json"));
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsNull_ForInvalidJson()
+    public async Task GetQrStatusAsync_429_ThrowsProviderRateLimit()
     {
-        var provider = CreateProvider(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
-        Assert.Null(await provider.ParseWebhookAsync("not json"));
+        var (provider, _) = MakeProvider(_ => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "rate"));
+        await Assert.ThrowsAsync<ProviderRateLimitException>(() => provider.GetQrStatusAsync("ORDER-1"));
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsTypedChargeSucceededEvent()
+    public async Task GetTransactionAsync_4xx_ThrowsPaymentDeclined()
     {
-        var provider = CreateProvider(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
-        var evt = await provider.ParseWebhookAsync("""
-            {"EventType":"payment.completed","PaymentId":"BRICS-99","Status":"completed","Amount":100,"Currency":"ZAR"}
-            """);
-        var typed = Assert.IsType<Bhengu.Finance.Payments.Core.Models.Webhooks.ChargeSucceededEvent>(evt);
-        Assert.Equal(Bhengu.Finance.Payments.Core.Models.Webhooks.WebhookEventCategory.ChargeSucceeded, typed.Category);
-        Assert.Equal(100m, typed.Amount);
+        var (provider, _) = MakeProvider(_ => StubHttpMessageHandler.Text(HttpStatusCode.BadRequest, "bad"));
+        await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.GetTransactionAsync("ORDER-1"));
     }
 
     [Fact]
-    public async Task ProcessPaymentAsync_DedupesViaIdempotencyKey()
+    public async Task GenerateQrAsync_NetworkError_ThrowsProviderUnavailable()
     {
-        var calls = 0;
-        var handler = new StubHttpMessageHandler((_, _) =>
-        {
-            calls++;
-            return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
-                {"PaymentId":"BRICS-PAY-1","Status":"completed"}
-                """);
-        });
-        var cache = new Bhengu.Finance.Payments.Core.Caching.InMemoryBhenguDistributedCache();
-        var http = new HttpClient(handler);
-        var opts = Options.Create(new BricsPayOptions
-        {
-            MerchantId = "BRICS_TEST",
-            SecretKey = "secret",
-            UseSandbox = true
-        });
-        var provider = new BricsPayPaymentProvider(http, opts, new Mock<ICurrencyExchangeService>().Object, NullLogger<BricsPayPaymentProvider>.Instance, cache);
-        var req = new PaymentRequest
-        {
-            PaymentMethodToken = "token",
-            Amount = 100m,
-            Currency = "ZAR",
-            Description = "test",
-            IdempotencyKey = "idem-1"
-        };
-        var first = await provider.ProcessPaymentAsync(req);
-        var second = await provider.ProcessPaymentAsync(req);
-        Assert.Equal(first.GatewayReference, second.GatewayReference);
-        Assert.Equal(1, calls);
+        var (provider, _) = MakeProvider(_ => throw new HttpRequestException("down"));
+        await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.GenerateQrAsync(SampleRequest()));
     }
 }

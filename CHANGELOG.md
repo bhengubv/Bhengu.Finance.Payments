@@ -3,6 +3,41 @@
 All notable changes to `Bhengu.Finance.Payments` packages are documented here.
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Breaking — BRICS Pay rebuilt against the real published API
+
+The previous `Bhengu.Finance.Payments.BricsPay` was built from imagination — a non-existent
+`api.bricspay.org` domain, HMAC-SHA256 shared-secret signing, a card-token charge model, a payout +
+settlement-feed surface, and a frankfurter.app "currency conversion" layer. **None of it matched BRICS
+Pay's actual API.** It has been rebuilt from BRICS Pay's published E-Commerce protocol (see
+`Bhengu.Finance.Payments.BricsPay/BRICS_PAY_API_REFERENCE.md`).
+
+The real BRICS Pay e-commerce API is **QR acquiring** ("Internet Acquiring") on the Joys processing
+platform: create a transaction, show a hosted payment-page QR, confirm by callback or status poll.
+
+- **Now implements `IQrCodeProvider`** — `GenerateQrAsync` (`POST /ia/api`) + `GetQrStatusAsync`
+  (`GET /ia/get`). Provider-specific `GetTransactionAsync`, `RefundAsync` (`POST /ia/refund`, full/partial)
+  and `ParseCallback` on the concrete type.
+- **No longer implements** `IPaymentGatewayProvider`, `IPayoutProvider`, or `ISettlementProvider` — BRICS
+  Pay e-commerce has no card-charge, payout, or settlement-feed API.
+- **Request signing is now asymmetric** (ECDSA P-256 / RSA-2048 over the JSON body or GET query, base64 in
+  the `signature` URL parameter), per the protocol — not the old HMAC shared secret.
+- **`BricsPayOptions` replaced**: `TerminalId`, `BaseUrl` (provisioned per terminal — required, no default),
+  `PrivateKeyPem`, `SignatureAlgorithm`, `CallbackUrl`, `ReturnUrl`, `CssUrl`, `DefaultTtlMinutes`. The old
+  `MerchantId` / `SecretKey` / `WebhookSecret` / `UseSandbox` / `SandboxUrl` are gone.
+
+### Removed
+
+- `BricsPaySettlementProvider` (no settlement API exists), the `IPayoutProvider` path (no payout API), the
+  `ICurrencyExchangeService` + frankfurter FX / rate-lock layer (not part of acquiring), and the
+  `BricsPayService` / `IBricsPayService` "Simulated BricsPay…" stub.
+
+### Status
+
+BRICS Pay is marked `DocsOnly` — implemented against the published protocol but never verified against a
+live terminal (BRICS Pay has no self-serve sandbox; a terminal is provisioned at onboarding).
+
 ## [2.0.0-preview.2] — 2026-05-30
 
 ### Breaking — ubiquity pass + 36 new providers
