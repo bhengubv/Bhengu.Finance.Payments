@@ -74,7 +74,7 @@ public sealed class MTNMoMoPaymentProvider : BhenguProviderBase, IPaymentGateway
 
         _baseUrl = _options.BaseUrl ?? (_options.UseSandbox
             ? "https://sandbox.momodeveloper.mtn.com/"
-            : "https://momodeveloper.mtn.com/");
+            : "https://proxy.momoapi.mtn.com/");
         if (!_baseUrl.EndsWith('/')) _baseUrl += "/";
 
         if (_httpClient.BaseAddress is null)

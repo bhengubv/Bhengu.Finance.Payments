@@ -31,6 +31,6 @@ public sealed class MTNMoMoOptions
     /// <summary>Use the sandbox base URL when true.</summary>
     public bool UseSandbox { get; set; } = true;
 
-    /// <summary>Override the base URL. Defaults to https://sandbox.momodeveloper.mtn.com/ (sandbox) or https://momodeveloper.mtn.com/ (production).</summary>
+    /// <summary>Override the base URL. Defaults to https://sandbox.momodeveloper.mtn.com/ (sandbox) or https://proxy.momoapi.mtn.com/ (production).</summary>
     public string? BaseUrl { get; set; }
 }
