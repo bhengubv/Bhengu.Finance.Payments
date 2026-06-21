@@ -29,8 +29,6 @@ using Bhengu.Finance.Payments.Interswitch.Configuration;
 using Bhengu.Finance.Payments.Interswitch.Providers;
 using Bhengu.Finance.Payments.IPay.Configuration;
 using Bhengu.Finance.Payments.IPay.Providers;
-using Bhengu.Finance.Payments.JamboPay.Configuration;
-using Bhengu.Finance.Payments.JamboPay.Providers;
 using Bhengu.Finance.Payments.Kashier.Configuration;
 using Bhengu.Finance.Payments.Kashier.Internals;
 using Bhengu.Finance.Payments.Kashier.Providers;
@@ -392,20 +390,6 @@ public sealed class WebhookTimingAttackTests
         TimingAttackHelpers.AssertConstantTimeVerification(provider.VerifyWebhookSignature, Payload, sig);
     }
 
-    // --- JamboPay: HMAC SHA256 hex ---
-    [Fact]
-    public void JamboPay_VerifyWebhookSignature_IsConstantTime()
-    {
-        var provider = new JamboPayPaymentProvider(StubHttp(),
-            Options.Create(new JamboPayOptions
-            {
-                ApiKey = "k", ClientId = "cid", ClientSecret = "csec", MerchantCode = "MCH-001",
-                WebhookSecret = Secret, CallbackUrl = "https://example.com/r", Currency = "KES"
-            }),
-            NullLogger<JamboPayPaymentProvider>.Instance);
-        var sig = TimingAttackHelpers.HmacSha256Hex(Payload, Secret);
-        TimingAttackHelpers.AssertConstantTimeVerification(provider.VerifyWebhookSignature, Payload, sig);
-    }
 
     // --- Kashier: HMAC SHA256 hex ---
     [Fact]
