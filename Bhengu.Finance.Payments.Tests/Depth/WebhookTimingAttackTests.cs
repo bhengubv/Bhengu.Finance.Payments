@@ -372,20 +372,35 @@ public sealed class WebhookTimingAttackTests
     }
 
 
-    // --- Kashier: HMAC SHA256 hex ---
+    // --- Kashier: HMAC SHA256 hex over the signatureKeys query string, keyed by the Payment API Key ---
+    // FLAGGED (Kashier real-fix): Kashier's webhook signature is NOT a raw-body HMAC. It signs the data fields
+    // named in `data.signatureKeys`, sorted alphabetically and RFC-3986 query-encoded, keyed by the Payment API
+    // Key (x-kashier-signature). This block was updated from the old raw-payload scheme to match the corrected
+    // provider; only the Kashier block here changed. The constant-time property still applies (FixedTimeEquals).
     [Fact]
     public void Kashier_VerifyWebhookSignature_IsConstantTime()
     {
+        const string apiKey = "api_test_key";
         var provider = new KashierPaymentProvider(StubHttp(),
             Options.Create(new KashierOptions
             {
-                ApiKey = "api_test_key", MerchantId = "MID_1", SecretKey = "secret_kashier",
-                WebhookSecret = Secret, Currency = "EGP", Mode = "test", UseSandbox = true
+                ApiKey = apiKey, MerchantId = "MID_1", SecretKey = "secret_kashier",
+                WebhookSecret = "", Currency = "EGP", Mode = "test", UseSandbox = true
             }),
             NullLogger<KashierPaymentProvider>.Instance,
             new KashierIdempotencyCache(new InMemoryBhenguDistributedCache()));
-        var sig = TimingAttackHelpers.HmacSha256Hex(Payload, Secret);
-        TimingAttackHelpers.AssertConstantTimeVerification(provider.VerifyWebhookSignature, Payload, sig);
+
+        // A representative Kashier webhook body whose data object carries signatureKeys.
+        const string kashierPayload =
+            "{\"event\":\"pay\",\"data\":{\"signatureKeys\":[\"amount\",\"currency\",\"merchantOrderId\",\"status\",\"transactionId\"]," +
+            "\"amount\":\"100.00\",\"currency\":\"EGP\",\"merchantOrderId\":\"ORD_timing_constant_time_verification\",\"status\":\"SUCCESS\",\"transactionId\":\"TX_timing_constant_time\"}}";
+        // Canonical signed string: signatureKeys sorted alphabetically, RFC-3986 query-encoded.
+        var canonical =
+            $"amount={Uri.EscapeDataString("100.00")}&currency={Uri.EscapeDataString("EGP")}" +
+            $"&merchantOrderId={Uri.EscapeDataString("ORD_timing_constant_time_verification")}" +
+            $"&status={Uri.EscapeDataString("SUCCESS")}&transactionId={Uri.EscapeDataString("TX_timing_constant_time")}";
+        var sig = TimingAttackHelpers.HmacSha256Hex(canonical, apiKey);
+        TimingAttackHelpers.AssertConstantTimeVerification(provider.VerifyWebhookSignature, kashierPayload, sig);
     }
 
     // --- MercadoPago: HMAC SHA256 hex ---

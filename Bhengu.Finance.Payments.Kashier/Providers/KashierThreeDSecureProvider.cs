@@ -1,5 +1,6 @@
 // © 2026 The Other Bhengu (Pty) Ltd t/a The Geek. Apache-2.0-licensed.
 
+using System.Collections.Generic;
 using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -9,7 +10,6 @@ using Bhengu.Finance.Payments.Core.Interfaces;
 using Bhengu.Finance.Payments.Core.Providers;
 using Bhengu.Finance.Payments.Core.Models;
 using Bhengu.Finance.Payments.Core.Models.ThreeDSecure;
-using Bhengu.Finance.Payments.Core.Observability;
 using Bhengu.Finance.Payments.Kashier.Configuration;
 using Bhengu.Finance.Payments.Kashier.Internals;
 using Microsoft.Extensions.Logging;
@@ -18,10 +18,16 @@ using Microsoft.Extensions.Options;
 namespace Bhengu.Finance.Payments.Kashier.Providers;
 
 /// <summary>
-/// Kashier implementation of <see cref="IThreeDSecureProvider"/>. Backed by Kashier's
-/// <c>/orders/{id}/payments</c> with the <c>3ds=true</c> flag — the response carries either
-/// an ACSURL (challenge required) or a CAVV (frictionless) depending on issuer policy.
+/// Kashier implementation of <see cref="IThreeDSecureProvider"/>. Kashier performs 3-D Secure inside its
+/// <c>POST /checkout</c> flow — the response carries either an ACS redirect URL (issuer challenge required)
+/// or a frictionless approval. The challenge state is later read via order reconciliation
+/// (<c>GET /payments/orders/{merchantOrderId}</c>).
 /// </summary>
+/// <remarks>
+/// Sources: www.kashier.io/docs/integration-guide and developers.kashier.io (Direct API integration "3D Secure
+/// Handling"; order reconciliation). The exact field names Kashier returns for the ACS challenge inside
+/// <c>response.card</c> are not fully documented publicly and are marked UNVERIFIED below.
+/// </remarks>
 public sealed class KashierThreeDSecureProvider : BhenguProviderBase, IThreeDSecureProvider
 {
     private readonly HttpClient _httpClient;
@@ -67,44 +73,54 @@ public sealed class KashierThreeDSecureProvider : BhenguProviderBase, IThreeDSec
             var orderId = chargeIntent.Metadata?.GetValueOrDefault("orderId") ?? $"kashier-3ds-{Guid.NewGuid():N}";
             var amount = chargeIntent.Amount.ToString("0.00", CultureInfo.InvariantCulture);
             var currency = string.IsNullOrWhiteSpace(chargeIntent.Currency) ? _options.Currency : chargeIntent.Currency.ToUpperInvariant();
+            var key = string.IsNullOrWhiteSpace(_options.SecretKey) ? _options.ApiKey : _options.SecretKey;
+            var hash = KashierPaymentProvider.ComputeOrderHash(_options.MerchantId, orderId, amount, currency, key);
 
-            var requestBody = new
+            // 3DS is exercised through the standard checkout request; Kashier returns the ACS challenge when the
+            // issuer requires a step-up.
+            var requestBody = new Dictionary<string, object?>
             {
-                amount,
-                currency,
-                shopperReference = chargeIntent.CustomerId,
-                cardData = chargeIntent.PaymentMethodToken,
-                description = chargeIntent.Description,
-                ThreeDs = true
+                ["merchantId"] = _options.MerchantId,
+                ["orderId"] = orderId,
+                ["amount"] = amount,
+                ["currency"] = currency,
+                ["hash"] = hash,
+                ["shopper_reference"] = chargeIntent.CustomerId,
+                ["cardToken"] = chargeIntent.PaymentMethodToken,
+                ["merchantRedirect"] = _options.RedirectUrl,
+                ["display"] = "en"
             };
 
             var responseBody = await KashierHttpClient.SendAsync(
-                _httpClient, Logger, HttpMethod.Post, $"orders/{Uri.EscapeDataString(orderId)}/payments",
+                _httpClient, Logger, HttpMethod.Post, "checkout",
                 requestBody, "Start3DS", ct, chargeIntent.IdempotencyKey).ConfigureAwait(false);
 
-            var response = JsonSerializer.Deserialize<KashierThreeDsResponse>(responseBody, KashierHttpClient.Json)?.Response
+            var parsed = JsonSerializer.Deserialize<KashierThreeDsResponse>(responseBody, KashierHttpClient.Json)
                 ?? throw new ProviderUnavailableException(ProviderName, "Kashier 3DS start returned no payload");
+            var response = parsed.Response;
 
-            var statusUpper = response.Status?.ToUpperInvariant();
-            var status = (statusUpper, hasAcs: !string.IsNullOrWhiteSpace(response.AcsUrl)) switch
+            // Evaluate the transaction status (response.status), not the envelope status — the envelope's
+            // "SUCCESS" only means the API call itself succeeded. An ACS URL always indicates an issuer challenge.
+            var statusUpper = response?.Status?.ToUpperInvariant();
+            var status = (statusUpper, hasAcs: !string.IsNullOrWhiteSpace(response?.AcsUrl)) switch
             {
-                ({ } s, _) when s is "SUCCESS" or "APPROVED" => ThreeDSecureStatus.Authenticated,
                 (_, true) => ThreeDSecureStatus.ChallengeRequired,
                 ("PENDING_3DS" or "INPROGRESS", _) => ThreeDSecureStatus.ChallengeRequired,
+                ({ } s, _) when s is "SUCCESS" or "APPROVED" => ThreeDSecureStatus.Authenticated,
                 ("FAILED" or "DECLINED", _) => ThreeDSecureStatus.Failed,
                 _ => ThreeDSecureStatus.Attempted
             };
 
-            Logger.LogInformation("Kashier 3DS challenge: status={Status} acsUrl={HasAcs}", status, !string.IsNullOrEmpty(response.AcsUrl));
+            Logger.LogInformation("Kashier 3DS challenge: status={Status} acsUrl={HasAcs}", status, !string.IsNullOrEmpty(response?.AcsUrl));
 
             return new ThreeDSecureChallenge
             {
                 Status = status,
-                ChallengeReference = response.TransactionId ?? orderId,
-                RedirectUrl = response.AcsUrl,
-                ChallengePayload = response.Pareq,
-                ProtocolVersion = response.ProtocolVersion ?? "2.x",
-                DsTransactionId = response.DsTransactionId
+                ChallengeReference = response?.TransactionId ?? response?.MerchantOrderId ?? orderId,
+                RedirectUrl = response?.AcsUrl,
+                ChallengePayload = response?.Pareq,
+                ProtocolVersion = response?.ProtocolVersion ?? "2.x",
+                DsTransactionId = response?.DsTransactionId
             };
         }, ct);
     }
@@ -117,8 +133,9 @@ public sealed class KashierThreeDSecureProvider : BhenguProviderBase, IThreeDSec
         {
             try
             {
+                // Poll the order reconciliation record for the latest authentication state.
                 var responseBody = await KashierHttpClient.SendAsync(
-                    _httpClient, Logger, HttpMethod.Get, $"payments/{Uri.EscapeDataString(challengeReference)}", null, "Get3DS", ct).ConfigureAwait(false);
+                    _httpClient, Logger, HttpMethod.Get, $"payments/orders/{Uri.EscapeDataString(challengeReference)}", null, "Get3DS", ct).ConfigureAwait(false);
                 var response = JsonSerializer.Deserialize<KashierThreeDsResponse>(responseBody, KashierHttpClient.Json)?.Response;
                 if (response is null)
                     return new ThreeDSecureChallenge { Status = ThreeDSecureStatus.ChallengeRequired, ChallengeReference = challengeReference };
@@ -149,9 +166,12 @@ public sealed class KashierThreeDSecureProvider : BhenguProviderBase, IThreeDSec
         [JsonPropertyName("response")] public KashierThreeDsData? Response { get; set; }
     }
 
+    // UNVERIFIED: Kashier's public docs do not enumerate the exact ACS/3DS fields returned inside response.card;
+    // the names below are a best-effort mapping and are not sandbox-confirmed.
     private sealed class KashierThreeDsData
     {
         [JsonPropertyName("transactionId")] public string? TransactionId { get; set; }
+        [JsonPropertyName("merchantOrderId")] public string? MerchantOrderId { get; set; }
         [JsonPropertyName("status")] public string? Status { get; set; }
         [JsonPropertyName("acsUrl")] public string? AcsUrl { get; set; }
         [JsonPropertyName("pareq")] public string? Pareq { get; set; }

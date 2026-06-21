@@ -17,7 +17,7 @@ public class KashierThreeDSecureProviderTests
 {
     private static KashierThreeDSecureProvider Create(StubHttpMessageHandler handler, KashierOptions? opts = null)
     {
-        opts ??= new KashierOptions { ApiKey = "k", MerchantId = "MID", Currency = "EGP" };
+        opts ??= new KashierOptions { ApiKey = "k", MerchantId = "MID", SecretKey = "s", Currency = "EGP" };
         var http = new HttpClient(handler);
         return new KashierThreeDSecureProvider(http, Options.Create(opts), NullLogger<KashierThreeDSecureProvider>.Instance);
     }
@@ -32,10 +32,16 @@ public class KashierThreeDSecureProviderTests
     };
 
     [Fact]
-    public async Task StartAuthenticationAsync_ReturnsChallengeRequired_WhenAcsUrlReturned()
+    public async Task StartAuthenticationAsync_PostsToCheckout_AndReturnsChallengeRequired_WhenAcsUrlReturned()
     {
-        var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK,
-            """{"status":"SUCCESS","response":{"transactionId":"TX1","status":"PENDING_3DS","acsUrl":"https://issuer.example/auth","pareq":"PaReq","dsTransactionId":"DS-1","protocolVersion":"2.2.0"}}"""));
+        var handler = new StubHttpMessageHandler((req, _) =>
+        {
+            // 3DS is exercised through POST /checkout.
+            Assert.Equal(HttpMethod.Post, req.Method);
+            Assert.Equal("/checkout", req.RequestUri!.AbsolutePath);
+            return StubHttpMessageHandler.Json(HttpStatusCode.OK,
+                """{"status":"SUCCESS","response":{"transactionId":"TX1","status":"PENDING_3DS","acsUrl":"https://issuer.example/auth","pareq":"PaReq","dsTransactionId":"DS-1","protocolVersion":"2.2.0"}}""");
+        });
         var provider = Create(handler);
         var ch = await provider.StartAuthenticationAsync(SampleIntent());
         Assert.Equal(ThreeDSecureStatus.ChallengeRequired, ch.Status);
@@ -81,10 +87,16 @@ public class KashierThreeDSecureProviderTests
     }
 
     [Fact]
-    public async Task GetChallengeAsync_ReturnsAuthenticated_WhenStatusSuccess()
+    public async Task GetChallengeAsync_GetsReconciliationEndpoint_AndReturnsAuthenticated_WhenStatusSuccess()
     {
-        var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK,
-            """{"status":"SUCCESS","response":{"status":"SUCCESS","dsTransactionId":"DS-7","protocolVersion":"2.2.0"}}"""));
+        var handler = new StubHttpMessageHandler((req, _) =>
+        {
+            // Challenge state is read via order reconciliation.
+            Assert.Equal(HttpMethod.Get, req.Method);
+            Assert.Equal("/payments/orders/TX1", req.RequestUri!.AbsolutePath);
+            return StubHttpMessageHandler.Json(HttpStatusCode.OK,
+                """{"status":"SUCCESS","response":{"status":"SUCCESS","dsTransactionId":"DS-7","protocolVersion":"2.2.0"}}""");
+        });
         var provider = Create(handler);
         var ch = await provider.GetChallengeAsync("TX1");
         Assert.Equal(ThreeDSecureStatus.Authenticated, ch.Status);

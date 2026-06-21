@@ -1,6 +1,8 @@
 # Bhengu.Finance.Payments.Kashier
 
-Kashier adapter for the Bhengu.Finance.Payments family — server-to-server card charges, marketplace payouts, and hosted-payment-page redirect for Egypt, the UAE and KSA via the Kashier REST API. Charge, refund, webhook verification, payouts, vaulted tokenisation, and 3-D Secure step-up behind the Bhengu canonical contracts.
+Kashier adapter for the Bhengu.Finance.Payments family — server-to-server card charges (`POST /checkout`), refunds, hosted-payment-page redirect, webhook verification, vaulted tokenisation and 3-D Secure for Egypt via the Kashier REST API. Charge, refund, order reconciliation, webhook verification, vaulted tokenisation and 3-D Secure behind the Bhengu canonical contracts.
+
+> **Verification status: `DocsOnly`.** The wire format is built from Kashier's public documentation and reference SDKs (kashier.io/docs/integration-guide, developers.kashier.io, the Kashier-payments GitHub demos, and the asciisd/kashier SDK) and is unit-tested, but has never been sandbox-verified. Kashier does **not** publicly document a server-side payout/disbursement API, so this package does **not** implement `IPayoutProvider`. A few endpoints whose exact request/response shapes Kashier does not publish (the 3-D Secure ACS fields, the tokenisation request cipher, the token-delete path) are marked `// UNVERIFIED:` in source.
 
 ## Install
 
@@ -12,10 +14,12 @@ dotnet add package Bhengu.Finance.Payments.Kashier
 
 | Contract | Provider class | Notes |
 |---|---|---|
-| `IPaymentGatewayProvider` | `KashierPaymentProvider` | Charge / refund / webhook verify |
-| `IPayoutProvider` | `KashierPaymentProvider` | Marketplace payouts |
-| `ITokenisationProvider` | `KashierTokenisationProvider` | Read vaulted card tokens |
-| `IThreeDSecureProvider` | `KashierThreeDSecureProvider` | SCA step-up flow |
+| `IPaymentGatewayProvider` | `KashierPaymentProvider` | Charge (`POST /checkout`) / refund (`PUT /orders/{orderId}/transactions/{transactionId}?operation=refund`) / order reconciliation / webhook verify |
+| `ITokenisationProvider` | `KashierTokenisationProvider` | List / fetch / delete vaulted card tokens (`GET /tokens`) |
+| `IRawCardTokenisationProvider` | `KashierRawCardTokenisationProvider` | Vault a raw card (`POST /tokenization`) — SAQ-D scope |
+| `IThreeDSecureProvider` | `KashierThreeDSecureProvider` | SCA step-up via the checkout flow |
+
+`IPayoutProvider` is intentionally **not** implemented — Kashier publishes no server payout API, and a guessed payout path would be worse than honestly not supporting it.
 
 ## Wiring
 
@@ -31,16 +35,17 @@ Bind options from `Bhengu:Finance:Payments:Kashier`:
     "Finance": {
       "Payments": {
         "Kashier": {
-          "ApiKey": "...",
+          "ApiKey": "...",          // Payment API Key — verifies webhook signatures (x-kashier-signature)
           "MerchantId": "MID-...",
-          "SecretKey": "...",
-          "WebhookSecret": "...",
+          "SecretKey": "...",        // Secret Key — Authorization header on REST calls + order-hash key
+          "WebhookSecret": "",       // optional; leave blank — webhooks are signed with the Payment API Key
           "Currency": "EGP",
           "Mode": "test",
           "RedirectUrl": "https://example.com/kashier/return",          // optional
           "ServerWebhookUrl": "https://example.com/webhooks/kashier",   // optional
-          "UseSandbox": true,
-          "BaseUrl": null                                                // optional override
+          "UseSandbox": true,                                            // true → test-api.kashier.io, false → api.kashier.io
+          "BaseUrl": null,                                               // optional REST base override
+          "HostedPaymentBaseUrl": null                                   // optional HPP base override (default https://checkout.kashier.io)
         }
       }
     }

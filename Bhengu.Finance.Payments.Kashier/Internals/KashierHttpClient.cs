@@ -2,7 +2,6 @@
 
 using System.Globalization;
 using System.Net;
-using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using Bhengu.Finance.Payments.Core;
@@ -13,10 +12,36 @@ using Microsoft.Extensions.Logging;
 namespace Bhengu.Finance.Payments.Kashier.Internals;
 
 /// <summary>Shared HTTP helper for every Kashier sibling provider.</summary>
+/// <remarks>
+/// Base URLs and auth are taken from Kashier's documentation and the asciisd/kashier SDK:
+/// <list type="bullet">
+///   <item>REST base — <c>https://test-api.kashier.io</c> (sandbox) / <c>https://api.kashier.io</c> (live).
+///         Source: asciisd KashierConstants (<c>REST_SANDBOX_ENDPOINT</c>/<c>REST_LIVE_ENDPOINT</c>) and the
+///         developers.kashier.io order-reconciliation curl example.</item>
+///   <item>Auth — the raw Secret Key in the <c>Authorization</c> header (no scheme prefix).
+///         Source: asciisd Refund.php (<c>Authorization =&gt; getSecretKey()</c>) and the reconciliation page
+///         (<c>-H 'Authorization: your_secretKey'</c>).</item>
+/// </list>
+/// </remarks>
 internal static class KashierHttpClient
 {
-    /// <summary>Default base URL when <see cref="KashierOptions.BaseUrl"/> is unset.</summary>
-    public const string DefaultBaseUrl = "https://api.kashier.io/";
+    /// <summary>REST base URL for the Kashier sandbox.</summary>
+    public const string SandboxBaseUrl = "https://test-api.kashier.io/";
+
+    /// <summary>REST base URL for Kashier live.</summary>
+    public const string LiveBaseUrl = "https://api.kashier.io/";
+
+    /// <summary>Default hosted-payment-page / iframe base URL.</summary>
+    public const string DefaultHostedPaymentBaseUrl = "https://checkout.kashier.io";
+
+    /// <summary>Resolve the REST base URL from options (explicit override wins, else sandbox/live by flag).</summary>
+    public static string ResolveBaseUrl(KashierOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        if (!string.IsNullOrWhiteSpace(options.BaseUrl))
+            return options.BaseUrl;
+        return options.UseSandbox ? SandboxBaseUrl : LiveBaseUrl;
+    }
 
     /// <summary>Shared JsonSerializerOptions: Kashier uses camelCase throughout.</summary>
     public static readonly JsonSerializerOptions Json = new()
@@ -32,10 +57,11 @@ internal static class KashierHttpClient
         ArgumentNullException.ThrowIfNull(options);
 
         if (httpClient.BaseAddress is null)
-            httpClient.BaseAddress = new Uri(options.BaseUrl ?? DefaultBaseUrl);
+            httpClient.BaseAddress = new Uri(ResolveBaseUrl(options));
 
-        if (httpClient.DefaultRequestHeaders.Authorization is null)
-            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(options.ApiKey);
+        // Kashier expects the Secret Key as the raw Authorization header value (no "Bearer"/scheme prefix).
+        if (!httpClient.DefaultRequestHeaders.Contains("Authorization") && !string.IsNullOrWhiteSpace(options.SecretKey))
+            httpClient.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", options.SecretKey);
     }
 
     /// <summary>
@@ -61,6 +87,7 @@ internal static class KashierHttpClient
             var json = JsonSerializer.Serialize(body, Json);
             req.Content = new StringContent(json, Encoding.UTF8, "application/json");
         }
+        req.Headers.TryAddWithoutValidation("Accept", "application/json");
         if (!string.IsNullOrWhiteSpace(idempotencyKey))
             req.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
 

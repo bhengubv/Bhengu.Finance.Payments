@@ -6,7 +6,7 @@
     <PackageId>Bhengu.Finance.Payments.Kashier</PackageId>
     <Authors>T.M. Bengu</Authors>
     <Company>Bhengu B.V.</Company>
-    <Description>Kashier payment gateway for the Bhengu.Finance.Payments family. Egypt + UAE + KSA online/in-store card payments, refunds and payouts via the Kashier REST API.</Description>
+    <Description>Kashier payment gateway for the Bhengu.Finance.Payments family. Egypt online/in-store card payments, refunds, tokenisation and 3-D Secure via the Kashier REST API and hosted payment page.</Description>
     <PackageTags>Payments;Payment Gateway;Bhengu;Bengu;Kashier;Egypt;UAE;KSA;NorthAfrica;MiddleEast</PackageTags>
     <RepositoryUrl>https://github.com/bhengubv/Bhengu.Finance.Payments</RepositoryUrl>
   </PropertyGroup>
