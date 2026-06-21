@@ -23,19 +23,35 @@ using Microsoft.Extensions.Options;
 namespace Bhengu.Finance.Payments.Onafriq.Providers;
 
 /// <summary>
-/// Onafriq (formerly MFS Africa) cross-border mobile-money provider. Onafriq is primarily a
-/// transfer / disbursement rail (wallet-to-wallet across 35+ African countries) — the payout path
-/// is the canonical use. ProcessPaymentAsync maps to the <c>/v1/collections</c> endpoint.
-/// Refunds are not supported by Onafriq: money movement is one-directional and reversals require
-/// a new opposite transaction.
+/// Onafriq (formerly MFS Africa) cross-border mobile-money provider.
+/// <para>
+/// Onafriq's "Portal API" is the Beyonic API (Onafriq acquired Beyonic in 2020 and rebranded the
+/// developer portal). Wire details below are taken from the public docs:
+/// <list type="bullet">
+///   <item>Base URL + Token auth: https://developer.mfsafrica.com/docs/api-endpoints and https://developer.mfsafrica.com/docs/api-key</item>
+///   <item>Payout (Payment): https://github.com/beyonic/api-docs/blob/master/source/includes/sending_funds/_payments.md → <c>POST /api/payments</c></item>
+///   <item>Payin (Collection Request): https://github.com/beyonic/api-docs/blob/master/source/includes/collecting_funds/_collection_requests.md → <c>POST /api/collectionrequests</c></item>
+///   <item>Webhooks: https://github.com/beyonic/api-docs/blob/master/source/includes/methods/_webhooks.md (optional HTTP Basic Auth — NOT HMAC)</item>
+/// </list>
+/// Onafriq is primarily a disbursement / collection rail across 35+ African countries.
+/// <see cref="ProcessPaymentAsync"/> maps to a Collection Request (request-to-pay / payin) and
+/// <see cref="ProcessPayoutAsync"/> maps to a Payment (disbursement). Refunds are not supported by the
+/// API: money movement is one-directional and a reversal must be issued as a new opposite transaction.
+/// </para>
 /// </summary>
-[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
+[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public Onafriq/MFS Africa (Beyonic) documentation; never sandbox-verified.")]
 public sealed class OnafriqPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
     private readonly OnafriqOptions _options;
     private readonly IBhenguDistributedCache _cache;
     private static readonly TimeSpan s_idempotencyTtl = TimeSpan.FromHours(24);
+
+    private static readonly JsonSerializerOptions s_json = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
 
     /// <inheritdoc/>
     public override string ProviderName => ProviderNames.Onafriq;
@@ -64,23 +80,33 @@ public sealed class OnafriqPaymentProvider : BhenguProviderBase, IPaymentGateway
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(OnafriqOptions.ApiKey)} is required");
-        if (string.IsNullOrWhiteSpace(_options.MerchantId))
-            throw new ProviderConfigurationException(ProviderName, $"{nameof(OnafriqOptions.MerchantId)} is required");
 
         if (_httpClient.BaseAddress is null)
         {
-            var defaultUrl = _options.UseSandbox
-                ? "https://api-sandbox.onafriq.com/"
-                : "https://api.onafriq.com/";
-            _httpClient.BaseAddress = new Uri(_options.BaseUrl ?? defaultUrl);
+            // Production cross-border host. There is no separate sandbox host — testing uses the same
+            // base URL with the BXC test currency. Source: https://developer.mfsafrica.com/docs/api-endpoints
+            _httpClient.BaseAddress = new Uri(_options.BaseUrl ?? "https://api.mfsafrica.com/api/");
         }
 
-        _httpClient.DefaultRequestHeaders.Remove("X-API-Key");
-        _httpClient.DefaultRequestHeaders.Add("X-API-Key", _options.ApiKey);
-        _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _options.ApiKey);
+        // Token Based Authentication: "Authorization: Token <api_key>".
+        // Source: https://developer.mfsafrica.com/docs/api-key and beyonic/api-docs _authentication.md.
+        _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Token", _options.ApiKey);
+
+        if (!string.IsNullOrWhiteSpace(_options.ApiVersion))
+        {
+            // Optional version pin. Source: beyonic/api-docs _versioning.md ("Beyonic-Version" header).
+            _httpClient.DefaultRequestHeaders.Remove("Beyonic-Version");
+            _httpClient.DefaultRequestHeaders.Add("Beyonic-Version", _options.ApiVersion);
+        }
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Maps to a Beyonic/Onafriq <b>Collection Request</b> (request-to-pay / payin): the payer is
+    /// prompted on their phone to authorise the debit. <c>PaymentMethodToken</c> carries the payer's
+    /// MSISDN in international format (e.g. "+254700000000"). Source:
+    /// https://github.com/beyonic/api-docs/blob/master/source/includes/collecting_funds/_collection_requests.md
+    /// </remarks>
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -89,34 +115,34 @@ public sealed class OnafriqPaymentProvider : BhenguProviderBase, IPaymentGateway
             var cached = await TryGetCachedAsync<PaymentResponse>(request.IdempotencyKey, "charge", ct).ConfigureAwait(false);
             if (cached is not null) return cached;
 
-            // PaymentMethodToken format: "<country>:<walletNumber>" (e.g. "ZA:27710000000").
-            var (countryCode, walletNumber) = SplitDestination(request.PaymentMethodToken, defaultCountry: "ZA");
-
-            var requestBody = new
+            // collectionrequests fields: phonenumber, amount, currency, account?, reason?, metadata?.
+            var form = new List<KeyValuePair<string, string>>
             {
-                merchantId = _options.MerchantId,
-                source = new { type = "wallet", country = countryCode, walletNumber },
-                amount = request.Amount,
-                currency = request.Currency.ToUpperInvariant(),
-                reference = request.IdempotencyKey ?? $"col-{Guid.NewGuid():N}",
-                description = request.Description,
-                callbackUrl = _options.CallbackUrl
+                new("phonenumber", request.PaymentMethodToken),
+                new("amount", request.Amount.ToString(CultureInfo.InvariantCulture)),
+                new("currency", request.Currency.ToUpperInvariant()),
+                new("reason", request.Description),
             };
+            if (!string.IsNullOrWhiteSpace(_options.AccountId))
+                form.Add(new("account", _options.AccountId));
+            if (!string.IsNullOrWhiteSpace(_options.CallbackUrl))
+                form.Add(new("callback_url", _options.CallbackUrl!));
+            AppendMetadata(form, request.Metadata, request.IdempotencyKey);
 
-            var body = await SendAsync(HttpMethod.Post, "v1/collections", requestBody, ct, "ProcessPayment", request.IdempotencyKey).ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<OnafriqTransactionResponse>(body);
+            var body = await SendFormAsync("collectionrequests", form, ct, "ProcessPayment", request.IdempotencyKey).ConfigureAwait(false);
+            var response = JsonSerializer.Deserialize<OnafriqCollectionResponse>(body, s_json);
 
-            Logger.LogInformation("Onafriq collection initiated: {Id} status={Status}",
-                response?.TransactionId, response?.Status);
+            Logger.LogInformation("Onafriq collection request created: {Id} status={Status}",
+                response?.Id, response?.Status);
 
             var pr = new PaymentResponse
             {
-                GatewayReference = response?.TransactionId ?? string.Empty,
+                GatewayReference = response?.Id?.ToString(CultureInfo.InvariantCulture) ?? string.Empty,
                 Status = MapStatus(response?.Status ?? "pending"),
-                Amount = request.Amount,
-                Currency = request.Currency,
+                Amount = response?.Amount ?? request.Amount,
+                Currency = response?.Currency ?? request.Currency,
                 ProcessedAt = DateTime.UtcNow,
-                Message = response?.Status
+                Message = response?.ErrorMessage ?? response?.Status
             };
 
             await TrySetCachedAsync(request.IdempotencyKey, "charge", pr, ct).ConfigureAwait(false);
@@ -125,6 +151,12 @@ public sealed class OnafriqPaymentProvider : BhenguProviderBase, IPaymentGateway
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Maps to a Beyonic/Onafriq <b>Payment</b> (disbursement): funds are sent to the recipient's
+    /// mobile wallet. <c>DestinationToken</c> carries the recipient's MSISDN in international format
+    /// (e.g. "+233244000000"). Source:
+    /// https://github.com/beyonic/api-docs/blob/master/source/includes/sending_funds/_payments.md
+    /// </remarks>
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -133,43 +165,33 @@ public sealed class OnafriqPaymentProvider : BhenguProviderBase, IPaymentGateway
             var cached = await TryGetCachedAsync<PayoutResponse>(request.IdempotencyKey, "payout", ct).ConfigureAwait(false);
             if (cached is not null) return cached;
 
-            // DestinationToken format: "<country>:<walletNumber>" (e.g. "GH:233244000000").
-            var (destCountry, destWallet) = SplitDestination(request.DestinationToken, defaultCountry: "GH");
-
-            var requestBody = new
+            // payments fields: phonenumber, amount, currency, payment_type, description?, account?, callback_url?.
+            var form = new List<KeyValuePair<string, string>>
             {
-                merchantId = _options.MerchantId,
-                source = new
-                {
-                    type = "wallet",
-                    country = "ZA",
-                    walletNumber = _options.MerchantId
-                },
-                destination = new
-                {
-                    type = "wallet",
-                    country = destCountry,
-                    walletNumber = destWallet
-                },
-                amount = request.Amount,
-                currency = request.Currency.ToUpperInvariant(),
-                reference = request.IdempotencyKey ?? $"pay-{Guid.NewGuid():N}",
-                description = request.Description,
-                callbackUrl = _options.CallbackUrl
+                new("phonenumber", request.DestinationToken),
+                new("amount", request.Amount.ToString(CultureInfo.InvariantCulture)),
+                new("currency", request.Currency.ToUpperInvariant()),
+                new("payment_type", "money"),
+                new("description", request.Description),
             };
+            if (!string.IsNullOrWhiteSpace(_options.AccountId))
+                form.Add(new("account", _options.AccountId));
+            if (!string.IsNullOrWhiteSpace(_options.CallbackUrl))
+                form.Add(new("callback_url", _options.CallbackUrl!));
+            AppendMetadata(form, request.Metadata, request.IdempotencyKey);
 
-            var body = await SendAsync(HttpMethod.Post, "v1/transactions", requestBody, ct, "ProcessPayout", request.IdempotencyKey).ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<OnafriqTransactionResponse>(body);
+            var body = await SendFormAsync("payments", form, ct, "ProcessPayout", request.IdempotencyKey).ConfigureAwait(false);
+            var response = JsonSerializer.Deserialize<OnafriqPaymentResponse>(body, s_json);
 
-            Logger.LogInformation("Onafriq transfer initiated: {Id} status={Status}",
-                response?.TransactionId, response?.Status);
+            Logger.LogInformation("Onafriq payment (disbursement) created: {Id} state={State}",
+                response?.Id, response?.State);
 
             var pr = new PayoutResponse
             {
-                GatewayReference = response?.TransactionId ?? string.Empty,
-                Status = MapStatus(response?.Status ?? "pending"),
-                Amount = request.Amount,
-                Currency = request.Currency,
+                GatewayReference = response?.Id?.ToString(CultureInfo.InvariantCulture) ?? string.Empty,
+                Status = MapStatus(response?.State ?? "new"),
+                Amount = response?.Amount ?? request.Amount,
+                Currency = response?.Currency ?? request.Currency,
                 ProcessedAt = DateTime.UtcNow
             };
 
@@ -181,17 +203,24 @@ public sealed class OnafriqPaymentProvider : BhenguProviderBase, IPaymentGateway
     /// <inheritdoc/>
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
-        // Onafriq money movement is one-directional. There is no /refund endpoint; reversals must
-        // be performed as a new opposite transaction (a payout from your merchant wallet to the
-        // original payer's wallet). Surface this explicitly so callers do not silently lose money.
+        // The Onafriq/Beyonic API exposes no refund endpoint. Money movement is one-directional;
+        // reversals must be issued as a new opposite Payment (disbursement) back to the original payer.
+        // Surface this explicitly so callers do not silently lose money.
         throw new BhenguPaymentException(
             ProviderName,
             "Onafriq does not support refunds; reversals require a new opposite transaction. " +
-            "Issue a payout from your merchant wallet back to the original payer's wallet instead.",
+            "Issue a payout from your merchant account back to the original payer's wallet instead.",
             providerErrorCode: "refund_unsupported");
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Onafriq/Beyonic does NOT HMAC-sign webhooks. It optionally authenticates the inbound callback
+    /// with HTTP Basic Auth credentials arranged with their support team. We therefore treat the
+    /// inbound <c>Authorization: Basic …</c> header value as the "signature": pass it verbatim and we
+    /// validate it (constant-time) against the configured username/password. Source:
+    /// https://github.com/beyonic/api-docs/blob/master/source/includes/methods/_webhooks.md
+    /// </remarks>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
@@ -199,12 +228,24 @@ public sealed class OnafriqPaymentProvider : BhenguProviderBase, IPaymentGateway
 
         return RunWebhookVerify(() =>
         {
-            if (string.IsNullOrWhiteSpace(_options.WebhookSecret))
+            if (string.IsNullOrWhiteSpace(_options.WebhookBasicAuthUsername) ||
+                string.IsNullOrWhiteSpace(_options.WebhookBasicAuthPassword))
             {
-                Logger.LogWarning("Onafriq WebhookSecret not configured — signature verification cannot succeed.");
+                Logger.LogWarning(
+                    "Onafriq webhook Basic Auth credentials not configured — callback authentication cannot succeed. " +
+                    "Set OnafriqOptions.WebhookBasicAuthUsername/Password (Onafriq does not HMAC-sign webhooks).");
                 return false;
             }
-            return SignatureHelpers.VerifyHmacSha256(payload, signature, _options.WebhookSecret);
+
+            var expected = "Basic " + Convert.ToBase64String(Encoding.UTF8.GetBytes(
+                $"{_options.WebhookBasicAuthUsername}:{_options.WebhookBasicAuthPassword}"));
+
+            // Accept either the full "Basic <b64>" header or the bare base64 credential.
+            var presented = signature.StartsWith("Basic ", StringComparison.OrdinalIgnoreCase)
+                ? signature
+                : "Basic " + signature;
+
+            return SignatureHelpers.ConstantTimeEquals(presented, expected);
         });
     }
 
@@ -216,11 +257,11 @@ public sealed class OnafriqPaymentProvider : BhenguProviderBase, IPaymentGateway
         {
             try
             {
-                var webhookEvent = JsonSerializer.Deserialize<OnafriqWebhookEvent>(payload);
-                if (webhookEvent is null) return Task.FromResult<WebhookEvent?>(null);
+                var envelope = JsonSerializer.Deserialize<OnafriqWebhookEnvelope>(payload, s_json);
+                if (envelope is null) return Task.FromResult<WebhookEvent?>(null);
 
-                Logger.LogInformation("Parsed Onafriq webhook event: {EventType}", webhookEvent.EventType);
-                var typed = MapWebhookEvent(webhookEvent);
+                Logger.LogInformation("Parsed Onafriq webhook event: {EventType}", envelope.Hook?.Event);
+                var typed = MapWebhookEvent(envelope);
                 return Task.FromResult(typed);
             }
             catch (Exception ex)
@@ -231,104 +272,129 @@ public sealed class OnafriqPaymentProvider : BhenguProviderBase, IPaymentGateway
         }, ct);
     }
 
-    private static WebhookEvent? MapWebhookEvent(OnafriqWebhookEvent webhookEvent)
+    // Beyonic/Onafriq webhook envelope is { "hook": { "event": "...", ... }, "data": { ...object... } }.
+    // Event names: payment.status.changed, collectionrequest.status.changed, collection.received,
+    // contact.created. Source: beyonic/api-docs methods/_webhooks.md and methods/_events.md.
+    private static WebhookEvent? MapWebhookEvent(OnafriqWebhookEnvelope envelope)
     {
-        var reference = webhookEvent.Data?.TransactionId;
+        var data = envelope.Data;
+        var reference = data?.Id?.ToString(CultureInfo.InvariantCulture);
         if (string.IsNullOrEmpty(reference)) return null;
 
-        var amount = webhookEvent.Data?.Amount ?? 0m;
-        var currency = webhookEvent.Data?.Currency ?? "USD";
-        var eventName = webhookEvent.EventType?.ToLowerInvariant();
+        var amount = data?.Amount ?? 0m;
+        var currency = data?.Currency ?? "USD";
+        var eventName = envelope.Hook?.Event?.ToLowerInvariant();
 
         switch (eventName)
         {
-            case "collection.completed":
-            case "collection.successful":
-                return new ChargeSucceededEvent
+            case "payment.status.changed":
+            {
+                // Disbursement lifecycle. "state": new/processed/processed_with_errors/rejected/cancelled.
+                var status = MapStatus(data?.State ?? data?.Status ?? "new");
+                return status switch
                 {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Completed,
-                    EventType = webhookEvent.EventType,
-                    Category = WebhookEventCategory.ChargeSucceeded,
-                    Amount = amount,
-                    Currency = currency,
-                    CustomerId = webhookEvent.Data?.Source?.WalletNumber,
-                    PaymentMethodToken = webhookEvent.Data?.Source?.WalletNumber
+                    PaymentStatus.Completed => new PayoutCompletedEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Completed,
+                        EventType = envelope.Hook?.Event,
+                        Category = WebhookEventCategory.PayoutCompleted,
+                        PayoutReference = reference,
+                        Amount = amount,
+                        Currency = currency,
+                        DestinationToken = data?.PhoneNumber
+                    },
+                    PaymentStatus.Failed or PaymentStatus.Cancelled => new PayoutFailedEvent
+                    {
+                        GatewayReference = reference,
+                        Status = status,
+                        EventType = envelope.Hook?.Event,
+                        Category = WebhookEventCategory.PayoutFailed,
+                        PayoutReference = reference,
+                        Amount = amount,
+                        Currency = currency,
+                        FailureCode = data?.State ?? data?.Status,
+                        FailureMessage = data?.LastError
+                    },
+                    _ => new WebhookEvent
+                    {
+                        GatewayReference = reference,
+                        Status = status,
+                        EventType = envelope.Hook?.Event,
+                        Category = WebhookEventCategory.Unknown
+                    }
                 };
+            }
 
-            case "collection.failed":
-                return new ChargeFailedEvent
+            case "collectionrequest.status.changed":
+            case "collection.received":
+            {
+                // Collection (payin) lifecycle. "status": pending/processing_started/successful/failed/expired/reversed.
+                var status = MapStatus(data?.Status ?? data?.State ?? "pending");
+                return status switch
                 {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Failed,
-                    EventType = webhookEvent.EventType,
-                    Category = WebhookEventCategory.ChargeFailed,
-                    Amount = amount,
-                    Currency = currency,
-                    FailureCode = webhookEvent.Data?.Status,
-                    FailureMessage = webhookEvent.Data?.Status
+                    PaymentStatus.Completed => new ChargeSucceededEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Completed,
+                        EventType = envelope.Hook?.Event,
+                        Category = WebhookEventCategory.ChargeSucceeded,
+                        Amount = amount,
+                        Currency = currency,
+                        CustomerId = data?.PhoneNumber,
+                        PaymentMethodToken = data?.PhoneNumber
+                    },
+                    PaymentStatus.Failed or PaymentStatus.Cancelled => new ChargeFailedEvent
+                    {
+                        GatewayReference = reference,
+                        Status = status,
+                        EventType = envelope.Hook?.Event,
+                        Category = WebhookEventCategory.ChargeFailed,
+                        Amount = amount,
+                        Currency = currency,
+                        FailureCode = data?.Status ?? data?.State,
+                        FailureMessage = data?.ErrorMessage
+                    },
+                    PaymentStatus.Pending => new ChargePendingEvent
+                    {
+                        GatewayReference = reference,
+                        Status = PaymentStatus.Pending,
+                        EventType = envelope.Hook?.Event,
+                        Category = WebhookEventCategory.ChargePending,
+                        Amount = amount,
+                        Currency = currency
+                    },
+                    _ => null
                 };
-
-            case "transaction.completed":
-            case "transaction.successful":
-                return new PayoutCompletedEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Completed,
-                    EventType = webhookEvent.EventType,
-                    Category = WebhookEventCategory.PayoutCompleted,
-                    PayoutReference = reference,
-                    Amount = amount,
-                    Currency = currency,
-                    DestinationToken = webhookEvent.Data?.Destination?.WalletNumber
-                };
-
-            case "transaction.failed":
-            case "transaction.rejected":
-                return new PayoutFailedEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Failed,
-                    EventType = webhookEvent.EventType,
-                    Category = WebhookEventCategory.PayoutFailed,
-                    PayoutReference = reference,
-                    Amount = amount,
-                    Currency = currency,
-                    FailureCode = webhookEvent.Data?.Status,
-                    FailureMessage = webhookEvent.Data?.Status
-                };
+            }
 
             default:
-                var status = eventName switch
-                {
-                    "transaction.pending" => PaymentStatus.Pending,
-                    _ => (PaymentStatus?)null
-                };
-                if (status is null) return null;
-                return new WebhookEvent
-                {
-                    GatewayReference = reference,
-                    Status = status.Value,
-                    EventType = webhookEvent.EventType,
-                    Category = WebhookEventCategory.Unknown
-                };
+                return null;
         }
     }
 
-    private static (string Country, string Wallet) SplitDestination(string token, string defaultCountry)
+    private void AppendMetadata(List<KeyValuePair<string, string>> form, IReadOnlyDictionary<string, string>? metadata, string? idempotencyKey)
     {
-        var colon = token.IndexOf(':');
-        if (colon <= 0)
-            return (defaultCountry, token);
-        return (token[..colon], token[(colon + 1)..]);
+        // Beyonic accepts custom attributes as "metadata.<key>=<value>" form fields (up to 10).
+        // Source: beyonic/api-docs _metadata.md.
+        if (metadata is not null)
+        {
+            foreach (var kvp in metadata)
+                form.Add(new($"metadata.{kvp.Key}", kvp.Value));
+        }
+
+        // Beyonic supports request de-duplication via a metadata key it indexes for duplicate detection.
+        // Source: beyonic/api-docs _duplicate_requests.md. Stamp the caller's idempotency key so retried
+        // POSTs are recognised upstream in addition to our local cache short-circuit.
+        if (!string.IsNullOrWhiteSpace(idempotencyKey) && (metadata is null || !metadata.ContainsKey("bhengu_idempotency_key")))
+            form.Add(new("metadata.bhengu_idempotency_key", idempotencyKey));
     }
 
-    private async Task<string> SendAsync(HttpMethod method, string path, object body, CancellationToken ct, string operation, string? idempotencyKey)
+    private async Task<string> SendFormAsync(string path, IEnumerable<KeyValuePair<string, string>> form, CancellationToken ct, string operation, string? idempotencyKey)
     {
-        var json = JsonSerializer.Serialize(body);
-        using var req = new HttpRequestMessage(method, path)
+        using var req = new HttpRequestMessage(HttpMethod.Post, path)
         {
-            Content = new StringContent(json, Encoding.UTF8, "application/json")
+            Content = new FormUrlEncodedContent(form)
         };
 
         if (!string.IsNullOrWhiteSpace(idempotencyKey))
@@ -372,45 +438,66 @@ public sealed class OnafriqPaymentProvider : BhenguProviderBase, IPaymentGateway
         return $"onafriq:idem:{operation}:{hash}";
     }
 
+    // Maps both the disbursement "state" values (new/processed/processed_with_errors/rejected/cancelled)
+    // and the collection "status" values (pending/processing_started/successful/failed/expired/reversed).
+    // Sources: beyonic/api-docs sending_funds/_payments.md and collecting_funds/_collection_requests.md.
     private static PaymentStatus MapStatus(string raw) => raw?.ToLowerInvariant() switch
     {
-        "completed" or "successful" or "success" => PaymentStatus.Completed,
-        "pending" or "processing" or "initiated" or "submitted" => PaymentStatus.Pending,
-        "failed" or "rejected" => PaymentStatus.Failed,
+        "processed" or "successful" or "success" or "completed" => PaymentStatus.Completed,
+        "new" or "pending" or "pending_dispatched" or "processing_started" or "processing" => PaymentStatus.Pending,
+        "processed_with_errors" or "failed" or "rejected" or "expired" => PaymentStatus.Failed,
+        "reversed" => PaymentStatus.Refunded,
         "cancelled" or "canceled" => PaymentStatus.Cancelled,
         _ => PaymentStatus.Pending
     };
 
-    // === Onafriq API response shapes (internal) ===
+    // === Onafriq/Beyonic API response shapes (internal) ===
 
-    private sealed class OnafriqTransactionResponse
+    // POST /api/payments response. Source: beyonic/api-docs sending_funds/_payments.md.
+    private sealed class OnafriqPaymentResponse
     {
-        [JsonPropertyName("transactionId")] public string? TransactionId { get; set; }
-        [JsonPropertyName("status")] public string? Status { get; set; }
-        [JsonPropertyName("reference")] public string? Reference { get; set; }
-        [JsonPropertyName("amount")] public decimal Amount { get; set; }
+        [JsonPropertyName("id")] public long? Id { get; set; }
+        [JsonPropertyName("state")] public string? State { get; set; }
+        [JsonPropertyName("amount")] public decimal? Amount { get; set; }
+        [JsonPropertyName("currency")] public string? Currency { get; set; }
+        [JsonPropertyName("last_error")] public string? LastError { get; set; }
+        [JsonPropertyName("remote_transaction_id")] public string? RemoteTransactionId { get; set; }
     }
 
-    private sealed class OnafriqWebhookEvent
+    // POST /api/collectionrequests response. Source: beyonic/api-docs collecting_funds/_collection_requests.md.
+    private sealed class OnafriqCollectionResponse
     {
-        [JsonPropertyName("eventType")] public string? EventType { get; set; }
+        [JsonPropertyName("id")] public long? Id { get; set; }
+        [JsonPropertyName("status")] public string? Status { get; set; }
+        [JsonPropertyName("amount")] public decimal? Amount { get; set; }
+        [JsonPropertyName("currency")] public string? Currency { get; set; }
+        [JsonPropertyName("phonenumber")] public string? PhoneNumber { get; set; }
+        [JsonPropertyName("error_message")] public string? ErrorMessage { get; set; }
+    }
+
+    // Webhook envelope: { "hook": {...}, "data": {...} }. Source: beyonic/api-docs methods/_webhooks.md.
+    private sealed class OnafriqWebhookEnvelope
+    {
+        [JsonPropertyName("hook")] public OnafriqWebhookHook? Hook { get; set; }
         [JsonPropertyName("data")] public OnafriqWebhookData? Data { get; set; }
+    }
+
+    private sealed class OnafriqWebhookHook
+    {
+        [JsonPropertyName("id")] public long? Id { get; set; }
+        [JsonPropertyName("event")] public string? Event { get; set; }
+        [JsonPropertyName("target")] public string? Target { get; set; }
     }
 
     private sealed class OnafriqWebhookData
     {
-        [JsonPropertyName("transactionId")] public string? TransactionId { get; set; }
-        [JsonPropertyName("status")] public string? Status { get; set; }
-        [JsonPropertyName("reference")] public string? Reference { get; set; }
+        [JsonPropertyName("id")] public long? Id { get; set; }
+        [JsonPropertyName("state")] public string? State { get; set; }       // payments
+        [JsonPropertyName("status")] public string? Status { get; set; }     // collectionrequests
         [JsonPropertyName("amount")] public decimal? Amount { get; set; }
         [JsonPropertyName("currency")] public string? Currency { get; set; }
-        [JsonPropertyName("source")] public OnafriqWebhookEndpoint? Source { get; set; }
-        [JsonPropertyName("destination")] public OnafriqWebhookEndpoint? Destination { get; set; }
-    }
-
-    private sealed class OnafriqWebhookEndpoint
-    {
-        [JsonPropertyName("country")] public string? Country { get; set; }
-        [JsonPropertyName("walletNumber")] public string? WalletNumber { get; set; }
+        [JsonPropertyName("phonenumber")] public string? PhoneNumber { get; set; }
+        [JsonPropertyName("last_error")] public string? LastError { get; set; }       // payments
+        [JsonPropertyName("error_message")] public string? ErrorMessage { get; set; } // collectionrequests
     }
 }

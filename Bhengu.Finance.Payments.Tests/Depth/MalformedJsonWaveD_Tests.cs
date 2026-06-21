@@ -382,8 +382,9 @@ public sealed class Onafriq_MalformedJsonTests
         new(new HttpClient(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK))),
             Options.Create(new OnafriqOptions
             {
-                ApiKey = "onafriq_test_key", MerchantId = "MERCH-001", WebhookSecret = "wh",
-                CallbackUrl = "https://example.com/cb", UseSandbox = true
+                ApiKey = "onafriq_test_key",
+                CallbackUrl = "https://example.com/cb",
+                WebhookBasicAuthUsername = "hookuser", WebhookBasicAuthPassword = "hookpass"
             }),
             NullLogger<OnafriqPaymentProvider>.Instance,
             null);

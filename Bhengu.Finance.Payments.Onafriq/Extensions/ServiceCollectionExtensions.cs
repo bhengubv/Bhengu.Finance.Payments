@@ -17,8 +17,8 @@ public static class ServiceCollectionExtensions
 {
     /// <summary>
     /// Register the Onafriq (formerly MFS Africa) provider. Reads configuration from
-    /// <c>Bhengu:Finance:Payments:Onafriq</c>. Fails fast at startup if required options
-    /// (ApiKey, MerchantId) are missing.
+    /// <c>Bhengu:Finance:Payments:Onafriq</c>. Fails fast at startup if the required
+    /// <see cref="OnafriqOptions.ApiKey"/> is missing.
     /// </summary>
     public static IServiceCollection AddOnafriqPayments(this IServiceCollection services, IConfiguration configuration)
     {
@@ -31,8 +31,6 @@ public static class ServiceCollectionExtensions
         var probe = section.Get<OnafriqOptions>() ?? new OnafriqOptions();
         if (string.IsNullOrWhiteSpace(probe.ApiKey))
             throw new ProviderConfigurationException("onafriq", $"{OnafriqOptions.ConfigSection}:ApiKey is required");
-        if (string.IsNullOrWhiteSpace(probe.MerchantId))
-            throw new ProviderConfigurationException("onafriq", $"{OnafriqOptions.ConfigSection}:MerchantId is required");
 
         services.AddBhenguInMemoryCache();
         services.AddHttpClient<OnafriqPaymentProvider>();
