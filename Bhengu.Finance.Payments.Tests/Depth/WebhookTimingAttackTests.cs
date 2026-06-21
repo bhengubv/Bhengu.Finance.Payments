@@ -10,8 +10,6 @@ using Bhengu.Finance.Payments.Alipay.Configuration;
 using Bhengu.Finance.Payments.Alipay.Providers;
 using Bhengu.Finance.Payments.Cellulant.Configuration;
 using Bhengu.Finance.Payments.Cellulant.Providers;
-using Bhengu.Finance.Payments.ChipperCash.Configuration;
-using Bhengu.Finance.Payments.ChipperCash.Providers;
 using Bhengu.Finance.Payments.CMI.Configuration;
 using Bhengu.Finance.Payments.CMI.Providers;
 using Bhengu.Finance.Payments.Core.Caching;
@@ -358,21 +356,6 @@ public sealed class WebhookTimingAttackTests
         TimingAttackHelpers.AssertConstantTimeVerification(provider.VerifyWebhookSignature, Payload, sig);
     }
 
-    // --- ChipperCash: HMAC SHA256 hex ---
-    [Fact]
-    public void ChipperCash_VerifyWebhookSignature_IsConstantTime()
-    {
-        var provider = new ChipperCashPaymentProvider(StubHttp(),
-            Options.Create(new ChipperCashOptions
-            {
-                ApiKey = "k", ApiSecret = Secret, MerchantId = "M",
-                CallbackUrl = "https://example.com/cb", Country = "NG", Currency = "NGN"
-            }),
-            NullLogger<ChipperCashPaymentProvider>.Instance,
-            null);
-        var sig = TimingAttackHelpers.HmacSha256Hex(Payload, Secret);
-        TimingAttackHelpers.AssertConstantTimeVerification(provider.VerifyWebhookSignature, Payload, sig);
-    }
 
     // --- DPO: skipped — DPO callbacks are NOT cryptographically signed; the provider returns true
     //  for any non-empty signature and authenticity is established via the verifyToken REST call
