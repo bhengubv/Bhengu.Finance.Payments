@@ -170,31 +170,6 @@ public class MercadoPagoPaymentProviderTests
     }
 
     [Fact]
-    public async Task ProcessPayoutAsync_ReturnsResponse_OnSuccess()
-    {
-        var handler = new StubHttpMessageHandler((req, _) =>
-        {
-            Assert.Contains("/v1/money_requests", req.RequestUri!.PathAndQuery);
-            return StubHttpMessageHandler.Json(HttpStatusCode.Created, """
-                {"id":55555,"status":"approved","amount":500.00,"currency_id":"BRL"}
-                """);
-        });
-        var provider = Create(handler);
-        var payout = await provider.ProcessPayoutAsync(new PayoutRequest
-        {
-            DestinationToken = "payee@example.com",
-            Amount = 500m,
-            Currency = "BRL",
-            Description = "Vendor payout"
-        });
-
-        Assert.Equal("55555", payout.GatewayReference);
-        Assert.Equal(PaymentStatus.Completed, payout.Status);
-        Assert.Equal(500m, payout.Amount);
-        Assert.Equal("BRL", payout.Currency);
-    }
-
-    [Fact]
     public void VerifyWebhookSignature_ReturnsFalse_WhenWebhookSecretMissing()
     {
         var provider = Create(

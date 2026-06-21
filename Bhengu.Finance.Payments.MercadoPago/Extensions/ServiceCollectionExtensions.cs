@@ -34,8 +34,8 @@ public static class ServiceCollectionExtensions
         services.AddHttpClient<MercadoPagoPaymentProvider>();
         services.AddTransient<IPaymentGatewayProvider, MercadoPagoPaymentProvider>(sp =>
             sp.GetRequiredService<MercadoPagoPaymentProvider>());
-        services.AddTransient<IPayoutProvider, MercadoPagoPaymentProvider>(sp =>
-            sp.GetRequiredService<MercadoPagoPaymentProvider>());
+
+        // Mercado Pago exposes no public disbursement endpoint, so no IPayoutProvider is registered.
 
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.MercadoPago, (sp, _) => sp.GetRequiredService<MercadoPagoPaymentProvider>());
 

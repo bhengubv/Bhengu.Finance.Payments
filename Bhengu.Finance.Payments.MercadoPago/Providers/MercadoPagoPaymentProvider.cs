@@ -21,11 +21,19 @@ namespace Bhengu.Finance.Payments.MercadoPago.Providers;
 
 /// <summary>
 /// Mercado Pago (Latin America) payment gateway provider. Wraps the Mercado Pago REST API
-/// (<c>https://api.mercadopago.com</c>) for card, PIX, boleto and wallet payments, refunds and money-out payouts.
+/// (<c>https://api.mercadopago.com</c>) for card, PIX, boleto and wallet payments and refunds.
 /// PIX charges return the QR code + copy-paste string under <c>point_of_interaction.transaction_data</c>.
 /// </summary>
+/// <remarks>
+/// Mercado Pago exposes no public "send money to anyone" disbursement endpoint, so this provider does
+/// not implement <see cref="IPayoutProvider"/>. Mercado Pago's own guidance is that its APIs are
+/// "designed only to support selling products and services, and not for money transfers between bank
+/// accounts." Marketplace settlement to sellers is handled implicitly via <c>collector_id</c> +
+/// <c>application_fee</c> on the split charge (see <see cref="MercadoPagoMarketplaceProvider"/>), not a
+/// standalone payout call.
+/// </remarks>
 [ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
-public sealed class MercadoPagoPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
+public sealed class MercadoPagoPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider
 {
     private readonly HttpClient _httpClient;
     private readonly MercadoPagoOptions _options;
@@ -35,7 +43,6 @@ public sealed class MercadoPagoPaymentProvider : BhenguProviderBase, IPaymentGat
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
         ProviderCapabilities.Refund |
-        ProviderCapabilities.Payout |
         ProviderCapabilities.Webhook |
         ProviderCapabilities.Cards |
         ProviderCapabilities.BankTransfer |
@@ -157,45 +164,6 @@ public sealed class MercadoPagoPaymentProvider : BhenguProviderBase, IPaymentGat
             Status = MapStatus(refundResponse?.Status ?? "approved"),
             ProcessedAt = DateTime.UtcNow,
             Message = refundResponse?.Status
-        };
-    }
-
-    /// <inheritdoc/>
-    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(request);
-        return RunPayoutAsync(request.Currency, () => ProcessPayoutCoreAsync(request, ct), ct);
-    }
-
-    private async Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
-    {
-        // Mercado Pago money-out: POST /v1/money_requests
-        var requestBody = new
-        {
-            amount = request.Amount,
-            currency_id = request.Currency,
-            description = request.Description,
-            payer_id = _options.AccessToken,
-            payee = new
-            {
-                email = request.DestinationToken,
-                identification = new { type = "CPF", number = string.Empty }
-            }
-        };
-
-        var (body, _) = await SendAsync(HttpMethod.Post, "/v1/money_requests", requestBody, ct, "ProcessPayout").ConfigureAwait(false);
-        var payoutResponse = JsonSerializer.Deserialize<MercadoPagoPayoutResponse>(body);
-
-        Logger.LogInformation("Mercado Pago payout created: {PayoutId} status={Status}",
-            payoutResponse?.Id, payoutResponse?.Status);
-
-        return new PayoutResponse
-        {
-            GatewayReference = payoutResponse?.Id?.ToString() ?? string.Empty,
-            Status = MapStatus(payoutResponse?.Status ?? "pending"),
-            Amount = payoutResponse?.Amount ?? request.Amount,
-            Currency = payoutResponse?.CurrencyId ?? request.Currency,
-            ProcessedAt = DateTime.UtcNow
         };
     }
 
@@ -483,14 +451,6 @@ public sealed class MercadoPagoPaymentProvider : BhenguProviderBase, IPaymentGat
         [JsonPropertyName("payment_id")] public long? PaymentId { get; set; }
         [JsonPropertyName("amount")] public decimal? Amount { get; set; }
         [JsonPropertyName("status")] public string? Status { get; set; }
-    }
-
-    private sealed class MercadoPagoPayoutResponse
-    {
-        [JsonPropertyName("id")] public long? Id { get; set; }
-        [JsonPropertyName("status")] public string? Status { get; set; }
-        [JsonPropertyName("amount")] public decimal? Amount { get; set; }
-        [JsonPropertyName("currency_id")] public string? CurrencyId { get; set; }
     }
 
     private sealed class MercadoPagoWebhookEvent

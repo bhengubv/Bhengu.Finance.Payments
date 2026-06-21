@@ -1,6 +1,6 @@
 # Bhengu.Finance.Payments.MercadoPago
 
-Mercado Pago adapter for the Bhengu.Finance.Payments family — Argentina, Brazil, Chile, Colombia, Mexico, Peru, Uruguay and Venezuela. Cards, PIX, boleto, and Mercado wallet via the Mercado Pago REST API, with charge, refund, webhook verification, payouts, vaulted tokenisation, recurring subscriptions, marketplace splits, and PIX QR generation behind the Bhengu canonical contracts.
+Mercado Pago adapter for the Bhengu.Finance.Payments family — Argentina, Brazil, Chile, Colombia, Mexico, Peru, Uruguay and Venezuela. Cards, PIX, boleto, and Mercado wallet via the Mercado Pago REST API, with charge, refund, webhook verification, vaulted tokenisation, recurring subscriptions, marketplace splits, and PIX QR generation behind the Bhengu canonical contracts. Mercado Pago exposes no public disbursement endpoint, so this adapter does not implement `IPayoutProvider`.
 
 ## Install
 
@@ -13,7 +13,6 @@ dotnet add package Bhengu.Finance.Payments.MercadoPago
 | Contract | Provider class | Notes |
 |---|---|---|
 | `IPaymentGatewayProvider` | `MercadoPagoPaymentProvider` | Charge / refund / webhook verify |
-| `IPayoutProvider` | `MercadoPagoPaymentProvider` | Money-request disbursement |
 | `ITokenisationProvider` | `MercadoPagoTokenisationProvider` | Read vaulted card tokens |
 | `ISubscriptionProvider` | `MercadoPagoSubscriptionProvider` | Plans + subscriptions |
 | `IMarketplaceProvider` | `MercadoPagoMarketplaceProvider` | Split payments + sub-accounts |
