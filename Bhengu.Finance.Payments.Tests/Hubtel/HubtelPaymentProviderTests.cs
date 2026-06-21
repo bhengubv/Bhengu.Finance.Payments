@@ -80,8 +80,11 @@ public class HubtelPaymentProviderTests
     {
         var handler = new StubHttpMessageHandler((req, _) =>
         {
+            // Online Checkout initiate: POST https://payproxyapi.hubtel.com/items/initiate (Basic auth).
+            // Source: https://businessdocs-developers.hubtel.com/docs/api-reference-online-checkout
             Assert.Equal(HttpMethod.Post, req.Method);
-            Assert.Contains("checkout/initiate", req.RequestUri!.PathAndQuery);
+            Assert.Equal("payproxyapi.hubtel.com", req.RequestUri!.Host);
+            Assert.Equal("/items/initiate", req.RequestUri!.AbsolutePath);
             Assert.NotNull(req.Headers.Authorization);
             Assert.Equal("Basic", req.Headers.Authorization!.Scheme);
             return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
@@ -134,7 +137,9 @@ public class HubtelPaymentProviderTests
     {
         var handler = new StubHttpMessageHandler((req, _) =>
         {
-            Assert.Contains("transactions/refund", req.RequestUri!.PathAndQuery);
+            // Refund: POST https://api.hubtel.com/v1/merchantaccount/merchants/{account}/transactions/refund
+            Assert.Equal("api.hubtel.com", req.RequestUri!.Host);
+            Assert.Equal("/v1/merchantaccount/merchants/1234567/transactions/refund", req.RequestUri!.AbsolutePath);
             return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
                 {"status":"Success","message":"ok","data":{"transactionId":"rf-1","status":"refunded"}}
                 """);
@@ -156,8 +161,9 @@ public class HubtelPaymentProviderTests
     {
         var handler = new StubHttpMessageHandler((req, _) =>
         {
-            Assert.Contains("merchantaccount/merchants/", req.RequestUri!.PathAndQuery);
-            Assert.Contains("send/mobilemoney", req.RequestUri!.PathAndQuery);
+            // Send money: POST https://api.hubtel.com/v1/merchantaccount/merchants/{account}/send/mobilemoney
+            Assert.Equal("api.hubtel.com", req.RequestUri!.Host);
+            Assert.Equal("/v1/merchantaccount/merchants/1234567/send/mobilemoney", req.RequestUri!.AbsolutePath);
             return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
                 {"responseCode":"0000","status":"Success","data":{"transactionId":"po-1","clientReference":"po-ref","transactionStatus":"success"}}
                 """);

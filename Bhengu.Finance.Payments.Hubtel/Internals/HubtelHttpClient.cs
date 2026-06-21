@@ -12,9 +12,25 @@ namespace Bhengu.Finance.Payments.Hubtel.Internals;
 /// <summary>
 /// Shared HTTP-call helper for every Hubtel sibling provider. Centralises JSON shaping
 /// and the exception-translation pattern (rate-limit / declined / unavailable).
+/// <para>
+/// The <c>path</c> argument may be an absolute URI. Hubtel splits its surface across two hosts
+/// (payproxyapi.hubtel.com for Online Checkout, api.hubtel.com for Merchant Account), so providers
+/// pass per-operation absolute URLs rather than relying on a single <see cref="HttpClient.BaseAddress"/>.
+/// </para>
 /// </summary>
 internal static class HubtelHttpClient
 {
+    /// <summary>
+    /// Serializer options shared by every Hubtel provider. Hubtel mixes casings across products —
+    /// Online Checkout uses camelCase, Merchant Account / callbacks use PascalCase — so reads are
+    /// case-insensitive; writes drop nulls to keep request bodies tight.
+    /// </summary>
+    public static readonly JsonSerializerOptions Json = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+    };
+
     /// <summary>Send a JSON request and return the raw response body, translating Hubtel errors into the SDK exception taxonomy.</summary>
     public static async Task<string> SendAsync(
         HttpClient httpClient,
@@ -31,7 +47,7 @@ internal static class HubtelHttpClient
         using var req = new HttpRequestMessage(method, path);
         if (body is not null)
         {
-            var json = JsonSerializer.Serialize(body);
+            var json = JsonSerializer.Serialize(body, Json);
             req.Content = new StringContent(json, Encoding.UTF8, "application/json");
         }
 

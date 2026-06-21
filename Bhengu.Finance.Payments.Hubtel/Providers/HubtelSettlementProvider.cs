@@ -18,16 +18,22 @@ using Microsoft.Extensions.Options;
 namespace Bhengu.Finance.Payments.Hubtel.Providers;
 
 /// <summary>
-/// Hubtel settlement provider — wraps the Hubtel reconciliation feed.
+/// Hubtel settlement provider — wraps the Hubtel Merchant-Account reconciliation feed on
+/// <c>https://api.hubtel.com/v1/merchantaccount/...</c> (Basic auth).
 /// <para>
-/// Hubtel surfaces settlements via <c>/merchantaccount/merchants/{posSalesNumber}/statement</c> and
-/// constituent transactions via <c>/transactions/{posSalesNumber}/history</c> with date filters.
+/// UNVERIFIED PATHS: the merchant-account HOST (api.hubtel.com/v1) is confirmed, but Hubtel does not
+/// publicly document a settlement/statement REST feed. The specific paths used here
+/// (<c>.../merchants/{posSalesNumber}/statement</c> and <c>.../transactions/{posSalesNumber}/history</c>)
+/// and their JSON shapes are NOT documented and are carried over unverified from the prior
+/// implementation — left in place (host-corrected only) rather than invented anew. Validate against a
+/// live Hubtel merchant account before relying on settlement reconciliation.
 /// </para>
 /// </summary>
 public sealed class HubtelSettlementProvider : BhenguProviderBase, ISettlementProvider
 {
     private readonly HttpClient _httpClient;
     private readonly HubtelOptions _options;
+    private readonly Uri _merchantBase;
 
     /// <inheritdoc/>
     public override string ProviderName => ProviderNames.Hubtel;
@@ -49,14 +55,10 @@ public sealed class HubtelSettlementProvider : BhenguProviderBase, ISettlementPr
         if (string.IsNullOrWhiteSpace(_options.MerchantAccountNumber))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(HubtelOptions.MerchantAccountNumber)} is required");
 
+        // Merchant-Account host (api.hubtel.com). Calls below use absolute URIs built from this.
+        _merchantBase = _options.ResolvedMerchantBaseUrl;
         if (_httpClient.BaseAddress is null)
-        {
-            var raw = _options.UseSandbox
-                ? _options.SandboxUrl ?? "https://api-txnstatus.hubtel.com/"
-                : _options.BaseUrl ?? "https://api-txnstatus.hubtel.com/";
-            if (!raw.EndsWith('/')) raw += "/";
-            _httpClient.BaseAddress = new Uri(raw);
-        }
+            _httpClient.BaseAddress = _merchantBase;
 
         var basic = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{_options.ClientId}:{_options.ClientSecret}"));
         if (_httpClient.DefaultRequestHeaders.Authorization is null)
@@ -66,9 +68,10 @@ public sealed class HubtelSettlementProvider : BhenguProviderBase, ISettlementPr
     /// <inheritdoc/>
     public async IAsyncEnumerable<Settlement> ListSettlementsAsync(DateTime fromUtc, DateTime toUtc, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        var path = $"merchantaccount/merchants/{Uri.EscapeDataString(_options.MerchantAccountNumber)}/statement?from={fromUtc:yyyy-MM-dd}&to={toUtc:yyyy-MM-dd}";
+        // UNVERIFIED path (see class docs); host api.hubtel.com/v1/merchantaccount is verified.
+        var path = new Uri(_merchantBase, $"v1/merchantaccount/merchants/{Uri.EscapeDataString(_options.MerchantAccountNumber)}/statement?from={fromUtc:yyyy-MM-dd}&to={toUtc:yyyy-MM-dd}").ToString();
         var responseBody = await HubtelHttpClient.SendAsync(_httpClient, Logger, HttpMethod.Get, path, body: null, ct, "ListSettlements").ConfigureAwait(false);
-        var envelope = JsonSerializer.Deserialize<HubtelStatementResponse>(responseBody);
+        var envelope = JsonSerializer.Deserialize<HubtelStatementResponse>(responseBody, HubtelHttpClient.Json);
         var items = envelope?.Data;
 
         Logger.LogInformation("Hubtel settlements listed: {Count} between {From:O} and {To:O}", items?.Count ?? 0, fromUtc, toUtc);
@@ -92,9 +95,10 @@ public sealed class HubtelSettlementProvider : BhenguProviderBase, ISettlementPr
     {
         try
         {
-            var path = $"merchantaccount/merchants/{Uri.EscapeDataString(_options.MerchantAccountNumber)}/statement/{Uri.EscapeDataString(settlementReference)}";
+            // UNVERIFIED path (see class docs); host verified.
+            var path = new Uri(_merchantBase, $"v1/merchantaccount/merchants/{Uri.EscapeDataString(_options.MerchantAccountNumber)}/statement/{Uri.EscapeDataString(settlementReference)}").ToString();
             var responseBody = await HubtelHttpClient.SendAsync(_httpClient, Logger, HttpMethod.Get, path, body: null, ct, "GetSettlement").ConfigureAwait(false);
-            var envelope = JsonSerializer.Deserialize<HubtelStatementSingleResponse>(responseBody);
+            var envelope = JsonSerializer.Deserialize<HubtelStatementSingleResponse>(responseBody, HubtelHttpClient.Json);
             return envelope?.Data is null ? null : ToSettlement(envelope.Data);
         }
         catch (PaymentDeclinedException ex) when (ex.ProviderErrorCode == "404")
@@ -108,9 +112,10 @@ public sealed class HubtelSettlementProvider : BhenguProviderBase, ISettlementPr
     {
         ArgumentException.ThrowIfNullOrEmpty(settlementReference);
 
-        var path = $"transactions/{Uri.EscapeDataString(_options.MerchantAccountNumber)}/history?statementId={Uri.EscapeDataString(settlementReference)}";
+        // UNVERIFIED path (see class docs); host verified.
+        var path = new Uri(_merchantBase, $"v1/merchantaccount/transactions/{Uri.EscapeDataString(_options.MerchantAccountNumber)}/history?statementId={Uri.EscapeDataString(settlementReference)}").ToString();
         var responseBody = await HubtelHttpClient.SendAsync(_httpClient, Logger, HttpMethod.Get, path, body: null, ct, "ListSettlementTransactions").ConfigureAwait(false);
-        var envelope = JsonSerializer.Deserialize<HubtelTransactionListResponse>(responseBody);
+        var envelope = JsonSerializer.Deserialize<HubtelTransactionListResponse>(responseBody, HubtelHttpClient.Json);
         var items = envelope?.Data;
 
         if (items is null) yield break;

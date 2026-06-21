@@ -75,6 +75,23 @@ public class HubtelTypedWebhookTests
     }
 
     [Fact]
+    public async Task ParseWebhookAsync_ParsesRealHubtelPascalCaseCallback_AsChargeSucceeded()
+    {
+        // The REAL Hubtel Online Checkout callback: PascalCase, no "type", ResponseCode "0000",
+        // status + identifiers under Data. Source:
+        // https://businessdocs-developers.hubtel.com/reference/checkout-callback
+        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
+        var evt = await provider.ParseWebhookAsync("""
+            {"ResponseCode":"0000","Status":"Success","Data":{"CheckoutId":"59e2fbbff4e443b98e09346881ac7e9a","SalesInvoiceId":"e96ccfb4746045bba13f425bd573a31c","ClientReference":"Kaks545253","Status":"Success","Amount":0.5,"CustomerPhoneNumber":"233242825109","PaymentDetails":{"MobileMoneyNumber":"233242825109","PaymentType":"mobilemoney","Channel":"mtn-gh"},"Description":"The MTN Mobile Money payment has been approved and processed successfully."}}
+            """);
+        var typed = Assert.IsType<ChargeSucceededEvent>(evt);
+        Assert.Equal(WebhookEventCategory.ChargeSucceeded, typed.Category);
+        Assert.Equal("Kaks545253", typed.GatewayReference);
+        Assert.Equal(PaymentStatus.Completed, typed.Status);
+        Assert.Equal(0.5m, typed.Amount);
+    }
+
+    [Fact]
     public async Task ParseWebhookAsync_ReturnsChargeFailedEvent_ForFailedStatus()
     {
         var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
