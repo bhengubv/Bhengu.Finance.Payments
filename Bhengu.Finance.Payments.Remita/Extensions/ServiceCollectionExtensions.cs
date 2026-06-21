@@ -19,8 +19,10 @@ public static class ServiceCollectionExtensions
     /// <summary>
     /// Register the Remita provider. Reads configuration from <c>Bhengu:Finance:Payments:Remita</c>.
     /// Fails fast at startup if required options (MerchantId, ServiceTypeId, ApiKey) are missing.
-    /// Registers charge + refund + payout + mandate + settlement, keyed by
-    /// <see cref="ProviderNames.Remita"/>.
+    /// Registers charge (RRR generation) + mandate + settlement, keyed by
+    /// <see cref="ProviderNames.Remita"/>. Note: <c>IPayoutProvider</c> is still registered for
+    /// interface-resolution compatibility, but <c>ProcessPayoutAsync</c>/<c>ProcessRefundAsync</c>
+    /// throw <c>not_supported</c> — Remita publishes no refund or e-collection send-money API.
     /// </summary>
     public static IServiceCollection AddRemitaPayments(this IServiceCollection services, IConfiguration configuration)
     {

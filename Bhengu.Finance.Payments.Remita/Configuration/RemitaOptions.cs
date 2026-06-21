@@ -23,10 +23,17 @@ public sealed class RemitaOptions
     /// <summary>Optional API token / secret companion to ApiKey for newer flows.</summary>
     public string ApiToken { get; set; } = string.Empty;
 
-    /// <summary>Funding bank code for Single Send Money payouts (required for IPayoutProvider calls).</summary>
+    /// <summary>
+    /// Funding bank code. Retained for binding compatibility but NOT used by the active e-collection
+    /// surface — Remita disbursement runs through the separate RITS API, not this provider. See
+    /// <c>RemitaPaymentProvider.ProcessPayoutAsync</c>, which throws <c>not_supported</c>.
+    /// </summary>
     public string FromBank { get; set; } = string.Empty;
 
-    /// <summary>Debit account number used for payouts.</summary>
+    /// <summary>
+    /// Debit account number. Retained for binding compatibility but NOT used by the active
+    /// e-collection surface (see <see cref="FromBank"/>).
+    /// </summary>
     public string DebitAccount { get; set; } = string.Empty;
 
     /// <summary>Default ISO 4217 currency code. Remita is Nigeria-centric; defaults to "NGN".</summary>

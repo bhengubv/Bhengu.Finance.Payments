@@ -21,21 +21,33 @@ using Microsoft.Extensions.Options;
 namespace Bhengu.Finance.Payments.Remita.Providers;
 
 /// <summary>
-/// Remita (SystemSpecs) payment + payout provider. Wraps the Remita REST surface for
-/// Nigerian government revenue collection, corporate disbursement, e-collection, and
-/// Single Send Money payouts. Authentication uses SHA-512 hex hashes of concatenated
-/// fields with the configured API key — Remita does NOT use bearer tokens for these endpoints.
+/// Remita (SystemSpecs) e-collection provider. Wraps Remita's documented RRR (Remita Retrieval
+/// Reference) generation flow for Nigerian revenue collection. Authentication uses SHA-512 hex
+/// hashes of concatenated fields with the configured API key carried in the
+/// <c>remitaConsumerKey=..,remitaConsumerToken=..</c> Authorization header — Remita's e-collection
+/// endpoints do NOT use bearer tokens.
 /// </summary>
-[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
+/// <remarks>
+/// <para><b>Scope.</b> This provider implements Remita's publicly documented <c>paymentinit</c>
+/// (RRR generation) endpoint. The verified wire format is taken from Remita's own sample SDK
+/// (<see href="https://github.com/RemitaPaymentServices/remita-rrr-generator-status-dotnet"/>).</para>
+/// <para><b>Refund / payout are deliberately not implemented.</b> Remita publishes no e-collection
+/// refund API (a code search of every official <c>RemitaPaymentServices</c> SDK returns no refund
+/// endpoint), and its real disbursement product (RITS — <c>rpgsvc/v3/rpg/single/payment</c>) is a
+/// separate Bearer-token + AES-128-CBC integration that shares neither host path, auth scheme, nor
+/// request shape with this e-collection surface. Rather than ship invented wire details for money
+/// movement, <see cref="ProcessRefundAsync"/> and <see cref="ProcessPayoutAsync"/> throw
+/// <c>not_supported</c>. See <see href="https://github.com/RemitaPaymentServices/rits-sdk-dotnet-v3"/>
+/// to integrate RITS as a dedicated provider when required.</para>
+/// </remarks>
+[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "RRR-generation wire format built from Remita's published sample SDK (github.com/RemitaPaymentServices/remita-rrr-generator-status-dotnet); never sandbox-verified.")]
 public sealed class RemitaPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
+    // Verified against Remita's official sample (RemitaPaymentServices/remita-rrr-generator-status-dotnet,
+    // Program.cs GENERATE_RRR) and the PHP sample (remita-rrr-generator-status-php). Demo host
+    // https://remitademo.net, live host https://login.remita.net.
     private const string PaymentInitPath =
         "remita/exapp/api/v1/send/api/echannelsvc/merchant/api/paymentinit";
-
-    private const string SendMoneyPath =
-        "remita/exapp/api/v1/send/api/echannelsvc/merchant/api/sendmoney";
-
-    private const string RefundPath = "remita/refundservice/refund/initiate";
 
     private readonly HttpClient _httpClient;
     private readonly RemitaOptions _options;
@@ -45,13 +57,14 @@ public sealed class RemitaPaymentProvider : BhenguProviderBase, IPaymentGatewayP
     public override string ProviderName => ProviderNames.Remita;
 
     /// <inheritdoc />
+    /// <remarks>
+    /// Refund / PartialRefund / Payout are intentionally absent: Remita exposes no public
+    /// e-collection refund or send-money endpoint on this surface (see <see cref="ProcessRefundAsync"/>
+    /// / <see cref="ProcessPayoutAsync"/>, which throw <c>not_supported</c>).
+    /// </remarks>
     public ProviderCapabilities Capabilities =>
         ProviderCapabilities.Charge |
-        ProviderCapabilities.Refund |
-        ProviderCapabilities.PartialRefund |
-        ProviderCapabilities.Payout |
         ProviderCapabilities.Webhook |
-        ProviderCapabilities.BankTransfer |
         ProviderCapabilities.Settlement |
         ProviderCapabilities.Mandates |
         ProviderCapabilities.Idempotency |
@@ -141,121 +154,44 @@ public sealed class RemitaPaymentProvider : BhenguProviderBase, IPaymentGatewayP
         }, ct);
 
     /// <inheritdoc />
+    /// <remarks>
+    /// Remita exposes no public refund API on its e-collection surface. A code search of every
+    /// official <c>RemitaPaymentServices</c> SDK (RRR/status, direct-debit mandate, and RITS
+    /// disbursement) returns no refund endpoint. Refunds/reversals are handled out-of-band through
+    /// the Remita merchant portal, so this method throws rather than POST an invented path.
+    /// </remarks>
     public Task<RefundResponse> ProcessRefundAsync(RefundRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return _idempotency is null
-            ? ProcessRefundCoreAsync(request, ct)
-            : _idempotency.GetOrAddAsync(request.IdempotencyKey, "refund",
-                () => ProcessRefundCoreAsync(request, ct), ct);
+        throw new BhenguPaymentException(ProviderName,
+            "Remita exposes no public refund API; process refunds/reversals via the Remita merchant portal.",
+            providerErrorCode: "not_supported");
     }
 
-    private Task<RefundResponse> ProcessRefundCoreAsync(RefundRequest request, CancellationToken ct)
-        => RunRefundAsync(request.GatewayReference, async () =>
-        {
-            var amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture);
-            var hash = Sha512Hex(_options.MerchantId + request.GatewayReference + amount + _options.ApiKey);
-
-            var requestBody = new
-            {
-                merchantId = _options.MerchantId,
-                rrr = request.GatewayReference,
-                amount,
-                reason = request.Reason,
-                hash
-            };
-
-            var authHeader = $"remitaConsumerKey={_options.MerchantId},remitaConsumerToken={hash}";
-            var body = await SendAsync(HttpMethod.Post, RefundPath, requestBody, ct, "ProcessRefund", authHeader)
-                .ConfigureAwait(false);
-
-            var refundResponse = JsonSerializer.Deserialize<RemitaRefundResponse>(body);
-
-            Logger.LogInformation("Remita refund initiated: refundRef={RefundRef} rrr={Rrr}",
-                refundResponse?.RefundReference, request.GatewayReference);
-
-            var status = MapStatusCode(refundResponse?.StatusCode);
-
-            return new RefundResponse
-            {
-                GatewayReference = refundResponse?.RefundReference ?? request.GatewayReference,
-                Amount = request.Amount,
-                Status = status,
-                ProcessedAt = DateTime.UtcNow,
-                Message = refundResponse?.Status
-            };
-        }, ct);
-
     /// <inheritdoc />
+    /// <remarks>
+    /// Remita's e-collection surface (the one this provider speaks) has no send-money endpoint. Its
+    /// real disbursement product is RITS (<c>rpgsvc/v3/rpg/single/payment</c>), a separate
+    /// Bearer-token + AES-128-CBC API with a different host path, auth model and request shape —
+    /// see <see href="https://github.com/RemitaPaymentServices/rits-sdk-dotnet-v3"/>. Rather than
+    /// emit invented wire details for money movement, this method throws; integrate RITS as a
+    /// dedicated provider to disburse.
+    /// </remarks>
     public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return _idempotency is null
-            ? ProcessPayoutCoreAsync(request, ct)
-            : _idempotency.GetOrAddAsync(request.IdempotencyKey, "payout",
-                () => ProcessPayoutCoreAsync(request, ct), ct);
+        throw new BhenguPaymentException(ProviderName,
+            "Remita exposes no public disbursement API on this e-collection surface; use the Remita RITS API (rits-sdk-dotnet) as a dedicated provider to send money.",
+            providerErrorCode: "not_supported");
     }
 
-    private Task<PayoutResponse> ProcessPayoutCoreAsync(PayoutRequest request, CancellationToken ct)
-        => RunPayoutAsync(request.Currency, async () =>
-        {
-            if (string.IsNullOrWhiteSpace(_options.FromBank) || string.IsNullOrWhiteSpace(_options.DebitAccount))
-                throw new ProviderConfigurationException(ProviderName,
-                    "Remita payouts require FromBank and DebitAccount to be configured.");
-
-            // DestinationToken format: "<creditBank>:<creditAccount>" (e.g. "058:0123456789").
-            var colon = request.DestinationToken.IndexOf(':');
-            if (colon <= 0)
-                throw new BhenguPaymentException(ProviderName,
-                    "Remita PayoutRequest.DestinationToken must be 'creditBankCode:creditAccountNumber'.",
-                    providerErrorCode: "invalid_destination");
-
-            var creditBank = request.DestinationToken[..colon];
-            var creditAccount = request.DestinationToken[(colon + 1)..];
-            var transRef = request.IdempotencyKey ?? $"sm-{Guid.NewGuid():N}";
-            var amount = request.Amount.ToString("F2", CultureInfo.InvariantCulture);
-
-            var hash = Sha512Hex(
-                _options.MerchantId + creditAccount + amount + _options.ApiKey);
-
-            var requestBody = new
-            {
-                fromBank = _options.FromBank,
-                debitAccount = _options.DebitAccount,
-                creditAccount,
-                creditBank,
-                narration = request.Description,
-                amount,
-                transRef,
-                custName = request.Description
-            };
-
-            var authHeader = $"remitaConsumerKey={_options.MerchantId},remitaConsumerToken={hash}";
-            var body = await SendAsync(HttpMethod.Post, SendMoneyPath, requestBody, ct, "ProcessPayout", authHeader)
-                .ConfigureAwait(false);
-
-            var payoutResponse = JsonSerializer.Deserialize<RemitaSendMoneyResponse>(body);
-
-            Logger.LogInformation("Remita Single Send Money queued: transRef={TransRef} statusCode={StatusCode}",
-                transRef, payoutResponse?.StatusCode);
-
-            var status = MapStatusCode(payoutResponse?.StatusCode);
-
-            return new PayoutResponse
-            {
-                GatewayReference = payoutResponse?.TransRef ?? transRef,
-                Status = status,
-                Amount = request.Amount,
-                Currency = request.Currency,
-                ProcessedAt = DateTime.UtcNow
-            };
-        }, ct);
-
     /// <summary>
-    /// Verify a Remita webhook callback. Remita signs callbacks with SHA-512 of
-    /// (rrr + status + apiKey). <paramref name="payload"/> is interpreted as the
-    /// JSON callback body and parsed to extract rrr + status; <paramref name="signature"/> is
-    /// the SHA-512 hex value Remita supplies.
+    /// Verify a Remita webhook callback. <paramref name="payload"/> is interpreted as the JSON
+    /// callback body and parsed to extract rrr + status; <paramref name="signature"/> is the
+    /// SHA-512 hex value Remita supplies. NOTE: the callback-signature scheme is UNVERIFIED —
+    /// Remita publishes no callback-signature spec in its official sample SDKs (see the inline note
+    /// on the hash construction). Do not rely on this as the sole authenticity gate without
+    /// confirming against a real Remita merchant notification.
     /// </summary>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
@@ -276,6 +212,9 @@ public sealed class RemitaPaymentProvider : BhenguProviderBase, IPaymentGatewayP
                 if (callback is null || string.IsNullOrEmpty(callback.Rrr) || string.IsNullOrEmpty(callback.Status))
                     return false;
 
+                // UNVERIFIED: Remita publishes no callback-signature spec in its official sample SDKs.
+                // The SHA512(rrr+status+apiKey) scheme here is a best-effort guess; confirm against a
+                // real Remita merchant notification before trusting it as the sole authenticity gate.
                 var expected = Sha512Hex(callback.Rrr + callback.Status + _options.ApiKey);
                 return CryptographicOperations.FixedTimeEquals(
                     Encoding.UTF8.GetBytes(signature),
@@ -525,20 +464,6 @@ public sealed class RemitaPaymentProvider : BhenguProviderBase, IPaymentGatewayP
         [JsonPropertyName("statuscode")] public string? StatusCode { get; set; }
         [JsonPropertyName("RRR")] public string? Rrr { get; set; }
         [JsonPropertyName("status")] public string? Status { get; set; }
-    }
-
-    private sealed class RemitaRefundResponse
-    {
-        [JsonPropertyName("statuscode")] public string? StatusCode { get; set; }
-        [JsonPropertyName("status")] public string? Status { get; set; }
-        [JsonPropertyName("refundReference")] public string? RefundReference { get; set; }
-    }
-
-    private sealed class RemitaSendMoneyResponse
-    {
-        [JsonPropertyName("statuscode")] public string? StatusCode { get; set; }
-        [JsonPropertyName("status")] public string? Status { get; set; }
-        [JsonPropertyName("transRef")] public string? TransRef { get; set; }
     }
 
     private sealed class RemitaWebhookEvent

@@ -139,65 +139,36 @@ public class RemitaPaymentProviderTests
         await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.ProcessPaymentAsync(SamplePayment()));
     }
 
+    // Remita publishes no refund endpoint in any official SDK — ProcessRefundAsync throws not_supported.
     [Fact]
-    public async Task ProcessRefundAsync_ReturnsResponse_OnSuccess()
+    public async Task ProcessRefundAsync_Throws_NotSupported()
     {
-        var handler = new StubHttpMessageHandler((req, _) =>
-        {
-            Assert.Contains("refund/initiate", req.RequestUri!.PathAndQuery);
-            return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
-                {"statuscode":"0","status":"Refund Initiated","refundReference":"REF-12345"}
-                """);
-        });
-        var provider = Create(handler);
-        var refund = await provider.ProcessRefundAsync(new RefundRequest
+        var provider = Create(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
+        var ex = await Assert.ThrowsAsync<BhenguPaymentException>(() => provider.ProcessRefundAsync(new RefundRequest
         {
             GatewayReference = "290008931930",
             Amount = 500m,
             Reason = "Customer cancelled"
-        });
-
-        Assert.Equal("REF-12345", refund.GatewayReference);
-        Assert.Equal(PaymentStatus.Completed, refund.Status);
-        Assert.Equal(500m, refund.Amount);
+        }));
+        Assert.Equal("not_supported", ex.ProviderErrorCode);
+        Assert.Equal("remita", ex.ProviderName);
     }
 
+    // Remita's e-collection surface has no send-money endpoint (disbursement is the separate RITS API) —
+    // ProcessPayoutAsync throws not_supported.
     [Fact]
-    public async Task ProcessPayoutAsync_ReturnsResponse_OnSuccess()
+    public async Task ProcessPayoutAsync_Throws_NotSupported()
     {
-        var handler = new StubHttpMessageHandler((req, _) =>
-        {
-            Assert.Contains("sendmoney", req.RequestUri!.PathAndQuery);
-            return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
-                {"statuscode":"00","status":"Approved","transRef":"sm-xyz"}
-                """);
-        });
-        var provider = Create(handler);
-        var payout = await provider.ProcessPayoutAsync(new PayoutRequest
+        var provider = Create(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
+        var ex = await Assert.ThrowsAsync<BhenguPaymentException>(() => provider.ProcessPayoutAsync(new PayoutRequest
         {
             DestinationToken = "058:0123456789",
             Amount = 750m,
             Currency = "NGN",
             Description = "Vendor disbursement"
-        });
-
-        Assert.Equal("sm-xyz", payout.GatewayReference);
-        Assert.Equal(750m, payout.Amount);
-    }
-
-    [Fact]
-    public async Task ProcessPayoutAsync_Throws_OnMissingDestinationColon()
-    {
-        var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}"));
-        var provider = Create(handler);
-        await Assert.ThrowsAsync<BhenguPaymentException>(() =>
-            provider.ProcessPayoutAsync(new PayoutRequest
-            {
-                DestinationToken = "no-colon-here",
-                Amount = 100m,
-                Currency = "NGN",
-                Description = "x"
-            }));
+        }));
+        Assert.Equal("not_supported", ex.ProviderErrorCode);
+        Assert.Equal("remita", ex.ProviderName);
     }
 
     [Fact]
