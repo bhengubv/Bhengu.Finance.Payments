@@ -29,17 +29,31 @@ Bind options from `Bhengu:Finance:Payments:Ozow`:
       "Payments": {
         "Ozow": {
           "SiteCode": "ABC123",
-          "PrivateKey": "...",
-          "ApiKey": "...",
-          "UseSandbox": false,
-          "BaseUrl": null,        // optional override
-          "SandboxUrl": null      // optional override
+          "PrivateKey": "...",       // used for the SHA-512 HashCheck + webhook hash
+          "ApiKey": "...",           // sent on the ApiKey header for api.ozow.com status calls
+          "CountryCode": "ZA",       // posted as CountryCode (part of the HashCheck)
+          "UseSandbox": false,       // maps to Ozow's IsTest flag
+          "PaymentBaseUrl": null,    // optional override of the pay.ozow.com redirect host
+          "ApiBaseUrl": null         // optional override of the api.ozow.com status host
         }
       }
     }
   }
 }
 ```
+
+## How the charge works (redirect flow)
+
+Ozow's customer payment is a **redirect**, not a JSON API call. `ProcessPaymentAsync` builds a signed request
+(the post variables plus a SHA-512 `HashCheck`) and returns a `PaymentResponse` with `Status = Pending` and the
+`https://pay.ozow.com/...` URL in `RedirectUrl`. Send the payer there to complete the payment; the outcome arrives
+on your `NotifyUrl` webhook (parse it with `ParseWebhookAsync`) and can be reconciled server-side via
+`GetTransactionByReferenceAsync` / `GetTransactionAsync` (both hit `api.ozow.com` with the `ApiKey` header).
+
+Pass the redirect URLs and reference via `PaymentRequest.Metadata`:
+`transaction_reference`, `success_url`, `cancel_url`, `error_url`, `notify_url`.
+
+Sources: <https://ozow.com/integrations>, <https://hub.ozow.com/docs>.
 
 ## Usage
 
