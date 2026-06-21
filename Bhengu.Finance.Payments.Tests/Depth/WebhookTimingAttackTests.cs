@@ -451,18 +451,19 @@ public sealed class WebhookTimingAttackTests
         TimingAttackHelpers.AssertConstantTimeVerification(provider.VerifyWebhookSignature, Payload, sig);
     }
 
-    // --- Moniepoint: HMAC SHA256 hex ---
+    // --- Moniepoint: HMAC SHA512 hex (monnify-signature) ---
     [Fact]
     public void Moniepoint_VerifyWebhookSignature_IsConstantTime()
     {
         var provider = new MoniepointPaymentProvider(StubHttp(),
             Options.Create(new MoniepointOptions
             {
-                ApiKey = "mpt-api-key", WebhookSecret = Secret, MerchantId = "MERCH-MPT",
-                RedirectUrl = "https://example.com/r"
+                ApiKey = "mpt-api-key", SecretKey = "sk", ContractCode = "CONTRACT-1",
+                WebhookSecret = Secret, RedirectUrl = "https://example.com/r"
             }),
             NullLogger<MoniepointPaymentProvider>.Instance);
-        var sig = TimingAttackHelpers.HmacSha256Hex(Payload, Secret);
+        using var h = new System.Security.Cryptography.HMACSHA512(System.Text.Encoding.UTF8.GetBytes(Secret));
+        var sig = System.Convert.ToHexString(h.ComputeHash(System.Text.Encoding.UTF8.GetBytes(Payload))).ToLowerInvariant();
         TimingAttackHelpers.AssertConstantTimeVerification(provider.VerifyWebhookSignature, Payload, sig);
     }
 

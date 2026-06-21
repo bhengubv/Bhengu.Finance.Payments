@@ -14,16 +14,15 @@ namespace Bhengu.Finance.Payments.Tests.Moniepoint;
 public class MoniepointTypedWebhookTests
 {
     private static MoniepointPaymentProvider Create() => new(
-        new HttpClient(new StubHttpMessageHandler((_, _) =>
-            StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}"))),
-        Options.Create(new MoniepointOptions { ApiKey = "k", MerchantId = "m" }),
+        new HttpClient(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}"))),
+        Options.Create(new MoniepointOptions { ApiKey = "k", SecretKey = "s", ContractCode = "c" }),
         NullLogger<MoniepointPaymentProvider>.Instance);
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsChargeSucceededEvent_ForTransactionSuccessful()
+    public async Task ParseWebhookAsync_ReturnsChargeSucceeded_ForSuccessfulTransaction()
     {
         var evt = await Create().ParseWebhookAsync("""
-            {"event":"transaction.successful","data":{"reference":"R-1","amount":2500,"currency":"NGN","customerEmail":"x@y","paymentMethod":"card","status":"successful"}}
+            {"eventType":"SUCCESSFUL_TRANSACTION","eventData":{"transactionReference":"R-1","amountPaid":2500,"currencyCode":"NGN","customer":{"email":"x@y"},"paymentMethod":"CARD","paymentStatus":"PAID"}}
             """);
         var typed = Assert.IsType<ChargeSucceededEvent>(evt);
         Assert.Equal(WebhookEventCategory.ChargeSucceeded, typed.Category);
@@ -31,21 +30,20 @@ public class MoniepointTypedWebhookTests
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsChargeFailedEvent_ForTransactionFailed()
+    public async Task ParseWebhookAsync_ReturnsChargeFailed_ForFailedTransaction()
     {
         var evt = await Create().ParseWebhookAsync("""
-            {"event":"transaction.failed","data":{"reference":"R-2","amount":100,"currency":"NGN","status":"failed","failureReason":"insufficient_funds"}}
+            {"eventType":"FAILED_TRANSACTION","eventData":{"transactionReference":"R-2","amountPaid":100,"currencyCode":"NGN","paymentStatus":"FAILED"}}
             """);
         var typed = Assert.IsType<ChargeFailedEvent>(evt);
         Assert.Equal(WebhookEventCategory.ChargeFailed, typed.Category);
-        Assert.Equal("insufficient_funds", typed.FailureMessage);
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsRefundSucceededEvent_ForRefundProcessed()
+    public async Task ParseWebhookAsync_ReturnsRefundSucceeded_ForSuccessfulRefund()
     {
         var evt = await Create().ParseWebhookAsync("""
-            {"event":"refund.processed","data":{"reference":"R-3","amount":50,"currency":"NGN","refundReference":"RF-1"}}
+            {"eventType":"SUCCESSFUL_REFUND","eventData":{"transactionReference":"R-3","amount":50,"currencyCode":"NGN","refundReference":"RF-1"}}
             """);
         var typed = Assert.IsType<RefundSucceededEvent>(evt);
         Assert.Equal(WebhookEventCategory.RefundSucceeded, typed.Category);
@@ -53,10 +51,10 @@ public class MoniepointTypedWebhookTests
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsPayoutCompletedEvent_ForTransferSuccessful()
+    public async Task ParseWebhookAsync_ReturnsPayoutCompleted_ForSuccessfulDisbursement()
     {
         var evt = await Create().ParseWebhookAsync("""
-            {"event":"transfer.successful","data":{"reference":"T-1","amount":10000,"currency":"NGN","beneficiaryAccount":"0123456789"}}
+            {"eventType":"SUCCESSFUL_DISBURSEMENT","eventData":{"reference":"T-1","amount":10000,"currencyCode":"NGN","destinationAccountNumber":"0123456789"}}
             """);
         var typed = Assert.IsType<PayoutCompletedEvent>(evt);
         Assert.Equal(WebhookEventCategory.PayoutCompleted, typed.Category);
@@ -64,11 +62,8 @@ public class MoniepointTypedWebhookTests
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsNull_ForUnknownEvent()
-    {
-        var evt = await Create().ParseWebhookAsync("""
-            {"event":"unknown.thing","data":{"reference":"X"}}
-            """);
-        Assert.Null(evt);
-    }
+    public async Task ParseWebhookAsync_ReturnsNull_ForUnknownEvent() =>
+        Assert.Null(await Create().ParseWebhookAsync("""
+            {"eventType":"UNKNOWN_THING","eventData":{"transactionReference":"X"}}
+            """));
 }

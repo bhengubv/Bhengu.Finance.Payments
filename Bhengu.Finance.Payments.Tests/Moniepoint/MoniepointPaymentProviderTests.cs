@@ -14,203 +14,191 @@ using Xunit;
 
 namespace Bhengu.Finance.Payments.Tests.Moniepoint;
 
+/// <summary>
+/// Tests the Moniepoint provider, which integrates Monnify (api.monnify.com): Basic→login→Bearer auth,
+/// init-transaction checkout, initiate-refund, single disbursement, and the monnify-signature (HMAC-SHA512)
+/// webhook. The stub answers the /api/v1/auth/login call first, then the operation.
+/// </summary>
 public class MoniepointPaymentProviderTests
 {
-    private static MoniepointPaymentProvider Create(StubHttpMessageHandler handler, MoniepointOptions? opts = null)
+    private const string LoginJson =
+        """{"requestSuccessful":true,"responseMessage":"success","responseBody":{"accessToken":"tok-123","expiresIn":3600}}""";
+
+    private static MoniepointPaymentProvider Create(Func<HttpRequestMessage, HttpResponseMessage> opResponse, MoniepointOptions? opts = null)
     {
+        var handler = new StubHttpMessageHandler((req, _) =>
+            req.RequestUri!.AbsolutePath.Contains("auth/login", StringComparison.OrdinalIgnoreCase)
+                ? StubHttpMessageHandler.Json(HttpStatusCode.OK, LoginJson)
+                : opResponse(req));
+
         opts ??= new MoniepointOptions
         {
-            ApiKey = "mpt-api-key",
-            WebhookSecret = "webhook-test-secret",
-            MerchantId = "MERCH-MPT",
+            ApiKey = "mpt-api-key", SecretKey = "mpt-secret", ContractCode = "CONTRACT-1",
+            WalletAccountNumber = "0123456789", WebhookSecret = "webhook-test-secret",
             RedirectUrl = "https://example.com/redirect"
         };
-        var http = new HttpClient(handler);
-        return new MoniepointPaymentProvider(http, Options.Create(opts), NullLogger<MoniepointPaymentProvider>.Instance);
+        return new MoniepointPaymentProvider(new HttpClient(handler), Options.Create(opts), NullLogger<MoniepointPaymentProvider>.Instance);
     }
 
     private static PaymentRequest SamplePayment() => new()
     {
-        PaymentMethodToken = "card",
-        Amount = 100m,
-        Currency = "NGN",
-        Description = "Moniepoint test"
+        PaymentMethodToken = "card", Amount = 100m, Currency = "NGN", Description = "Moniepoint test"
     };
 
     [Fact]
     public void Constructor_Throws_WhenApiKeyMissing()
     {
         var http = new HttpClient(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
-        Assert.Throws<ProviderConfigurationException>(() =>
-            new MoniepointPaymentProvider(http, Options.Create(new MoniepointOptions()),
-                NullLogger<MoniepointPaymentProvider>.Instance));
+        Assert.Throws<ProviderConfigurationException>(() => new MoniepointPaymentProvider(
+            http, Options.Create(new MoniepointOptions { SecretKey = "s", ContractCode = "c" }),
+            NullLogger<MoniepointPaymentProvider>.Instance));
     }
 
     [Fact]
-    public void ProviderName_IsMoniepoint()
+    public void Constructor_Throws_WhenSecretKeyMissing()
     {
-        var provider = Create(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
-        Assert.Equal("moniepoint", provider.ProviderName);
+        var http = new HttpClient(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
+        Assert.Throws<ProviderConfigurationException>(() => new MoniepointPaymentProvider(
+            http, Options.Create(new MoniepointOptions { ApiKey = "k", ContractCode = "c" }),
+            NullLogger<MoniepointPaymentProvider>.Instance));
     }
 
     [Fact]
-    public async Task ProcessPaymentAsync_ReturnsCompletedResponse_OnSuccess()
+    public void Constructor_Throws_WhenContractCodeMissing()
     {
-        var handler = new StubHttpMessageHandler((req, _) =>
+        var http = new HttpClient(new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")));
+        Assert.Throws<ProviderConfigurationException>(() => new MoniepointPaymentProvider(
+            http, Options.Create(new MoniepointOptions { ApiKey = "k", SecretKey = "s" }),
+            NullLogger<MoniepointPaymentProvider>.Instance));
+    }
+
+    [Fact]
+    public void ProviderName_IsMoniepoint() =>
+        Assert.Equal("moniepoint", Create(_ => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")).ProviderName);
+
+    [Fact]
+    public async Task ProcessPaymentAsync_InitsTransaction_ReturnsPendingWithCheckoutUrl()
+    {
+        var provider = Create(req =>
         {
-            Assert.Equal(HttpMethod.Post, req.Method);
-            Assert.Contains("transactions/initialize", req.RequestUri!.PathAndQuery);
+            Assert.Contains("merchant/transactions/init-transaction", req.RequestUri!.PathAndQuery);
             return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
-                {"status":true,"message":"OK","data":{"reference":"MPT-TX-1","checkoutUrl":"https://moniepoint/c/1","status":"successful","amount":100}}
+                {"requestSuccessful":true,"responseMessage":"success","responseBody":{"transactionReference":"MNFY-TX-1","paymentReference":"mpt-1","checkoutUrl":"https://sandbox.monnify.com/checkout/MNFY-TX-1"}}
                 """);
         });
-        var provider = Create(handler);
         var response = await provider.ProcessPaymentAsync(SamplePayment());
 
-        Assert.Equal("MPT-TX-1", response.GatewayReference);
-        Assert.Equal(PaymentStatus.Completed, response.Status);
-        Assert.Equal(100m, response.Amount);
+        Assert.Equal("MNFY-TX-1", response.GatewayReference);
+        Assert.Equal(PaymentStatus.Pending, response.Status);
+        Assert.Equal("https://sandbox.monnify.com/checkout/MNFY-TX-1", response.RedirectUrl);
     }
 
     [Fact]
-    public async Task ProcessPaymentAsync_Throws429AsProviderRateLimitException()
+    public async Task ProcessRefundAsync_InitiatesRefund()
     {
-        var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "rate limited"));
-        var provider = Create(handler);
+        var provider = Create(req =>
+        {
+            Assert.Contains("refunds/initiate-refund", req.RequestUri!.PathAndQuery);
+            return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
+                {"requestSuccessful":true,"responseMessage":"queued","responseBody":{"refundReference":"MNFY-RF-1","transactionReference":"MNFY-TX-1","refundAmount":50,"refundStatus":"COMPLETED"}}
+                """);
+        });
+        var refund = await provider.ProcessRefundAsync(new RefundRequest { GatewayReference = "MNFY-TX-1", Amount = 50m, Reason = "Customer requested" });
+
+        Assert.Equal("MNFY-RF-1", refund.GatewayReference);
+        Assert.Equal(PaymentStatus.Completed, refund.Status);
+    }
+
+    [Fact]
+    public async Task ProcessPayoutAsync_SingleDisbursement()
+    {
+        var provider = Create(req =>
+        {
+            Assert.Contains("disbursements/single", req.RequestUri!.PathAndQuery);
+            return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
+                {"requestSuccessful":true,"responseMessage":"ok","responseBody":{"reference":"MNFY-TFR-1","status":"SUCCESS","amount":500}}
+                """);
+        });
+        var payout = await provider.ProcessPayoutAsync(new PayoutRequest { DestinationToken = "058:1234567890", Amount = 500m, Currency = "NGN", Description = "Vendor payout" });
+
+        Assert.Equal("MNFY-TFR-1", payout.GatewayReference);
+        Assert.Equal(PaymentStatus.Completed, payout.Status);
+    }
+
+    [Fact]
+    public async Task ProcessPaymentAsync_Throws429_OnOperationRateLimit()
+    {
+        var provider = Create(_ => StubHttpMessageHandler.Text(HttpStatusCode.TooManyRequests, "rate limited"));
         await Assert.ThrowsAsync<ProviderRateLimitException>(() => provider.ProcessPaymentAsync(SamplePayment()));
     }
 
     [Fact]
-    public async Task ProcessPaymentAsync_Throws4xxAsPaymentDeclinedException()
+    public async Task ProcessPaymentAsync_Throws4xxAsPaymentDeclined()
     {
-        var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.BadRequest, "bad request"));
-        var provider = Create(handler);
+        var provider = Create(_ => StubHttpMessageHandler.Text(HttpStatusCode.BadRequest, "bad"));
         await Assert.ThrowsAsync<PaymentDeclinedException>(() => provider.ProcessPaymentAsync(SamplePayment()));
     }
 
     [Fact]
-    public async Task ProcessPaymentAsync_Throws5xxAsProviderUnavailableException()
+    public async Task ProcessPaymentAsync_Throws5xxAsProviderUnavailable()
     {
-        var handler = new StubHttpMessageHandler((_, _) => StubHttpMessageHandler.Text(HttpStatusCode.BadGateway, "down"));
-        var provider = Create(handler);
+        var provider = Create(_ => StubHttpMessageHandler.Text(HttpStatusCode.BadGateway, "down"));
         await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.ProcessPaymentAsync(SamplePayment()));
     }
 
     [Fact]
-    public async Task ProcessPaymentAsync_WrapsHttpRequestExceptionAsProviderUnavailableException()
+    public async Task ProcessPaymentAsync_WrapsHttpRequestExceptionAsProviderUnavailable()
     {
-        var handler = new StubHttpMessageHandler((_, _) => throw new HttpRequestException("DNS fail"));
-        var provider = Create(handler);
+        var provider = Create(_ => throw new HttpRequestException("DNS fail"));
         await Assert.ThrowsAsync<ProviderUnavailableException>(() => provider.ProcessPaymentAsync(SamplePayment()));
     }
 
     [Fact]
-    public async Task ProcessRefundAsync_ReturnsResponse_OnSuccess()
-    {
-        var handler = new StubHttpMessageHandler((req, _) =>
-        {
-            Assert.Contains("/refund", req.RequestUri!.PathAndQuery);
-            return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
-                {"status":true,"message":"Refund queued","data":{"refundReference":"MPT-RF-1","status":"successful","amount":50}}
-                """);
-        });
-        var provider = Create(handler);
-        var refund = await provider.ProcessRefundAsync(new RefundRequest
-        {
-            GatewayReference = "MPT-TX-1",
-            Amount = 50m,
-            Reason = "Customer requested"
-        });
-
-        Assert.Equal("MPT-RF-1", refund.GatewayReference);
-        Assert.Equal(PaymentStatus.Completed, refund.Status);
-        Assert.Equal(50m, refund.Amount);
-    }
-
-    [Fact]
-    public async Task ProcessPayoutAsync_ReturnsResponse_OnSuccess()
-    {
-        var handler = new StubHttpMessageHandler((req, _) =>
-        {
-            Assert.Contains("transfers", req.RequestUri!.PathAndQuery);
-            return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
-                {"status":true,"message":"Transfer ok","data":{"reference":"MPT-TFR-1","status":"successful","amount":500}}
-                """);
-        });
-        var provider = Create(handler);
-        var payout = await provider.ProcessPayoutAsync(new PayoutRequest
-        {
-            DestinationToken = "058:1234567890",
-            Amount = 500m,
-            Currency = "NGN",
-            Description = "Vendor payout"
-        });
-
-        Assert.Equal("MPT-TFR-1", payout.GatewayReference);
-        Assert.Equal(PaymentStatus.Completed, payout.Status);
-        Assert.Equal(500m, payout.Amount);
-    }
-
-    [Fact]
-    public void VerifyWebhookSignature_FallsBackToApiKey_WhenWebhookSecretEmpty()
-    {
-        const string apiKey = "mpt-fallback-api-key";
-        const string payload = """{"event":"transaction.successful","data":{"reference":"MPT-1"}}""";
-        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(apiKey));
-        var validSig = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant();
-
-        var provider = Create(
-            new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)),
-            new MoniepointOptions { ApiKey = apiKey, WebhookSecret = "" });
-
-        Assert.True(provider.VerifyWebhookSignature(payload, validSig));
-    }
-
-    [Fact]
-    public void VerifyWebhookSignature_ReturnsTrue_ForValidSignature()
+    public void VerifyWebhookSignature_ReturnsTrue_ForValidSha512Signature()
     {
         const string secret = "webhook-test-secret";
-        const string payload = """{"event":"transaction.successful","data":{"reference":"MPT-1"}}""";
-        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
-        var validSig = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant();
+        const string payload = """{"eventType":"SUCCESSFUL_TRANSACTION","eventData":{"transactionReference":"MNFY-1"}}""";
+        using var hmac = new HMACSHA512(Encoding.UTF8.GetBytes(secret));
+        var sig = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant();
 
-        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
-        Assert.True(provider.VerifyWebhookSignature(payload, validSig));
+        Assert.True(Create(_ => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")).VerifyWebhookSignature(payload, sig));
     }
 
     [Fact]
-    public void VerifyWebhookSignature_ReturnsFalse_ForTamperedSignature()
+    public void VerifyWebhookSignature_FallsBackToSecretKey_WhenWebhookSecretEmpty()
     {
-        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
-        Assert.False(provider.VerifyWebhookSignature("anything", "deadbeef"));
+        const string secretKey = "mpt-secret";
+        const string payload = """{"eventType":"SUCCESSFUL_TRANSACTION","eventData":{"transactionReference":"MNFY-1"}}""";
+        using var hmac = new HMACSHA512(Encoding.UTF8.GetBytes(secretKey));
+        var sig = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant();
+
+        var provider = Create(_ => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}"),
+            new MoniepointOptions { ApiKey = "k", SecretKey = secretKey, ContractCode = "c", WebhookSecret = "" });
+        Assert.True(provider.VerifyWebhookSignature(payload, sig));
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsEvent_ForTransactionSuccessful()
+    public void VerifyWebhookSignature_ReturnsFalse_ForTampered() =>
+        Assert.False(Create(_ => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")).VerifyWebhookSignature("anything", "deadbeef"));
+
+    [Fact]
+    public async Task ParseWebhookAsync_ReturnsChargeSucceeded_ForSuccessfulTransaction()
     {
-        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
-        var evt = await provider.ParseWebhookAsync("""
-            {"event":"transaction.successful","data":{"reference":"MPT-99","status":"successful"}}
+        var evt = await Create(_ => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")).ParseWebhookAsync("""
+            {"eventType":"SUCCESSFUL_TRANSACTION","eventData":{"transactionReference":"MNFY-99","amountPaid":100,"currencyCode":"NGN","paymentStatus":"PAID"}}
             """);
         Assert.NotNull(evt);
-        Assert.Equal("MPT-99", evt!.GatewayReference);
+        Assert.Equal("MNFY-99", evt!.GatewayReference);
         Assert.Equal(PaymentStatus.Completed, evt.Status);
-        Assert.Equal("transaction.successful", evt.EventType);
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsNull_ForUnknownEventType()
-    {
-        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
-        Assert.Null(await provider.ParseWebhookAsync("""
-            {"event":"some.unknown","data":{"reference":"X"}}
+    public async Task ParseWebhookAsync_ReturnsNull_ForUnknownEvent() =>
+        Assert.Null(await Create(_ => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")).ParseWebhookAsync("""
+            {"eventType":"SOME_UNKNOWN","eventData":{"transactionReference":"X"}}
             """));
-    }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsNull_ForInvalidJson()
-    {
-        var provider = Create(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
-        Assert.Null(await provider.ParseWebhookAsync("not json"));
-    }
+    public async Task ParseWebhookAsync_ReturnsNull_ForInvalidJson() =>
+        Assert.Null(await Create(_ => StubHttpMessageHandler.Json(HttpStatusCode.OK, "{}")).ParseWebhookAsync("not json"));
 }

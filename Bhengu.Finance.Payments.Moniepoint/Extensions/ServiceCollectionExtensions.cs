@@ -13,13 +13,14 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace Bhengu.Finance.Payments.Moniepoint.Extensions;
 
-/// <summary>DI registration helpers for the Moniepoint provider family.</summary>
+/// <summary>DI registration helpers for the Moniepoint (Monnify) provider.</summary>
 public static class ServiceCollectionExtensions
 {
     /// <summary>
-    /// Register the Moniepoint provider. Reads configuration from <c>Bhengu:Finance:Payments:Moniepoint</c>.
-    /// Fails fast at startup if required options (ApiKey) are missing. Registers charge + refund +
-    /// payout + settlement, keyed by <see cref="ProviderNames.Moniepoint"/>.
+    /// Register the Moniepoint provider (integrating Monnify). Reads configuration from
+    /// <c>Bhengu:Finance:Payments:Moniepoint</c> and fails fast at startup if required options
+    /// (ApiKey, SecretKey, ContractCode) are missing. Registers charge + payout, keyed by
+    /// <see cref="ProviderNames.Moniepoint"/>.
     /// </summary>
     public static IServiceCollection AddMoniepointPayments(this IServiceCollection services, IConfiguration configuration)
     {
@@ -32,26 +33,25 @@ public static class ServiceCollectionExtensions
         var probe = section.Get<MoniepointOptions>() ?? new MoniepointOptions();
         if (string.IsNullOrWhiteSpace(probe.ApiKey))
             throw new ProviderConfigurationException("moniepoint", $"{MoniepointOptions.ConfigSection}:ApiKey is required");
+        if (string.IsNullOrWhiteSpace(probe.SecretKey))
+            throw new ProviderConfigurationException("moniepoint", $"{MoniepointOptions.ConfigSection}:SecretKey is required");
+        if (string.IsNullOrWhiteSpace(probe.ContractCode))
+            throw new ProviderConfigurationException("moniepoint", $"{MoniepointOptions.ConfigSection}:ContractCode is required");
 
         services.AddBhenguInMemoryCache();
         services.AddSingleton<MoniepointIdempotencyCache>();
 
         services.AddHttpClient<MoniepointPaymentProvider>();
-        services.AddHttpClient<MoniepointSettlementProvider>();
 
         services.AddTransient<IPaymentGatewayProvider, MoniepointPaymentProvider>(sp =>
             sp.GetRequiredService<MoniepointPaymentProvider>());
         services.AddTransient<IPayoutProvider, MoniepointPaymentProvider>(sp =>
             sp.GetRequiredService<MoniepointPaymentProvider>());
-        services.AddTransient<ISettlementProvider, MoniepointSettlementProvider>(sp =>
-            sp.GetRequiredService<MoniepointSettlementProvider>());
 
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.Moniepoint,
             (sp, _) => sp.GetRequiredService<MoniepointPaymentProvider>());
         services.AddKeyedTransient<IPayoutProvider>(ProviderNames.Moniepoint,
             (sp, _) => sp.GetRequiredService<MoniepointPaymentProvider>());
-        services.AddKeyedTransient<ISettlementProvider>(ProviderNames.Moniepoint,
-            (sp, _) => sp.GetRequiredService<MoniepointSettlementProvider>());
 
         services.AddBhenguPaymentStartupValidation();
 

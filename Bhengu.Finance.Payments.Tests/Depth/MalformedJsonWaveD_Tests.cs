@@ -355,8 +355,8 @@ public sealed class Moniepoint_MalformedJsonTests
         new(new HttpClient(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK))),
             Options.Create(new MoniepointOptions
             {
-                ApiKey = "mpt-api-key", WebhookSecret = "wh", MerchantId = "MERCH-MPT",
-                RedirectUrl = "https://example.com/r"
+                ApiKey = "mpt-api-key", SecretKey = "sk", ContractCode = "CONTRACT-1",
+                WebhookSecret = "wh", RedirectUrl = "https://example.com/r"
             }),
             NullLogger<MoniepointPaymentProvider>.Instance);
 
