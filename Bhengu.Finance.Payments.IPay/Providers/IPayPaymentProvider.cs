@@ -102,16 +102,16 @@ public sealed class IPayPaymentProvider : BhenguProviderBase, IPaymentGatewayPro
             var cst = request.Metadata?.GetValueOrDefault("cst") ?? "1";
             var crl = request.Metadata?.GetValueOrDefault("crl") ?? "0";
 
-            // iPay hash order: live + oid + inv + ttl + tel + eml + vid + curr + p1 + p2 + p3 + p4 + cbk + cst + crl
+            // iPay web-flow hsh (HMAC-SHA1) order: live + oid + inv + ttl + tel + eml + vid + curr + p1 + p2 + p3 + p4 + cbk + cst + crl
             var dataToHash = string.Concat(_options.Live, oid, inv, ttl, tel, eml, vid, curr, p1, p2, p3, p4, cbk, cst, crl);
-            var hash = IPayCrypto.ComputeHmacHex(dataToHash, _options.HashKey);
+            var hash = IPayCrypto.ComputeHmacSha1Hex(dataToHash, _options.HashKey);
 
             var pairs = new (string Key, string Value)[]
             {
                 ("live", _options.Live), ("oid", oid), ("inv", inv), ("ttl", ttl),
                 ("tel", tel), ("eml", eml), ("vid", vid), ("curr", curr),
                 ("p1", p1), ("p2", p2), ("p3", p3), ("p4", p4),
-                ("cbk", cbk), ("cst", cst), ("crl", crl), ("hash", hash)
+                ("cbk", cbk), ("cst", cst), ("crl", crl), ("hsh", hash)
             };
             var qs = string.Join('&', pairs.Select(p =>
                 $"{WebUtility.UrlEncode(p.Key)}={WebUtility.UrlEncode(p.Value)}"));

@@ -82,7 +82,7 @@ public class IPayPaymentProviderTests
         Assert.Contains("oid=order-001", response.RedirectUrl);
         Assert.Contains("ttl=250.00", response.RedirectUrl);
         Assert.Contains("vid=demo", response.RedirectUrl);
-        Assert.Contains("hash=", response.RedirectUrl);
+        Assert.Contains("hsh=", response.RedirectUrl);
         Assert.Contains("payments.ipayafrica.com", response.RedirectUrl);
     }
 
