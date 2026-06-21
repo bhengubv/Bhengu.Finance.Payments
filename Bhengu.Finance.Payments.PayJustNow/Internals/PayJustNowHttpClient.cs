@@ -2,6 +2,7 @@
 
 using System.Globalization;
 using System.Net;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using Bhengu.Finance.Payments.Core;
@@ -11,14 +12,25 @@ using Microsoft.Extensions.Logging;
 
 namespace Bhengu.Finance.Payments.PayJustNow.Internals;
 
-/// <summary>Shared HTTP helper for every PayJustNow sibling provider.</summary>
+/// <summary>
+/// Shared HTTP helper for the PayJustNow merchant API.
+/// <para>
+/// Wire format verified against PayJustNow's official, public production source:
+/// the PayJustNow-for-WooCommerce gateway (WordPress.org plugin SVN, stable tag 2.7.9,
+/// <c>classes/payjustnow.class.php</c>) and the PayJustNow public API README
+/// (github.com/PayJustNow/Api). Both confirm: base path <c>/api/v1/merchant/</c>,
+/// HTTP Basic authentication, and JSON request/response bodies.
+/// </para>
+/// </summary>
 internal static class PayJustNowHttpClient
 {
-    /// <summary>Production default base URL.</summary>
-    public const string ProductionDefaultUrl = "https://api.payjustnow.com/v1/";
+    // Source: payjustnow.class.php L557 — 'https://api.payjustnow.com/api/v1/merchant/checkout'.
+    /// <summary>Production default base URL (includes the <c>/api/v1/merchant/</c> path prefix).</summary>
+    public const string ProductionDefaultUrl = "https://api.payjustnow.com/api/v1/merchant/";
 
-    /// <summary>Sandbox default base URL.</summary>
-    public const string SandboxDefaultUrl = "https://sandbox.payjustnow.com/v1/";
+    // Source: payjustnow.class.php L554 — 'https://sandbox.payjustnow.com/api/v1/merchant/checkout'.
+    /// <summary>Sandbox default base URL (includes the <c>/api/v1/merchant/</c> path prefix).</summary>
+    public const string SandboxDefaultUrl = "https://sandbox.payjustnow.com/api/v1/merchant/";
 
     /// <summary>Shared JsonSerializerOptions: PayJustNow uses snake_case throughout.</summary>
     public static readonly JsonSerializerOptions Json = new()
@@ -27,7 +39,16 @@ internal static class PayJustNowHttpClient
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
     };
 
-    /// <summary>Apply BaseAddress + API-key headers to a freshly-resolved HttpClient.</summary>
+    /// <summary>
+    /// Apply BaseAddress + HTTP Basic auth to a freshly-resolved HttpClient.
+    /// <para>
+    /// Auth scheme verified from payjustnow.class.php L533/L725:
+    /// <c>'Basic ' . base64_encode($merchant_id . ':' . $merchant_api_key)</c> — i.e. the Merchant ID
+    /// is the Basic username and the Merchant API Key is the Basic password
+    /// (settings fields "Merchant ID" → <c>pjn_username</c>, "Merchant API Key" → <c>pjn_password</c>,
+    /// L271–L283). The public API README documents the same scheme with test credentials <c>1:secret</c>.
+    /// </para>
+    /// </summary>
     public static void ConfigureClient(HttpClient httpClient, PayJustNowOptions options)
     {
         ArgumentNullException.ThrowIfNull(httpClient);
@@ -40,10 +61,15 @@ internal static class PayJustNowHttpClient
                 : options.BaseUrl ?? ProductionDefaultUrl);
         }
 
-        if (!httpClient.DefaultRequestHeaders.Contains("X-Api-Key"))
-            httpClient.DefaultRequestHeaders.Add("X-Api-Key", options.ApiKey);
-        if (!httpClient.DefaultRequestHeaders.Contains("X-Merchant-Id"))
-            httpClient.DefaultRequestHeaders.Add("X-Merchant-Id", options.MerchantId);
+        if (httpClient.DefaultRequestHeaders.Authorization is null)
+        {
+            var raw = $"{options.MerchantId}:{options.ApiKey}";
+            var token = Convert.ToBase64String(Encoding.UTF8.GetBytes(raw));
+            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", token);
+        }
+
+        if (!httpClient.DefaultRequestHeaders.Accept.Any())
+            httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
     }
 
     /// <summary>
@@ -57,8 +83,7 @@ internal static class PayJustNowHttpClient
         string path,
         object? body,
         string operation,
-        CancellationToken ct,
-        string? idempotencyKey = null)
+        CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(httpClient);
         ArgumentNullException.ThrowIfNull(logger);
@@ -69,8 +94,6 @@ internal static class PayJustNowHttpClient
             var json = JsonSerializer.Serialize(body, Json);
             req.Content = new StringContent(json, Encoding.UTF8, "application/json");
         }
-        if (!string.IsNullOrWhiteSpace(idempotencyKey))
-            req.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
 
         HttpResponseMessage response;
         try

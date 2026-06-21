@@ -4,7 +4,12 @@ using Bhengu.Finance.Payments.Core.Caching;
 
 namespace Bhengu.Finance.Payments.PayJustNow.Internals;
 
-/// <summary>Client-side dedup wrapper for PayJustNow — paired with native Idempotency-Key header.</summary>
+/// <summary>
+/// Client-side dedup wrapper for PayJustNow. PayJustNow's merchant API does not document an
+/// idempotency header, so this is a purely local guard: it caches the response for a given
+/// caller-supplied key so a client retry after a transient failure does not create a second checkout
+/// or refund.
+/// </summary>
 public sealed class PayJustNowIdempotencyCache
 {
     private readonly IBhenguDistributedCache _cache;

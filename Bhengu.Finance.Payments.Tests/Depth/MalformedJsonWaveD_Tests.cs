@@ -522,7 +522,7 @@ public sealed class PayJustNow_MalformedJsonTests
         new(new HttpClient(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK))),
             Options.Create(new PayJustNowOptions
             {
-                ApiKey = "k", SecretKey = "wh-secret", MerchantId = "m-1", UseSandbox = true
+                ApiKey = "k", MerchantId = "m-1", UseSandbox = true
             }),
             NullLogger<PayJustNowPaymentProvider>.Instance,
             new PayJustNowIdempotencyCache(new InMemoryBhenguDistributedCache()));

@@ -9,13 +9,17 @@ public sealed class PayJustNowOptions
 {
     public const string ConfigSection = "Bhengu:Finance:Payments:PayJustNow";
 
-    /// <summary>PayJustNow API key sent on the X-Api-Key header.</summary>
+    /// <summary>
+    /// PayJustNow Merchant API Key. Used as the HTTP Basic <b>password</b>
+    /// (<c>Authorization: Basic base64(MerchantId:ApiKey)</c>). Maps to the WooCommerce gateway's
+    /// "Merchant API Key" setting. Source: payjustnow.class.php L278–L283, L533/L725.
+    /// </summary>
     public string ApiKey { get; set; } = string.Empty;
 
-    /// <summary>PayJustNow secret key used to sign webhooks.</summary>
-    public string SecretKey { get; set; } = string.Empty;
-
-    /// <summary>PayJustNow merchant ID sent on the X-Merchant-Id header.</summary>
+    /// <summary>
+    /// PayJustNow Merchant ID. Used as the HTTP Basic <b>username</b>. Maps to the WooCommerce gateway's
+    /// "Merchant ID" setting. Source: payjustnow.class.php L271–L276, L531/L723.
+    /// </summary>
     public string MerchantId { get; set; } = string.Empty;
 
     /// <summary>If true, all requests go to sandbox.payjustnow.com instead of production.</summary>

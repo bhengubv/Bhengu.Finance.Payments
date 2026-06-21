@@ -13,11 +13,15 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace Bhengu.Finance.Payments.PayJustNow.Extensions;
 
-/// <summary>DI registration for the PayJustNow provider family — payment + subscription + mandate.</summary>
+/// <summary>
+/// DI registration for the PayJustNow provider. PayJustNow's public merchant API is a single
+/// BNPL gateway (checkout + refund); it exposes no subscription, mandate, or payout API, so only
+/// <see cref="IPaymentGatewayProvider"/> is registered.
+/// </summary>
 public static class ServiceCollectionExtensions
 {
     /// <summary>
-    /// Register the full PayJustNow provider family. Reads configuration from
+    /// Register the PayJustNow payment provider. Reads configuration from
     /// <c>Bhengu:Finance:Payments:PayJustNow</c>. Fails fast at startup if required options
     /// (ApiKey, MerchantId) are missing.
     /// </summary>
@@ -39,22 +43,12 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<PayJustNowIdempotencyCache>();
 
         services.AddHttpClient<PayJustNowPaymentProvider>();
-        services.AddHttpClient<PayJustNowSubscriptionProvider>();
-        services.AddHttpClient<PayJustNowMandateProvider>();
 
         services.AddTransient<IPaymentGatewayProvider, PayJustNowPaymentProvider>(sp =>
             sp.GetRequiredService<PayJustNowPaymentProvider>());
-        services.AddTransient<ISubscriptionProvider, PayJustNowSubscriptionProvider>(sp =>
-            sp.GetRequiredService<PayJustNowSubscriptionProvider>());
-        services.AddTransient<IMandateProvider, PayJustNowMandateProvider>(sp =>
-            sp.GetRequiredService<PayJustNowMandateProvider>());
 
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.PayJustNow,
             (sp, _) => sp.GetRequiredService<PayJustNowPaymentProvider>());
-        services.AddKeyedTransient<ISubscriptionProvider>(ProviderNames.PayJustNow,
-            (sp, _) => sp.GetRequiredService<PayJustNowSubscriptionProvider>());
-        services.AddKeyedTransient<IMandateProvider>(ProviderNames.PayJustNow,
-            (sp, _) => sp.GetRequiredService<PayJustNowMandateProvider>());
 
         services.AddBhenguPaymentStartupValidation();
 
