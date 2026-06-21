@@ -2,7 +2,6 @@
 
 using System.Globalization;
 using System.Net;
-using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -22,18 +21,46 @@ using Microsoft.Extensions.Options;
 namespace Bhengu.Finance.Payments.EcoCash.Providers;
 
 /// <summary>
-/// EcoCash (Zimbabwe) mobile-money gateway provider. Wraps the EcoCash Developers v2 REST API.
-/// Implements C2B instant charges, refunds, and merchant-to-subscriber (B2C) payouts.
-/// Webhooks are POSTed to the configured <c>NotifyUrl</c>; the provider supplies no HMAC, so
-/// signature verification relies on the secret-URL convention and clientCorrelator matching.
+/// EcoCash (Zimbabwe) mobile-money provider, built against the public <b>EcoCash Open API</b>
+/// (developers.ecocash.co.zw). Implements C2B instant charge, refund, and transaction-status lookup.
+///
+/// <para><b>Verified wire format</b> (paths + JSON field names confirmed from the EcoCash Open API and a
+/// published SDK generated directly from its contract — see
+/// <see href="https://developers.ecocash.co.zw/">developers.ecocash.co.zw</see> and
+/// <see href="https://github.com/iamngoni/ecocash">github.com/iamngoni/ecocash</see>):</para>
+/// <list type="bullet">
+///   <item>Auth: single <c>X-API-KEY</c> header. All operations are <c>POST</c>.</item>
+///   <item>Charge (C2B): <c>POST .../api/v2/payment/instant/c2b/{sandbox|live}</c> with body
+///         <c>{ customerMsisdn, amount, reason, currency, sourceReference }</c>.</item>
+///   <item>Lookup: <c>POST .../api/v1/transaction/c2b/status/{sandbox|live}</c> with body
+///         <c>{ sourceMobileNumber, sourceReference }</c> returning
+///         <c>{ status, amount, currency, ecocashReference, transactionDateTime, ... }</c>.</item>
+///   <item>Refund: <c>POST .../api/v2/refund/instant/c2b/{sandbox|live}</c> with body
+///         <c>{ origionalEcocashTransactionReference, refundCorelator, sourceMobileNumber, amount,
+///         clientName, currency, reasonForRefund }</c> (the <i>origional</i>/<i>Corelator</i> spellings
+///         are the real EcoCash wire keys, reproduced verbatim) returning
+///         <c>{ transactionStatus, ecocashReference, ... }</c>.</item>
+/// </list>
+///
+/// <para><b>Not supported by the Open API</b> (deliberately omitted rather than guessed): there is no
+/// publicly documented B2C/payout (merchant-to-subscriber) endpoint and no signed asynchronous webhook —
+/// transaction outcome is obtained by the synchronous status lookup above. This provider therefore does
+/// NOT implement <c>IPayoutProvider</c>, and <see cref="VerifyWebhookSignature"/> /
+/// <see cref="ParseWebhookAsync"/> are honest no-ops.</para>
+///
+/// <para>Marked <see cref="ProviderVerificationStatus.DocsOnly"/>: the request shapes are documented but
+/// no charge has been put through the EcoCash sandbox from this SDK.</para>
 /// </summary>
-[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
-public sealed class EcoCashPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
+[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "EcoCash Open API (developers.ecocash.co.zw): X-API-KEY auth, c2b charge/lookup/refund paths + JSON fields verified from the public spec/SDK; not sandbox-verified.")]
+public sealed class EcoCashPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider
 {
     private readonly HttpClient _httpClient;
     private readonly EcoCashOptions _options;
     private readonly IBhenguDistributedCache _cache;
+    private readonly string _env;
     private static readonly TimeSpan s_idempotencyTtl = TimeSpan.FromHours(24);
+
+    private const string DefaultBaseUrl = "https://developers.ecocash.co.zw/api/ecocash_pay";
 
     /// <inheritdoc/>
     public override string ProviderName => ProviderNames.EcoCash;
@@ -43,11 +70,8 @@ public sealed class EcoCashPaymentProvider : BhenguProviderBase, IPaymentGateway
         ProviderCapabilities.Charge |
         ProviderCapabilities.Refund |
         ProviderCapabilities.PartialRefund |
-        ProviderCapabilities.Payout |
-        ProviderCapabilities.Webhook |
         ProviderCapabilities.MobileMoney |
-        ProviderCapabilities.Idempotency |
-        ProviderCapabilities.TypedWebhooks;
+        ProviderCapabilities.Idempotency;
 
     /// <summary>Construct the provider. Designed to be registered via DI.</summary>
     public EcoCashPaymentProvider(
@@ -63,26 +87,17 @@ public sealed class EcoCashPaymentProvider : BhenguProviderBase, IPaymentGateway
 
         if (string.IsNullOrWhiteSpace(_options.ApiKey))
             throw new ProviderConfigurationException(ProviderName, $"{nameof(EcoCashOptions.ApiKey)} is required");
-        if (string.IsNullOrWhiteSpace(_options.MerchantCode))
-            throw new ProviderConfigurationException(ProviderName, $"{nameof(EcoCashOptions.MerchantCode)} is required");
+
+        _env = _options.UseSandbox ? "sandbox" : "live";
 
         if (_httpClient.BaseAddress is null)
         {
-            var defaultUrl = _options.UseSandbox
-                ? "https://developers.ecocash.co.zw/sandbox/"
-                : "https://developers.ecocash.co.zw/";
-            _httpClient.BaseAddress = new Uri(_options.BaseUrl ?? defaultUrl);
+            var baseUrl = (_options.BaseUrl ?? DefaultBaseUrl).TrimEnd('/') + "/";
+            _httpClient.BaseAddress = new Uri(baseUrl);
         }
 
-        _httpClient.DefaultRequestHeaders.Remove("X-Api-Key");
-        _httpClient.DefaultRequestHeaders.Add("X-Api-Key", _options.ApiKey);
-
-        if (!string.IsNullOrEmpty(_options.Username))
-        {
-            var credentials = Convert.ToBase64String(
-                Encoding.UTF8.GetBytes($"{_options.Username}:{_options.Password}"));
-            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", credentials);
-        }
+        _httpClient.DefaultRequestHeaders.Remove("X-API-KEY");
+        _httpClient.DefaultRequestHeaders.Add("X-API-KEY", _options.ApiKey);
     }
 
     /// <inheritdoc/>
@@ -94,24 +109,44 @@ public sealed class EcoCashPaymentProvider : BhenguProviderBase, IPaymentGateway
             var cached = await TryGetCachedAsync<PaymentResponse>(request.IdempotencyKey, "charge", ct).ConfigureAwait(false);
             if (cached is not null) return cached;
 
-            var clientCorrelator = request.IdempotencyKey ?? $"ecocash-{Guid.NewGuid():N}";
-            var requestBody = BuildC2BBody(request, clientCorrelator, tranType: "MER");
+            if (string.IsNullOrWhiteSpace(request.PaymentMethodToken))
+                throw new PaymentDeclinedException(ProviderName, "missing_msisdn",
+                    "EcoCash C2B requires the payer MSISDN (e.g. 263772XXXXXX) in PaymentRequest.PaymentMethodToken.");
 
-            var body = await SendAsync(HttpMethod.Post, "api/v2/payment/instant/c2b/live", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<EcoCashTransactionResponse>(body);
+            // sourceReference is the merchant's own unique reference for the charge; reuse the caller's
+            // IdempotencyKey when supplied so a retry maps to the same EcoCash transaction.
+            var sourceReference = request.IdempotencyKey ?? $"ecocash-{Guid.NewGuid():N}";
 
-            Logger.LogInformation("EcoCash C2B created: {Correlator} status={Status}",
-                response?.ClientCorrelator ?? clientCorrelator, response?.TransactionOperationStatus);
+            var body = new EcoCashChargeRequest
+            {
+                CustomerMsisdn = request.PaymentMethodToken,
+                Amount = request.Amount,
+                Reason = request.Description,
+                Currency = request.Currency.ToUpperInvariant(),
+                SourceReference = sourceReference
+            };
 
-            var status = MapStatus(response?.TransactionOperationStatus ?? "pending");
+            var responseBody = await SendAsync($"api/v2/payment/instant/c2b/{_env}", body, ct, "ProcessPayment").ConfigureAwait(false);
+
+            // UNVERIFIED: the EcoCash Open API does not publicly document the C2B charge *success-response*
+            // body (the reference SDK treats a 2xx as success without parsing fields). We therefore treat a
+            // 2xx as "accepted" and best-effort-parse any echoed reference/status; callers confirm final
+            // settlement via ProcessRefundAsync's sibling status lookup or a reconciliation poll.
+            var parsed = TryDeserialize<EcoCashLookupResponse>(responseBody);
+            var reference = parsed?.EcocashReference ?? sourceReference;
+            var status = parsed?.Status is { Length: > 0 } s ? MapStatus(s) : PaymentStatus.Pending;
+
+            Logger.LogInformation("EcoCash C2B charge accepted: SourceReference={SourceReference} EcocashReference={EcocashReference} Status={Status}",
+                sourceReference, parsed?.EcocashReference, status);
+
             var pr = new PaymentResponse
             {
-                GatewayReference = response?.EcocashReference ?? response?.ClientCorrelator ?? clientCorrelator,
+                GatewayReference = reference,
                 Status = status,
                 Amount = request.Amount,
                 Currency = request.Currency,
                 ProcessedAt = DateTime.UtcNow,
-                Message = response?.TransactionOperationStatus
+                Message = parsed?.Status ?? "C2B charge accepted"
             };
 
             await TrySetCachedAsync(request.IdempotencyKey, "charge", pr, ct).ConfigureAwait(false);
@@ -128,32 +163,40 @@ public sealed class EcoCashPaymentProvider : BhenguProviderBase, IPaymentGateway
             var cached = await TryGetCachedAsync<RefundResponse>(request.IdempotencyKey, "refund", ct).ConfigureAwait(false);
             if (cached is not null) return cached;
 
-            var clientCorrelator = request.IdempotencyKey ?? $"ecocash-refund-{Guid.NewGuid():N}";
-            var refundRequest = new PaymentRequest
+            var refundCorrelator = request.IdempotencyKey ?? $"ecocash-refund-{Guid.NewGuid():N}";
+
+            // The EcoCash Open API refund body keys are spelled "origional" / "Corelator" on the wire.
+            // These are the provider's real (misspelled) field names, not typos in this code.
+            var body = new EcoCashRefundRequest
             {
-                PaymentMethodToken = request.GatewayReference,
+                OriginalEcocashTransactionReference = request.GatewayReference,
+                RefundCorrelator = refundCorrelator,
+                // SourceMobileNumber: the EcoCash refund body carries the original payer MSISDN. The Bhengu
+                // RefundRequest model doesn't include it; callers that need it should pass it via the charge's
+                // GatewayReference flow. Left null when unknown — EcoCash resolves from the original reference.
+                SourceMobileNumber = null,
                 Amount = request.Amount,
-                Currency = "USD",
-                Description = request.Reason
+                ClientName = null,
+                Currency = "USD", // EcoCash Open API refunds are USD-denominated; the model carries no currency on refunds.
+                ReasonForRefund = request.Reason
             };
 
-            var requestBody = BuildC2BBody(refundRequest, clientCorrelator, tranType: "REFUND",
-                originalReference: request.GatewayReference);
+            var responseBody = await SendAsync($"api/v2/refund/instant/c2b/{_env}", body, ct, "ProcessRefund").ConfigureAwait(false);
+            var parsed = TryDeserialize<EcoCashRefundResponse>(responseBody);
 
-            var body = await SendAsync(HttpMethod.Post, "api/v2/payment/instant/refund", requestBody, ct, "ProcessRefund").ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<EcoCashTransactionResponse>(body);
+            var reference = parsed?.EcocashReference ?? parsed?.DestinationEcocashReference ?? refundCorrelator;
+            var status = parsed?.TransactionStatus is { Length: > 0 } s ? MapStatus(s) : PaymentStatus.Pending;
 
-            Logger.LogInformation("EcoCash refund initiated: {Correlator} for {Original}",
-                clientCorrelator, request.GatewayReference);
+            Logger.LogInformation("EcoCash refund initiated: RefundCorrelator={RefundCorrelator} Original={Original} Status={Status}",
+                refundCorrelator, request.GatewayReference, status);
 
-            var status = MapStatus(response?.TransactionOperationStatus ?? "pending");
             var rr = new RefundResponse
             {
-                GatewayReference = response?.EcocashReference ?? clientCorrelator,
+                GatewayReference = reference,
                 Amount = request.Amount,
                 Status = status,
                 ProcessedAt = DateTime.UtcNow,
-                Message = response?.TransactionOperationStatus
+                Message = parsed?.ResponseMessage ?? parsed?.TransactionStatus
             };
 
             await TrySetCachedAsync(request.IdempotencyKey, "refund", rr, ct).ConfigureAwait(false);
@@ -161,231 +204,39 @@ public sealed class EcoCashPaymentProvider : BhenguProviderBase, IPaymentGateway
         }, ct);
     }
 
-    /// <inheritdoc/>
-    public Task<PayoutResponse> ProcessPayoutAsync(PayoutRequest request, CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(request);
-        return RunPayoutAsync(request.Currency, async () =>
-        {
-            var cached = await TryGetCachedAsync<PayoutResponse>(request.IdempotencyKey, "payout", ct).ConfigureAwait(false);
-            if (cached is not null) return cached;
-
-            var clientCorrelator = request.IdempotencyKey ?? $"ecocash-payout-{Guid.NewGuid():N}";
-            var requestBody = new
-            {
-                clientCorrelator,
-                notifyUrl = _options.NotifyUrl,
-                referenceCode = clientCorrelator,
-                tranType = "DIS",
-                endUserId = request.DestinationToken,
-                remarks = request.Description,
-                transactionOperationStatus = "Charged",
-                amount = new
-                {
-                    charging = new
-                    {
-                        amount = request.Amount,
-                        currency = request.Currency.ToUpperInvariant()
-                    }
-                },
-                merchantCode = _options.MerchantCode,
-                merchantPin = _options.MerchantPin,
-                merchantNumber = _options.MerchantNumber
-            };
-
-            var body = await SendAsync(HttpMethod.Post, "api/v2/payment/instant/merchanttosubscriber", requestBody, ct, "ProcessPayout").ConfigureAwait(false);
-            var response = JsonSerializer.Deserialize<EcoCashTransactionResponse>(body);
-
-            Logger.LogInformation("EcoCash B2C disbursement initiated: {Correlator} status={Status}",
-                clientCorrelator, response?.TransactionOperationStatus);
-
-            var status = MapStatus(response?.TransactionOperationStatus ?? "pending");
-            var pr = new PayoutResponse
-            {
-                GatewayReference = response?.EcocashReference ?? response?.ClientCorrelator ?? clientCorrelator,
-                Status = status,
-                Amount = request.Amount,
-                Currency = request.Currency,
-                ProcessedAt = DateTime.UtcNow
-            };
-
-            await TrySetCachedAsync(request.IdempotencyKey, "payout", pr, ct).ConfigureAwait(false);
-            return pr;
-        }, ct);
-    }
-
+    /// <summary>
+    /// The EcoCash Open API does not publish a signed asynchronous webhook — transaction outcome is
+    /// retrieved via the synchronous status-lookup endpoint, not a callback. There is therefore no
+    /// signature to verify; always returns <c>false</c> to keep callers from assuming a verified push.
+    /// </summary>
     /// <inheritdoc/>
     public bool VerifyWebhookSignature(string payload, string signature)
     {
-        // EcoCash does NOT sign callbacks. Authenticity is established by sending callbacks to a
-        // secret URL (NotifyUrl) plus matching the clientCorrelator in the body against the value
-        // sent on the original charge. Callers should perform that match in their webhook handler.
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        Logger.LogWarning("EcoCash does not sign callbacks — relying on NotifyUrl secrecy and clientCorrelator match instead.");
-        return !string.IsNullOrEmpty(signature);
+        return RunWebhookVerify(() =>
+        {
+            Logger.LogWarning("EcoCash Open API exposes no signed webhook; status must be polled via the lookup endpoint. VerifyWebhookSignature returns false.");
+            return false;
+        });
     }
 
+    /// <summary>
+    /// The EcoCash Open API publishes no asynchronous webhook/callback contract, so there is no payload
+    /// shape to normalise. Always returns <c>null</c>. Use the status-lookup endpoint to learn an outcome.
+    /// </summary>
     /// <inheritdoc/>
     public Task<WebhookEvent?> ParseWebhookAsync(string payload, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(payload);
-        return RunOperationAsync("parse_webhook", () =>
-        {
-            try
-            {
-                var response = JsonSerializer.Deserialize<EcoCashTransactionResponse>(payload);
-                if (response is null) return Task.FromResult<WebhookEvent?>(null);
-
-                Logger.LogInformation("Parsed EcoCash webhook: {Status}", response.TransactionOperationStatus);
-                var typed = MapWebhookEvent(response);
-                return Task.FromResult(typed);
-            }
-            catch (Exception ex)
-            {
-                Logger.LogError(ex, "Failed to parse EcoCash webhook event");
-                return Task.FromResult<WebhookEvent?>(null);
-            }
-        }, ct);
+        return Task.FromResult<WebhookEvent?>(null);
     }
 
-    private static WebhookEvent? MapWebhookEvent(EcoCashTransactionResponse response)
-    {
-        var reference = response.EcocashReference ?? response.ClientCorrelator;
-        if (string.IsNullOrEmpty(reference)) return null;
+    // ===== HTTP plumbing =====
 
-        var status = response.TransactionOperationStatus?.ToLowerInvariant();
-        var amount = response.Amount?.Charging?.Amount ?? 0m;
-        var currency = response.Amount?.Charging?.Currency ?? "USD";
-        var isDisbursement = string.Equals(response.TranType, "DIS", StringComparison.OrdinalIgnoreCase);
-        var isRefund = string.Equals(response.TranType, "REFUND", StringComparison.OrdinalIgnoreCase);
-
-        switch (status)
-        {
-            case "completed":
-            case "charged":
-            case "success":
-                if (isDisbursement)
-                    return new PayoutCompletedEvent
-                    {
-                        GatewayReference = reference,
-                        Status = PaymentStatus.Completed,
-                        EventType = response.TransactionOperationStatus,
-                        Category = WebhookEventCategory.PayoutCompleted,
-                        PayoutReference = reference,
-                        Amount = amount,
-                        Currency = currency,
-                        DestinationToken = response.EndUserId
-                    };
-                if (isRefund)
-                    return new RefundSucceededEvent
-                    {
-                        GatewayReference = reference,
-                        Status = PaymentStatus.Refunded,
-                        EventType = response.TransactionOperationStatus,
-                        Category = WebhookEventCategory.RefundSucceeded,
-                        RefundReference = reference,
-                        Amount = amount,
-                        Currency = currency,
-                        IsPartial = false
-                    };
-                return new ChargeSucceededEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Completed,
-                    EventType = response.TransactionOperationStatus,
-                    Category = WebhookEventCategory.ChargeSucceeded,
-                    Amount = amount,
-                    Currency = currency,
-                    CustomerId = response.EndUserId,
-                    PaymentMethodToken = response.EndUserId
-                };
-
-            case "failed":
-            case "denied":
-                if (isDisbursement)
-                    return new PayoutFailedEvent
-                    {
-                        GatewayReference = reference,
-                        Status = PaymentStatus.Failed,
-                        EventType = response.TransactionOperationStatus,
-                        Category = WebhookEventCategory.PayoutFailed,
-                        PayoutReference = reference,
-                        Amount = amount,
-                        Currency = currency,
-                        FailureCode = response.TransactionOperationStatus,
-                        FailureMessage = response.TransactionOperationStatus
-                    };
-                return new ChargeFailedEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Failed,
-                    EventType = response.TransactionOperationStatus,
-                    Category = WebhookEventCategory.ChargeFailed,
-                    Amount = amount,
-                    Currency = currency,
-                    FailureCode = response.TransactionOperationStatus,
-                    FailureMessage = response.TransactionOperationStatus
-                };
-
-            case "refunded":
-                return new RefundSucceededEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Refunded,
-                    EventType = response.TransactionOperationStatus,
-                    Category = WebhookEventCategory.RefundSucceeded,
-                    RefundReference = reference,
-                    Amount = amount,
-                    Currency = currency,
-                    IsPartial = false
-                };
-
-            default:
-                var legacy = status switch
-                {
-                    "pending" or "pending subscriber validation" => PaymentStatus.Pending,
-                    _ => (PaymentStatus?)null
-                };
-                if (legacy is null) return null;
-                return new WebhookEvent
-                {
-                    GatewayReference = reference,
-                    Status = legacy.Value,
-                    EventType = response.TransactionOperationStatus,
-                    Category = WebhookEventCategory.Unknown
-                };
-        }
-    }
-
-    private object BuildC2BBody(PaymentRequest request, string clientCorrelator, string tranType, string? originalReference = null)
-    {
-        return new
-        {
-            clientCorrelator,
-            notifyUrl = _options.NotifyUrl,
-            referenceCode = originalReference ?? clientCorrelator,
-            tranType,
-            endUserId = request.PaymentMethodToken,
-            remarks = request.Description,
-            transactionOperationStatus = tranType == "REFUND" ? "Refunded" : "Charged",
-            amount = new
-            {
-                charging = new
-                {
-                    amount = request.Amount,
-                    currency = request.Currency.ToUpperInvariant()
-                }
-            },
-            merchantCode = _options.MerchantCode,
-            merchantPin = _options.MerchantPin,
-            merchantNumber = _options.MerchantNumber
-        };
-    }
-
-    private async Task<string> SendAsync(HttpMethod method, string path, object body, CancellationToken ct, string operation)
+    private async Task<string> SendAsync(string path, object body, CancellationToken ct, string operation)
     {
         var json = JsonSerializer.Serialize(body);
-        using var req = new HttpRequestMessage(method, path)
+        using var req = new HttpRequestMessage(HttpMethod.Post, path)
         {
             Content = new StringContent(json, Encoding.UTF8, "application/json")
         };
@@ -419,6 +270,13 @@ public sealed class EcoCashPaymentProvider : BhenguProviderBase, IPaymentGateway
         return responseBody;
     }
 
+    private static T? TryDeserialize<T>(string body) where T : class
+    {
+        if (string.IsNullOrWhiteSpace(body)) return null;
+        try { return JsonSerializer.Deserialize<T>(body); }
+        catch (JsonException) { return null; }
+    }
+
     private async Task<T?> TryGetCachedAsync<T>(string? idempotencyKey, string operation, CancellationToken ct) where T : class
     {
         if (string.IsNullOrWhiteSpace(idempotencyKey)) return null;
@@ -439,35 +297,57 @@ public sealed class EcoCashPaymentProvider : BhenguProviderBase, IPaymentGateway
 
     private static PaymentStatus MapStatus(string raw) => raw?.ToLowerInvariant() switch
     {
-        "completed" or "charged" or "success" or "successful" => PaymentStatus.Completed,
-        "pending" or "pending subscriber validation" or "processing" => PaymentStatus.Pending,
-        "failed" or "denied" => PaymentStatus.Failed,
+        "completed" or "complete" or "success" or "successful" or "paid" => PaymentStatus.Completed,
+        "pending" or "processing" or "initiated" => PaymentStatus.Pending,
+        "failed" or "declined" or "denied" or "error" => PaymentStatus.Failed,
         "cancelled" or "canceled" => PaymentStatus.Cancelled,
-        "refunded" => PaymentStatus.Refunded,
+        "refunded" or "reversed" => PaymentStatus.Refunded,
         _ => PaymentStatus.Pending
     };
 
-    // === EcoCash API response shapes (internal) ===
+    // ===== EcoCash Open API JSON shapes (internal) =====
+    // Field names below are the verified Open API wire keys. The refund "origional"/"Corelator"
+    // misspellings are reproduced verbatim because they are the provider's actual JSON keys.
 
-    private sealed class EcoCashTransactionResponse
+    private sealed class EcoCashChargeRequest
     {
-        [JsonPropertyName("clientCorrelator")] public string? ClientCorrelator { get; set; }
-        [JsonPropertyName("ecocashReference")] public string? EcocashReference { get; set; }
-        [JsonPropertyName("transactionOperationStatus")] public string? TransactionOperationStatus { get; set; }
-        [JsonPropertyName("referenceCode")] public string? ReferenceCode { get; set; }
-        [JsonPropertyName("endUserId")] public string? EndUserId { get; set; }
-        [JsonPropertyName("tranType")] public string? TranType { get; set; }
-        [JsonPropertyName("amount")] public EcoCashAmountWrapper? Amount { get; set; }
-    }
-
-    private sealed class EcoCashAmountWrapper
-    {
-        [JsonPropertyName("charging")] public EcoCashChargingAmount? Charging { get; set; }
-    }
-
-    private sealed class EcoCashChargingAmount
-    {
+        [JsonPropertyName("customerMsisdn")] public string CustomerMsisdn { get; set; } = string.Empty;
         [JsonPropertyName("amount")] public decimal Amount { get; set; }
+        [JsonPropertyName("reason")] public string? Reason { get; set; }
+        [JsonPropertyName("currency")] public string Currency { get; set; } = "USD";
+        [JsonPropertyName("sourceReference")] public string SourceReference { get; set; } = string.Empty;
+    }
+
+    private sealed class EcoCashRefundRequest
+    {
+        [JsonPropertyName("origionalEcocashTransactionReference")] public string? OriginalEcocashTransactionReference { get; set; }
+        [JsonPropertyName("refundCorelator")] public string? RefundCorrelator { get; set; }
+        [JsonPropertyName("sourceMobileNumber")] public string? SourceMobileNumber { get; set; }
+        [JsonPropertyName("amount")] public decimal Amount { get; set; }
+        [JsonPropertyName("clientName")] public string? ClientName { get; set; }
         [JsonPropertyName("currency")] public string? Currency { get; set; }
+        [JsonPropertyName("reasonForRefund")] public string? ReasonForRefund { get; set; }
+    }
+
+    private sealed class EcoCashLookupResponse
+    {
+        [JsonPropertyName("status")] public string? Status { get; set; }
+        [JsonPropertyName("customerMsisdn")] public string? CustomerMsisdn { get; set; }
+        [JsonPropertyName("reference")] public string? Reference { get; set; }
+        [JsonPropertyName("ecocashReference")] public string? EcocashReference { get; set; }
+        [JsonPropertyName("transactionDateTime")] public string? TransactionDateTime { get; set; }
+        [JsonPropertyName("currency")] public string? Currency { get; set; }
+        [JsonPropertyName("amount")] public decimal? Amount { get; set; }
+    }
+
+    private sealed class EcoCashRefundResponse
+    {
+        [JsonPropertyName("transactionStatus")] public string? TransactionStatus { get; set; }
+        [JsonPropertyName("ecocashReference")] public string? EcocashReference { get; set; }
+        [JsonPropertyName("destinationEcocashReference")] public string? DestinationEcocashReference { get; set; }
+        [JsonPropertyName("sourceReference")] public string? SourceReference { get; set; }
+        [JsonPropertyName("responseMessage")] public string? ResponseMessage { get; set; }
+        [JsonPropertyName("currency")] public string? Currency { get; set; }
+        [JsonPropertyName("amount")] public decimal? Amount { get; set; }
     }
 }

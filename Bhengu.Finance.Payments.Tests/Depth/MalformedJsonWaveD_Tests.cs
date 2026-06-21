@@ -122,11 +122,11 @@ public sealed class EcoCash_MalformedJsonTests
 {
     private static EcoCashPaymentProvider Create() =>
         new(new HttpClient(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK))),
+            // EcoCash now targets the Open API: only ApiKey + UseSandbox remain on EcoCashOptions
+            // (the legacy Username/Password/MerchantCode/MerchantPin/MerchantNumber/NotifyUrl fields were removed).
             Options.Create(new EcoCashOptions
             {
-                ApiKey = "k", Username = "u", Password = "p", MerchantCode = "MC",
-                MerchantPin = "1234", MerchantNumber = "263772000000",
-                NotifyUrl = "https://example.com/n", UseSandbox = true
+                ApiKey = "k", UseSandbox = true
             }),
             NullLogger<EcoCashPaymentProvider>.Instance,
             null);

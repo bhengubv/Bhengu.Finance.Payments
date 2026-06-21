@@ -16,9 +16,10 @@ namespace Bhengu.Finance.Payments.EcoCash.Extensions;
 public static class ServiceCollectionExtensions
 {
     /// <summary>
-    /// Register the EcoCash provider (payment + payout). Reads configuration from
-    /// <c>Bhengu:Finance:Payments:EcoCash</c>. Fails fast at startup if required options
-    /// (ApiKey, MerchantCode) are missing.
+    /// Register the EcoCash (Zimbabwe) provider against the public EcoCash Open API. Implements
+    /// C2B charge + refund (no documented B2C/payout, so <c>IPayoutProvider</c> is not registered).
+    /// Reads configuration from <c>Bhengu:Finance:Payments:EcoCash</c> and fails fast at startup if
+    /// the required <c>ApiKey</c> is missing.
     /// </summary>
     public static IServiceCollection AddEcoCashPayments(this IServiceCollection services, IConfiguration configuration)
     {
@@ -31,20 +32,14 @@ public static class ServiceCollectionExtensions
         var probe = section.Get<EcoCashOptions>() ?? new EcoCashOptions();
         if (string.IsNullOrWhiteSpace(probe.ApiKey))
             throw new ProviderConfigurationException("ecocash", $"{EcoCashOptions.ConfigSection}:ApiKey is required");
-        if (string.IsNullOrWhiteSpace(probe.MerchantCode))
-            throw new ProviderConfigurationException("ecocash", $"{EcoCashOptions.ConfigSection}:MerchantCode is required");
 
         services.AddBhenguInMemoryCache();
         services.AddHttpClient<EcoCashPaymentProvider>();
 
         services.AddTransient<IPaymentGatewayProvider, EcoCashPaymentProvider>(sp =>
             sp.GetRequiredService<EcoCashPaymentProvider>());
-        services.AddTransient<IPayoutProvider, EcoCashPaymentProvider>(sp =>
-            sp.GetRequiredService<EcoCashPaymentProvider>());
 
         services.AddKeyedTransient<IPaymentGatewayProvider>(ProviderNames.EcoCash,
-            (sp, _) => sp.GetRequiredService<EcoCashPaymentProvider>());
-        services.AddKeyedTransient<IPayoutProvider>(ProviderNames.EcoCash,
             (sp, _) => sp.GetRequiredService<EcoCashPaymentProvider>());
 
         services.AddBhenguPaymentStartupValidation();

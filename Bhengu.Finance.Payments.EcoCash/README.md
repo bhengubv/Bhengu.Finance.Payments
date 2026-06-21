@@ -1,6 +1,6 @@
 # Bhengu.Finance.Payments.EcoCash
 
-EcoCash adapter for the Bhengu.Finance.Payments family — Zimbabwe's dominant mobile-money operator. C2B instant charges, refunds, and B2C payouts via the EcoCash Developers v2 REST API, behind the Bhengu canonical contracts.
+EcoCash adapter for the Bhengu.Finance.Payments family — Zimbabwe's dominant mobile-money operator. C2B instant charges and refunds via the public [EcoCash Open API](https://developers.ecocash.co.zw/), behind the Bhengu canonical contracts.
 
 ## Install
 
@@ -12,8 +12,11 @@ dotnet add package Bhengu.Finance.Payments.EcoCash
 
 | Contract | Provider class | Notes |
 |---|---|---|
-| `IPaymentGatewayProvider` | `EcoCashPaymentProvider` | Charge / refund / webhook verify (C2B) |
-| `IPayoutProvider` | `EcoCashPaymentProvider` | B2C disbursement |
+| `IPaymentGatewayProvider` | `EcoCashPaymentProvider` | C2B instant charge + refund |
+
+> The EcoCash Open API does not publicly document a B2C/payout endpoint or a signed asynchronous
+> webhook (transaction outcome is obtained via the synchronous status-lookup endpoint), so this
+> provider does **not** implement `IPayoutProvider`, and webhook verify/parse are honest no-ops.
 
 ## Wiring
 
@@ -29,15 +32,9 @@ Bind options from `Bhengu:Finance:Payments:EcoCash`:
     "Finance": {
       "Payments": {
         "EcoCash": {
-          "ApiKey": "...",
-          "Username": "...",
-          "Password": "...",
-          "MerchantCode": "...",
-          "MerchantPin": "...",
-          "MerchantNumber": "263771234567",
-          "NotifyUrl": "https://example.com/ecocash/callback", // optional
-          "UseSandbox": true,
-          "BaseUrl": null                                       // optional override
+          "ApiKey": "...",       // sent as the X-API-KEY header; merchant identity is bound to the key
+          "UseSandbox": true,    // .../c2b/sandbox vs .../c2b/live
+          "BaseUrl": null        // optional override; defaults to https://developers.ecocash.co.zw/api/ecocash_pay
         }
       }
     }
