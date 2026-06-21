@@ -67,7 +67,7 @@ public sealed class YocoPaymentProvider : BhenguProviderBase, IPaymentGatewayPro
         if (_httpClient.BaseAddress is null)
             _httpClient.BaseAddress = new Uri(_options.BaseUrl ?? "https://online.yoco.com/v1/");
 
-        _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _options.SecretKey);
+        _httpClient.DefaultRequestHeaders.Add("X-Auth-Secret-Key", _options.SecretKey);
     }
 
     /// <inheritdoc/>

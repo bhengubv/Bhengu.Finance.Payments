@@ -46,8 +46,8 @@ public sealed class YocoPayoutProvider : BhenguProviderBase, IPayoutProvider
         if (httpClient.BaseAddress is null)
             httpClient.BaseAddress = new Uri(_options.BaseUrl ?? "https://online.yoco.com/v1/");
 
-        if (httpClient.DefaultRequestHeaders.Authorization is null)
-            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _options.SecretKey);
+        if (!httpClient.DefaultRequestHeaders.Contains("X-Auth-Secret-Key"))
+            httpClient.DefaultRequestHeaders.Add("X-Auth-Secret-Key", _options.SecretKey);
     }
 
     /// <inheritdoc/>

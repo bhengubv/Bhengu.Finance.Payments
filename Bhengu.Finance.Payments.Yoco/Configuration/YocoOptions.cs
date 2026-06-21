@@ -9,7 +9,7 @@ public sealed class YocoOptions
 {
     public const string ConfigSection = "Bhengu:Finance:Payments:Yoco";
 
-    /// <summary>Yoco secret API key. Used as the Bearer token on every request.</summary>
+    /// <summary>Yoco secret API key. Sent in the <c>X-Auth-Secret-Key</c> header on every request.</summary>
     public string SecretKey { get; set; } = string.Empty;
 
     /// <summary>Yoco webhook signing secret used to verify inbound webhook payloads.</summary>

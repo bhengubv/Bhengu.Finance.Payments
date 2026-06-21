@@ -51,8 +51,8 @@ public sealed class YocoSettlementProvider : BhenguProviderBase, ISettlementProv
         if (_httpClient.BaseAddress is null)
             _httpClient.BaseAddress = new Uri(_options.BaseUrl ?? "https://online.yoco.com/v1/");
 
-        if (_httpClient.DefaultRequestHeaders.Authorization is null)
-            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _options.SecretKey);
+        if (!_httpClient.DefaultRequestHeaders.Contains("X-Auth-Secret-Key"))
+            _httpClient.DefaultRequestHeaders.Add("X-Auth-Secret-Key", _options.SecretKey);
     }
 
     /// <inheritdoc/>
