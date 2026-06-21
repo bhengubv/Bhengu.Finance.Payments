@@ -29,8 +29,8 @@ namespace Bhengu.Finance.Payments.Fawry.Providers;
 [ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
 public sealed class FawryPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider
 {
-    private const string LiveDefaultUrl = "https://atfawry.fawrystaging.com/ECommerceWeb/api/";
-    private const string SandboxDefaultUrl = "https://atfawry.fawrystaging.com/ECommerceWeb/api/";
+    private const string LiveDefaultUrl = "https://www.atfawry.com/ECommerceWeb/Fawry/";
+    private const string SandboxDefaultUrl = "https://atfawry.fawrystaging.com/ECommerceWeb/Fawry/";
 
     private readonly HttpClient _httpClient;
     private readonly FawryOptions _options;
