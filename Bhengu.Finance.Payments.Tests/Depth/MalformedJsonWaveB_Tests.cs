@@ -189,7 +189,7 @@ public sealed class Cellulant_MalformedJsonTests
         new(new HttpClient(new StubHttpMessageHandler((_, _) => new HttpResponseMessage(HttpStatusCode.OK))),
             Options.Create(new CellulantOptions
             {
-                ServiceCode = "TGNTEST", ClientId = "c", ClientSecret = "s",
+                ServiceCode = "TGNTEST", ApiKey = "k", ClientId = "c", ClientSecret = "s",
                 WebhookSecret = "wh", CallbackUrl = "https://example.com/cb", UseSandbox = true
             }),
             NullLogger<CellulantPaymentProvider>.Instance);

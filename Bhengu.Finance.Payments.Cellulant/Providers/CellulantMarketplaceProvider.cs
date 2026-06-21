@@ -26,10 +26,17 @@ namespace Bhengu.Finance.Payments.Cellulant.Providers;
 
 /// <summary>
 /// Cellulant (Tingg) implementation of <see cref="IMarketplaceProvider"/>. Tingg models
-/// marketplaces as "sub-services" attached to the merchant's service tree — each sub-service
-/// settles to its own bank account / wallet. Split definitions are stored locally and applied at
-/// charge time as a Tingg <c>splits</c> array on the Express Checkout call.
+/// marketplaces as beneficiaries on the merchant's service; split definitions are stored locally and
+/// applied at charge time as the Tingg <c>charge_beneficiaries</c> array on the Express Checkout call
+/// (verified: https://docs.tingg.africa/docs/checkout-v3-express-checkout).
 /// </summary>
+/// <remarks>
+/// VERIFIED: the split mechanism on the express-request call (<c>charge_beneficiaries</c> with
+/// <c>charge_beneficiary_code</c> + <c>amount</c>) and the host/auth (apiKey + Bearer).
+/// UNVERIFIED: the programmatic sub-service onboarding endpoints (<c>services/v1/sub-services</c>) —
+/// Tingg does not publicly document a self-serve beneficiary-onboarding API in Checkout 3.0; those
+/// paths are retained from prior behaviour and flagged inline. See <c>CreateSubAccountAsync</c>.
+/// </remarks>
 /// <remarks>
 /// <para>Tingg's onboarding is API-only at the sub-service tier; <see cref="SubAccount.OnboardingUrl"/>
 /// is always null. The <see cref="SubAccountRequest.SettlementAccountToken"/> is required and is
@@ -69,9 +76,10 @@ public sealed class CellulantMarketplaceProvider : BhenguProviderBase, IMarketpl
 
         if (_httpClient.BaseAddress is null)
         {
+            // Verified Tingg Checkout 3.0 hosts. Source: https://docs.tingg.africa/reference/authenticate-requests
             var defaultUrl = _options.UseSandbox
-                ? "https://online.uat.tingg.africa/"
-                : "https://online.tingg.africa/";
+                ? "https://api-approval.tingg.africa/"
+                : "https://api.tingg.africa/";
             _httpClient.BaseAddress = new Uri(_options.BaseUrl ?? defaultUrl);
         }
     }
@@ -90,6 +98,12 @@ public sealed class CellulantMarketplaceProvider : BhenguProviderBase, IMarketpl
             var cached = await TryGetCachedAsync<SubAccount>(request.IdempotencyKey, "sub_account", ct).ConfigureAwait(false);
             if (cached is not null) return cached;
 
+            // UNVERIFIED: Tingg does not publicly document a self-serve sub-service / beneficiary
+            // ONBOARDING API in Checkout 3.0 (beneficiary codes are provisioned via the merchant
+            // portal / account manager, then referenced as `charge_beneficiaries.charge_beneficiary_code`
+            // on the express-request call — which IS verified). The path + body below are retained from
+            // prior behaviour and are NOT confirmed against Tingg docs. Do not rely on programmatic
+            // sub-account creation in production until verified.
             var body = new
             {
                 parentServiceCode = _options.ServiceCode,
@@ -204,43 +218,59 @@ public sealed class CellulantMarketplaceProvider : BhenguProviderBase, IMarketpl
             else
                 throw new BhenguPaymentException(ProviderName, "ChargeWithSplitRequest requires SplitReference or InlineRules.", "missing_split");
 
-            var email = request.Payment.Metadata?.GetValueOrDefault("email") ?? "noreply@example.com";
+            var email = request.Payment.Metadata?.GetValueOrDefault("email");
+            var firstName = request.Payment.Metadata?.GetValueOrDefault("firstName")
+                ?? request.Payment.Metadata?.GetValueOrDefault("name") ?? "Customer";
+            var lastName = request.Payment.Metadata?.GetValueOrDefault("lastName") ?? "Customer";
             var msisdn = request.Payment.PaymentMethodToken;
             var merchantTxId = request.Payment.IdempotencyKey ?? $"tingg-split-{Guid.NewGuid():N}";
 
-            var splitsPayload = rules.Select(r => new
+            // Tingg models splits as `charge_beneficiaries` on the express-request call, each entry a
+            // { charge_beneficiary_code, amount } pair. Source:
+            // https://docs.tingg.africa/docs/checkout-v3-express-checkout
+            // Note: the documented split entry carries a FIXED `amount` only — percentage splits are
+            // resolved client-side against the request amount before sending.
+            var chargeBeneficiaries = rules.Select(r => new
             {
-                subServiceCode = r.SubAccountReference,
-                amount = r.ShareType == SplitShareType.FixedAmount ? r.Amount ?? 0m : null as decimal?,
-                percentage = r.ShareType == SplitShareType.Percentage ? r.Percentage ?? 0m : null as decimal?,
-                bearsFee = r.BearsTransactionFee
+                charge_beneficiary_code = r.SubAccountReference,
+                amount = r.ShareType == SplitShareType.FixedAmount
+                    ? (r.Amount ?? 0m)
+                    : Math.Round(request.Payment.Amount * (r.Percentage ?? 0m) / 100m, 2)
             }).ToArray();
 
+            var accountNumber = BuildAccountNumber(merchantTxId);
             var body = new
             {
+                customer_first_name = firstName,
+                customer_last_name = lastName,
+                customer_email = email,
                 msisdn,
-                payerEmail = email,
-                requestAmount = request.Payment.Amount,
-                currencyCode = request.Payment.Currency.ToUpperInvariant(),
-                serviceCode = _options.ServiceCode,
-                merchantTransactionId = merchantTxId,
-                requestDescription = request.Payment.Description,
-                countryCode = _options.CountryCode,
-                splits = splitsPayload
+                account_number = accountNumber,
+                request_amount = request.Payment.Amount.ToString(CultureInfo.InvariantCulture),
+                merchant_transaction_id = merchantTxId,
+                service_code = _options.ServiceCode,
+                country_code = _options.CountryCode,
+                currency_code = request.Payment.Currency.ToUpperInvariant(),
+                request_description = request.Payment.Description,
+                callback_url = _options.CallbackUrl,
+                success_redirect_url = _options.CallbackUrl,
+                fail_redirect_url = _options.CallbackUrl,
+                charge_beneficiaries = chargeBeneficiaries
             };
 
-            var responseBody = await SendAuthorisedAsync(HttpMethod.Post, "checkout/v3/express", body, ct, "ChargeWithSplit").ConfigureAwait(false);
+            var responseBody = await SendAuthorisedAsync(HttpMethod.Post, "v3/checkout-api/checkout-request/express-request", body, ct, "ChargeWithSplit").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<CellulantCheckoutResponse>(responseBody);
 
+            var statusCode = response?.Status?.StatusCode;
             return new PaymentResponse
             {
-                GatewayReference = response?.CheckoutRequestId ?? merchantTxId,
-                Status = MapStatus(response?.Status),
+                GatewayReference = merchantTxId,
+                Status = statusCode == 200 ? PaymentStatus.Pending : PaymentStatus.Failed,
                 Amount = request.Payment.Amount,
                 Currency = request.Payment.Currency,
                 ProcessedAt = DateTime.UtcNow,
-                RedirectUrl = response?.RedirectUrl,
-                Message = response?.Status
+                RedirectUrl = response?.Results?.ShortUrl ?? response?.Results?.LongUrl,
+                Message = response?.Status?.StatusDescription
             };
         }, ct);
     }
@@ -255,14 +285,6 @@ public sealed class CellulantMarketplaceProvider : BhenguProviderBase, IMarketpl
         OnboardingUrl = null
     };
 
-    private static PaymentStatus MapStatus(string? raw) => raw?.ToLowerInvariant() switch
-    {
-        "success" or "completed" or "successful" => PaymentStatus.Completed,
-        "pending" or "processing" or "initiated" => PaymentStatus.Pending,
-        "failed" or "rejected" => PaymentStatus.Failed,
-        _ => PaymentStatus.Pending
-    };
-
     private async Task<string> SendAuthorisedAsync(HttpMethod method, string path, object? body, CancellationToken ct, string operation)
     {
         var token = await _tokenBroker.EnsureAccessTokenAsync(_httpClient, ct).ConfigureAwait(false);
@@ -275,6 +297,10 @@ public sealed class CellulantMarketplaceProvider : BhenguProviderBase, IMarketpl
             req.Content = new StringContent(json, Encoding.UTF8, "application/json");
         }
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        // Tingg requires the apiKey header on every call (case-insensitive on the wire).
+        // Source: https://docs.tingg.africa/reference/authenticate-requests
+        if (!string.IsNullOrEmpty(_options.ApiKey))
+            req.Headers.TryAddWithoutValidation("apiKey", _options.ApiKey);
 
         var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
@@ -294,6 +320,17 @@ public sealed class CellulantMarketplaceProvider : BhenguProviderBase, IMarketpl
         }
 
         return responseBody;
+    }
+
+    /// <summary>
+    /// Tingg's <c>account_number</c> must be ≤15 chars with no special chars (underscores allowed).
+    /// Source: https://docs.tingg.africa/docs/checkout-v3-express-checkout
+    /// </summary>
+    private static string BuildAccountNumber(string merchantTransactionId)
+    {
+        var cleaned = new string(merchantTransactionId.Where(c => char.IsLetterOrDigit(c) || c == '_').ToArray());
+        if (cleaned.Length == 0) cleaned = Guid.NewGuid().ToString("N");
+        return cleaned.Length <= 15 ? cleaned : cleaned[..15];
     }
 
     private async Task<T?> TryGetCachedAsync<T>(string? idempotencyKey, string operation, CancellationToken ct) where T : class
@@ -335,10 +372,23 @@ public sealed class CellulantMarketplaceProvider : BhenguProviderBase, IMarketpl
         [JsonPropertyName("isActive")] public bool? IsActive { get; set; }
     }
 
+    // Verified express-request response envelope.
+    // Source: https://docs.tingg.africa/docs/checkout-v3-express-checkout
     private sealed class CellulantCheckoutResponse
     {
-        [JsonPropertyName("checkoutRequestId")] public string? CheckoutRequestId { get; set; }
-        [JsonPropertyName("redirectUrl")] public string? RedirectUrl { get; set; }
-        [JsonPropertyName("status")] public string? Status { get; set; }
+        [JsonPropertyName("status")] public CellulantStatusEnvelope? Status { get; set; }
+        [JsonPropertyName("results")] public CellulantCheckoutResults? Results { get; set; }
+    }
+
+    private sealed class CellulantStatusEnvelope
+    {
+        [JsonPropertyName("status_code")] public int? StatusCode { get; set; }
+        [JsonPropertyName("status_description")] public string? StatusDescription { get; set; }
+    }
+
+    private sealed class CellulantCheckoutResults
+    {
+        [JsonPropertyName("short_url")] public string? ShortUrl { get; set; }
+        [JsonPropertyName("long_url")] public string? LongUrl { get; set; }
     }
 }

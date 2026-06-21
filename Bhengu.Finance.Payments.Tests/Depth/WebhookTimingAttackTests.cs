@@ -326,7 +326,7 @@ public sealed class WebhookTimingAttackTests
         var provider = new CellulantPaymentProvider(StubHttp(),
             Options.Create(new CellulantOptions
             {
-                ServiceCode = "TGNTEST", ClientId = "c", ClientSecret = "s", WebhookSecret = Secret,
+                ServiceCode = "TGNTEST", ApiKey = "k", ClientId = "c", ClientSecret = "s", WebhookSecret = Secret,
                 CallbackUrl = "https://example.com/cb", UseSandbox = true
             }),
             NullLogger<CellulantPaymentProvider>.Instance);

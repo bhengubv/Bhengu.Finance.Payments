@@ -23,13 +23,24 @@ using Microsoft.Extensions.Options;
 namespace Bhengu.Finance.Payments.Cellulant.Providers;
 
 /// <summary>
-/// Cellulant (Tingg / Mula) pan-African aggregator. Wraps the Tingg Express Checkout v3 API for
-/// collections and refunds, and the Mula disbursement endpoint for payouts. OAuth2 access tokens
-/// are minted on demand using the configured client credentials. Webhooks are HMAC-SHA256 signed
-/// via the <c>x-tingg-signature</c> header. Honours per-call <c>IdempotencyKey</c> by dedup'ing
-/// via the shared <see cref="IBhenguDistributedCache"/> for 24 hours.
+/// Cellulant (Tingg) pan-African aggregator. Wraps the Tingg Checkout 3.0 Express Checkout API for
+/// collections (<c>/v3/checkout-api/checkout-request/express-request</c>) and the Checkout refund
+/// endpoint (<c>/v3/checkout-api/refund/request</c>); payouts use the SEPARATE Tingg Payouts
+/// "global-api" product (<c>/v1/global-api/payments</c>). OAuth2 access tokens are minted on demand
+/// using the configured client credentials, and EVERY call additionally carries the Tingg
+/// <c>apiKey</c> header. Honours per-call <c>IdempotencyKey</c> by dedup'ing via the shared
+/// <see cref="IBhenguDistributedCache"/> for 24 hours.
 /// </summary>
-[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public documentation; never sandbox-verified.")]
+/// <remarks>
+/// Wire details verified against Tingg docs (June 2026):
+/// hosts https://docs.tingg.africa/reference/authenticate-requests ;
+/// express checkout https://docs.tingg.africa/docs/checkout-v3-express-checkout ;
+/// refund https://docs.tingg.africa/reference/refund ;
+/// query https://docs.tingg.africa/reference/query-status ;
+/// callback/webhook https://docs.tingg.africa/reference/4-implement-webhook-via-callback-url-1 ;
+/// payouts https://docs.tingg.africa/reference/postpayment .
+/// </remarks>
+[ProviderVerificationStatus(ProviderVerificationStatus.DocsOnly, Notes = "Wire format built from public Tingg Checkout 3.0 docs (docs.tingg.africa, June 2026); never sandbox-verified. Webhook signature scheme + payout body are UNVERIFIED — see code.")]
 public sealed class CellulantPaymentProvider : BhenguProviderBase, IPaymentGatewayProvider, IPayoutProvider
 {
     private readonly HttpClient _httpClient;
@@ -79,12 +90,17 @@ public sealed class CellulantPaymentProvider : BhenguProviderBase, IPaymentGatew
 
         if (_httpClient.BaseAddress is null)
         {
+            // Verified Tingg Checkout 3.0 hosts. Source: https://docs.tingg.africa/reference/authenticate-requests
             var defaultUrl = _options.UseSandbox
-                ? "https://online.uat.tingg.africa/"
-                : "https://online.tingg.africa/";
+                ? "https://api-approval.tingg.africa/"
+                : "https://api.tingg.africa/";
             _httpClient.BaseAddress = new Uri(_options.BaseUrl ?? defaultUrl);
         }
     }
+
+    private static string PayoutBaseUrl(CellulantOptions options) =>
+        options.PayoutBaseUrl
+        ?? (options.UseSandbox ? "https://api-approval.tingg.africa/" : "https://api.tingg.africa/");
 
     /// <inheritdoc/>
     public Task<PaymentResponse> ProcessPaymentAsync(PaymentRequest request, CancellationToken ct = default)
@@ -95,8 +111,10 @@ public sealed class CellulantPaymentProvider : BhenguProviderBase, IPaymentGatew
             var cached = await TryGetCachedAsync<PaymentResponse>(request.IdempotencyKey, "charge", ct).ConfigureAwait(false);
             if (cached is not null) return cached;
 
-            var email = request.Metadata?.GetValueOrDefault("email") ?? "noreply@example.com";
-            var name = request.Metadata?.GetValueOrDefault("name") ?? "Customer";
+            var email = request.Metadata?.GetValueOrDefault("email");
+            var firstName = request.Metadata?.GetValueOrDefault("firstName")
+                ?? request.Metadata?.GetValueOrDefault("name") ?? "Customer";
+            var lastName = request.Metadata?.GetValueOrDefault("lastName") ?? "Customer";
             var msisdn = request.PaymentMethodToken;
 
             var merchantTransactionId = request.IdempotencyKey
@@ -104,42 +122,51 @@ public sealed class CellulantPaymentProvider : BhenguProviderBase, IPaymentGatew
                     ? $"tingg-{Guid.NewGuid():N}"
                     : $"{_options.MerchantTransactionId}-{Guid.NewGuid():N}");
 
+            // Verified body (snake_case). Source: https://docs.tingg.africa/docs/checkout-v3-express-checkout
+            // amount/codes are strings on the wire in Tingg's example; account_number must be <=15 chars
+            // with no special chars, so we derive a safe reference from the merchant transaction id.
+            var accountNumber = BuildAccountNumber(merchantTransactionId);
             var requestBody = new
             {
+                customer_first_name = firstName,
+                customer_last_name = lastName,
+                customer_email = email,
                 msisdn,
-                accountNumber = msisdn,
-                payerEmail = email,
-                payerClientCode = msisdn,
-                payerClientName = name,
-                payerAuthEmail = email,
-                requestAmount = request.Amount,
-                currencyCode = request.Currency.ToUpperInvariant(),
-                serviceCode = _options.ServiceCode,
-                merchantTransactionId,
-                requestDescription = request.Description,
-                dueDate = DateTime.UtcNow.AddDays(7).ToString("yyyy-MM-dd HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture),
-                languageCode = "en",
-                successRedirectUrl = _options.CallbackUrl,
-                failRedirectUrl = _options.CallbackUrl,
-                paymentWebhookUrl = _options.CallbackUrl,
-                countryCode = _options.CountryCode
+                account_number = accountNumber,
+                request_amount = request.Amount.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                merchant_transaction_id = merchantTransactionId,
+                service_code = _options.ServiceCode,
+                country_code = _options.CountryCode,
+                currency_code = request.Currency.ToUpperInvariant(),
+                request_description = request.Description,
+                due_date = DateTime.UtcNow.AddDays(7).ToString("yyyy-MM-dd HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture),
+                language_code = "en",
+                callback_url = _options.CallbackUrl,
+                success_redirect_url = _options.CallbackUrl,
+                fail_redirect_url = _options.CallbackUrl
             };
 
-            var body = await SendAuthorisedAsync(HttpMethod.Post, "checkout/v3/express", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
+            var body = await SendAuthorisedAsync(HttpMethod.Post, "v3/checkout-api/checkout-request/express-request", requestBody, ct, "ProcessPayment").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<CellulantCheckoutResponse>(body);
 
-            Logger.LogInformation("Cellulant checkout created: {Id} status={Status}",
-                response?.CheckoutRequestId, response?.Status);
+            // Express response carries no checkout id — the merchant_transaction_id is the correlation
+            // key; the customer-facing payment page is results.short_url.
+            // Source: https://docs.tingg.africa/docs/checkout-v3-express-checkout
+            var statusCode = response?.Status?.StatusCode;
+            Logger.LogInformation("Cellulant checkout created: txn={Txn} status={Status}",
+                merchantTransactionId, statusCode);
 
             var pr = new PaymentResponse
             {
-                GatewayReference = response?.CheckoutRequestId ?? merchantTransactionId,
-                Status = MapStatus(response?.Status ?? "pending"),
+                GatewayReference = merchantTransactionId,
+                // A successful express-request returns the hosted page; the actual payment is still
+                // pending until the customer completes it on the page (confirmed via webhook/query).
+                Status = statusCode == 200 ? PaymentStatus.Pending : PaymentStatus.Failed,
                 Amount = request.Amount,
                 Currency = request.Currency,
                 ProcessedAt = DateTime.UtcNow,
-                RedirectUrl = response?.RedirectUrl,
-                Message = response?.Status
+                RedirectUrl = response?.Results?.ShortUrl ?? response?.Results?.LongUrl,
+                Message = response?.Status?.StatusDescription
             };
 
             await TrySetCachedAsync(request.IdempotencyKey, "charge", pr, ct).ConfigureAwait(false);
@@ -156,28 +183,60 @@ public sealed class CellulantPaymentProvider : BhenguProviderBase, IPaymentGatew
             var cached = await TryGetCachedAsync<PayoutResponse>(request.IdempotencyKey, "payout", ct).ConfigureAwait(false);
             if (cached is not null) return cached;
 
-            var externalReference = request.IdempotencyKey ?? $"mula-{Guid.NewGuid():N}";
+            var payerTransactionId = request.IdempotencyKey ?? $"tingg-payout-{Guid.NewGuid():N}";
+
+            // Verified host/path: POST {payout-host}/v1/global-api/payments for B2C mobile-money
+            // disbursement. Source: https://docs.tingg.africa/reference/postpayment
+            //
+            // UNVERIFIED: the exact request/response JSON for global-api/payments is NOT fully
+            // documented publicly. The docs show a function-envelope shape
+            //   { function:"BEEP.postPayment", countryCode, payload:{ credentials:{username,password},
+            //     packet:[{ serviceCode, MSISDN, accountNumber, payerTransactionID, amount, countryCode,
+            //     currencyCode, datePaymentReceived, narration, customerNames, paymentMode,
+            //     extraData:{ callbackUrl } }] } }
+            // authenticated by username/password INSIDE the payload (NOT the checkout Bearer/apiKey).
+            // We construct that documented envelope on a best-effort basis; the credential fields are
+            // intentionally left unset because Tingg Payouts uses different credentials than Checkout
+            // and the SDK has no verified field for them. DO NOT rely on payouts in production until
+            // sandbox-verified. See README / ProviderVerificationStatus note.
             var requestBody = new
             {
-                sourceServiceCode = _options.ServiceCode,
-                destinationMSISDN = request.DestinationToken,
-                currencyCode = request.Currency.ToUpperInvariant(),
-                amount = request.Amount,
-                narration = request.Description,
+                function = "BEEP.postPayment",
                 countryCode = _options.CountryCode,
-                externalReference
+                payload = new
+                {
+                    packet = new[]
+                    {
+                        new
+                        {
+                            serviceCode = _options.ServiceCode,
+                            MSISDN = request.DestinationToken,
+                            accountNumber = request.DestinationToken,
+                            payerTransactionID = payerTransactionId,
+                            amount = request.Amount,
+                            countryCode = _options.CountryCode,
+                            currencyCode = request.Currency.ToUpperInvariant(),
+                            narration = request.Description,
+                            extraData = new { callbackUrl = _options.CallbackUrl }
+                        }
+                    }
+                }
             };
 
-            var body = await SendAuthorisedAsync(HttpMethod.Post, "disbursement/v1/initiate", requestBody, ct, "ProcessPayout").ConfigureAwait(false);
+            var body = await SendAuthorisedToAsync(PayoutBaseUrl(_options), HttpMethod.Post, "v1/global-api/payments", requestBody, ct, "ProcessPayout").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<CellulantPayoutResponse>(body);
 
-            Logger.LogInformation("Cellulant Mula disbursement initiated: {Reference} status={Status}",
-                response?.TransactionReference, response?.Status);
+            // UNVERIFIED: response field names below (results[].beepTransactionID/statusCode) follow the
+            // partial docs at https://docs.tingg.africa/reference/postpayment but were not verified live.
+            var result = response?.Results is { Length: > 0 } r ? r[0] : null;
+            Logger.LogInformation("Cellulant Tingg payout posted: {Reference} status={Status}",
+                result?.BeepTransactionId, result?.StatusCode);
 
             var pr = new PayoutResponse
             {
-                GatewayReference = response?.TransactionReference ?? string.Empty,
-                Status = MapStatus(response?.Status ?? "pending"),
+                GatewayReference = result?.BeepTransactionId ?? payerTransactionId,
+                // 139 = "Payment posted successfully and pending acknowledgement" per the docs.
+                Status = result?.StatusCode == 139 ? PaymentStatus.Pending : MapPayoutStatus(result?.StatusCode),
                 Amount = request.Amount,
                 Currency = request.Currency,
                 ProcessedAt = DateTime.UtcNow
@@ -197,26 +256,38 @@ public sealed class CellulantPaymentProvider : BhenguProviderBase, IPaymentGatew
             var cached = await TryGetCachedAsync<RefundResponse>(request.IdempotencyKey, "refund", ct).ConfigureAwait(false);
             if (cached is not null) return cached;
 
+            // Verified body. Source: https://docs.tingg.africa/reference/refund
+            // GatewayReference holds our merchant_transaction_id (the correlation key from checkout).
+            var refundReference = request.IdempotencyKey ?? $"tingg-refund-{Guid.NewGuid():N}";
             var requestBody = new
             {
-                transactionId = request.GatewayReference,
+                merchant_transaction_id = request.GatewayReference,
+                // Verified values: "Full" | "Partial". amount is compulsory for partial refunds.
+                // currency_code is optional (Tingg defaults to the original) and RefundRequest carries
+                // no currency, so it is omitted.
+                refund_type = request.IsPartial ? "Partial" : "Full",
                 amount = request.Amount,
-                reason = request.Reason
+                refund_narration = string.IsNullOrWhiteSpace(request.Reason) ? "Refund" : request.Reason,
+                refund_reference = refundReference,
+                service_code = _options.ServiceCode
             };
 
-            var body = await SendAuthorisedAsync(HttpMethod.Post, "refunds", requestBody, ct, "ProcessRefund").ConfigureAwait(false);
+            var body = await SendAuthorisedAsync(HttpMethod.Post, "v3/checkout-api/refund/request", requestBody, ct, "ProcessRefund").ConfigureAwait(false);
             var response = JsonSerializer.Deserialize<CellulantRefundResponse>(body);
 
-            Logger.LogInformation("Cellulant refund processed: {Reference} for transaction {TransactionId}",
-                response?.RefundReference, request.GatewayReference);
+            // Verified response is a status envelope (status.status_code 200 = "request logged").
+            var statusCode = response?.Status?.StatusCode;
+            Logger.LogInformation("Cellulant refund logged: {Reference} for txn {TransactionId} status={Status}",
+                refundReference, request.GatewayReference, statusCode);
 
             var pr = new RefundResponse
             {
-                GatewayReference = response?.RefundReference ?? request.GatewayReference,
+                GatewayReference = refundReference,
                 Amount = request.Amount,
-                Status = MapStatus(response?.Status ?? "pending"),
+                // 200 = refund request successfully logged (async; final state arrives via webhook/query).
+                Status = statusCode == 200 ? PaymentStatus.Pending : PaymentStatus.Failed,
                 ProcessedAt = DateTime.UtcNow,
-                Message = response?.Status
+                Message = response?.Status?.StatusDescription
             };
 
             await TrySetCachedAsync(request.IdempotencyKey, "refund", pr, ct).ConfigureAwait(false);
@@ -237,7 +308,13 @@ public sealed class CellulantPaymentProvider : BhenguProviderBase, IPaymentGatew
                 Logger.LogWarning("Cellulant WebhookSecret not configured — signature verification cannot succeed.");
                 return false;
             }
-            // Tingg signs the raw payload with HMAC-SHA256, lowercase hex, in x-tingg-signature.
+            // UNVERIFIED: Tingg's public Checkout v3 callback docs
+            // (https://docs.tingg.africa/reference/4-implement-webhook-via-callback-url-1) do NOT
+            // document any signature/HMAC header on the IPN — authenticity is not described there.
+            // This retains the prior HMAC-SHA256 lowercase-hex check for deployments with an
+            // out-of-band signing arrangement; it is NOT confirmed against Tingg. If Tingg does not
+            // sign your callbacks, do NOT rely on this — authenticate by re-querying transaction
+            // status via GET /v3/checkout-api/query/{service_code}/{merchant_transaction_id}.
             return SignatureHelpers.VerifyHmacSha256(payload, signature, _options.WebhookSecret);
         });
     }
@@ -253,7 +330,8 @@ public sealed class CellulantPaymentProvider : BhenguProviderBase, IPaymentGatew
                 var webhookEvent = JsonSerializer.Deserialize<CellulantWebhookEvent>(payload);
                 if (webhookEvent is null) return Task.FromResult<WebhookEvent?>(null);
 
-                Logger.LogInformation("Parsed Cellulant webhook event: {EventType}", webhookEvent.EventType);
+                Logger.LogInformation("Parsed Cellulant webhook: txn={Txn} status={Status}",
+                    webhookEvent.MerchantTransactionId, webhookEvent.RequestStatusCode);
                 var typed = MapWebhookEvent(webhookEvent);
                 return Task.FromResult(typed);
             }
@@ -265,114 +343,71 @@ public sealed class CellulantPaymentProvider : BhenguProviderBase, IPaymentGatew
         }, ct);
     }
 
+    // Verified Tingg Checkout v3 IPN/callback payload (snake_case, status-code driven). The
+    // correlation key is merchant_transaction_id; checkout_request_id is Tingg's internal id.
+    // Status codes: 178 = full payment, 179 = partial payment, 180 = payment rejected,
+    // 184-187/191 = refund states. Sources:
+    // https://docs.tingg.africa/reference/4-implement-webhook-via-callback-url-1 and
+    // https://docs.tingg.africa/reference/query-status
     private static WebhookEvent? MapWebhookEvent(CellulantWebhookEvent webhookEvent)
     {
-        var eventName = webhookEvent.EventType?.ToLowerInvariant();
-        var reference = webhookEvent.Data?.CheckoutRequestId ?? webhookEvent.Data?.TransactionId;
+        var reference = webhookEvent.MerchantTransactionId ?? webhookEvent.CheckoutRequestId;
         if (string.IsNullOrEmpty(reference)) return null;
 
-        var amount = webhookEvent.Data?.Amount ?? 0m;
-        var currency = webhookEvent.Data?.Currency ?? "KES";
+        var amount = webhookEvent.AmountPaid ?? webhookEvent.RequestAmount ?? 0m;
+        var currency = webhookEvent.CurrencyCode ?? "KES";
+        var statusCode = webhookEvent.RequestStatusCode;
+        var statusDesc = webhookEvent.RequestStatusDescription;
 
-        switch (eventName)
+        switch (statusCode)
         {
-            case "payment.success":
-            case "checkout.success":
+            // Successful collection (full or partial payment received).
+            case 178:
+            case 179:
                 return new ChargeSucceededEvent
                 {
                     GatewayReference = reference,
                     Status = PaymentStatus.Completed,
-                    EventType = webhookEvent.EventType,
+                    EventType = statusDesc ?? statusCode?.ToString(System.Globalization.CultureInfo.InvariantCulture),
                     Category = WebhookEventCategory.ChargeSucceeded,
                     Amount = amount,
                     Currency = currency,
-                    CustomerId = webhookEvent.Data?.Msisdn,
-                    PaymentMethodToken = webhookEvent.Data?.Msisdn
+                    CustomerId = webhookEvent.Msisdn,
+                    PaymentMethodToken = webhookEvent.Msisdn
                 };
 
-            case "payment.failed":
-            case "checkout.failed":
+            // Payment rejected / failed.
+            case 180:
                 return new ChargeFailedEvent
                 {
                     GatewayReference = reference,
                     Status = PaymentStatus.Failed,
-                    EventType = webhookEvent.EventType,
+                    EventType = statusDesc ?? statusCode?.ToString(System.Globalization.CultureInfo.InvariantCulture),
                     Category = WebhookEventCategory.ChargeFailed,
                     Amount = amount,
                     Currency = currency,
-                    FailureCode = webhookEvent.Data?.Status,
-                    FailureMessage = webhookEvent.Data?.Status
+                    FailureCode = statusCode?.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    FailureMessage = statusDesc
                 };
 
-            case "refund.success":
-            case "refund.processed":
+            // Refund completed (186 = refunded, 187 = refund acknowledged, 191 = refund settled).
+            case 186:
+            case 187:
+            case 191:
                 return new RefundSucceededEvent
                 {
                     GatewayReference = reference,
                     Status = PaymentStatus.Refunded,
-                    EventType = webhookEvent.EventType,
+                    EventType = statusDesc ?? statusCode?.ToString(System.Globalization.CultureInfo.InvariantCulture),
                     Category = WebhookEventCategory.RefundSucceeded,
-                    RefundReference = webhookEvent.Data?.TransactionId ?? reference,
+                    RefundReference = webhookEvent.CheckoutRequestId ?? reference,
                     Amount = amount,
                     Currency = currency,
                     IsPartial = false
                 };
 
-            case "disbursement.success":
-                return new PayoutCompletedEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Completed,
-                    EventType = webhookEvent.EventType,
-                    Category = WebhookEventCategory.PayoutCompleted,
-                    PayoutReference = reference,
-                    Amount = amount,
-                    Currency = currency,
-                    DestinationToken = webhookEvent.Data?.Msisdn
-                };
-
-            case "disbursement.failed":
-                return new PayoutFailedEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Failed,
-                    EventType = webhookEvent.EventType,
-                    Category = WebhookEventCategory.PayoutFailed,
-                    PayoutReference = reference,
-                    Amount = amount,
-                    Currency = currency,
-                    FailureCode = webhookEvent.Data?.Status,
-                    FailureMessage = webhookEvent.Data?.Status
-                };
-
-            case "settlement.completed":
-                return new SettlementCompletedEvent
-                {
-                    GatewayReference = reference,
-                    Status = PaymentStatus.Completed,
-                    EventType = webhookEvent.EventType,
-                    Category = WebhookEventCategory.SettlementCompleted,
-                    SettlementReference = reference,
-                    NetAmount = amount,
-                    Currency = currency
-                };
-
             default:
-                var status = eventName switch
-                {
-                    "payment.success" or "checkout.success" or "disbursement.success" => PaymentStatus.Completed,
-                    "payment.failed" or "checkout.failed" or "disbursement.failed" => PaymentStatus.Failed,
-                    "refund.success" or "refund.processed" => PaymentStatus.Refunded,
-                    _ => (PaymentStatus?)null
-                };
-                if (status is null) return null;
-                return new WebhookEvent
-                {
-                    GatewayReference = reference,
-                    Status = status.Value,
-                    EventType = webhookEvent.EventType,
-                    Category = WebhookEventCategory.Unknown
-                };
+                return null;
         }
     }
 
@@ -380,17 +415,33 @@ public sealed class CellulantPaymentProvider : BhenguProviderBase, IPaymentGatew
     internal Task<string> EnsureAccessTokenAsync(CancellationToken ct) =>
         _tokenBroker.EnsureAccessTokenAsync(_httpClient, ct);
 
-    private async Task<string> SendAuthorisedAsync(HttpMethod method, string path, object body, CancellationToken ct, string operation)
+    private Task<string> SendAuthorisedAsync(HttpMethod method, string path, object body, CancellationToken ct, string operation) =>
+        SendAuthorisedToAsync(baseUrlOverride: null, method, path, body, ct, operation);
+
+    /// <summary>
+    /// Send an authorised request. Every Tingg call carries the OAuth Bearer token AND the
+    /// <c>apiKey</c> header. Source: https://docs.tingg.africa/reference/authenticate-requests.
+    /// When <paramref name="baseUrlOverride"/> is set the request targets an absolute URI on that
+    /// host (used for the separate Payouts global-api host) rather than the client's BaseAddress.
+    /// </summary>
+    private async Task<string> SendAuthorisedToAsync(string? baseUrlOverride, HttpMethod method, string path, object body, CancellationToken ct, string operation)
     {
         var token = await _tokenBroker.EnsureAccessTokenAsync(_httpClient, ct).ConfigureAwait(false);
         ct.ThrowIfCancellationRequested();
 
+        var requestUri = baseUrlOverride is null ? new Uri(path, UriKind.Relative) : new Uri(new Uri(baseUrlOverride), path);
         var json = JsonSerializer.Serialize(body);
-        using var req = new HttpRequestMessage(method, path)
+        using var req = new HttpRequestMessage(method, requestUri)
         {
             Content = new StringContent(json, Encoding.UTF8, "application/json")
         };
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        // Tingg requires the apiKey header on every call. The checkout endpoints document it as
+        // `apiKey`; the token/refund/query reference pages show `apikey`. HTTP header names are
+        // case-insensitive (RFC 7230 §3.2), so the casing is immaterial on the wire.
+        // Source: https://docs.tingg.africa/docs/checkout-v3-express-checkout
+        if (!string.IsNullOrEmpty(_options.ApiKey))
+            req.Headers.TryAddWithoutValidation("apiKey", _options.ApiKey);
 
         var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
@@ -412,6 +463,25 @@ public sealed class CellulantPaymentProvider : BhenguProviderBase, IPaymentGatew
         return responseBody;
     }
 
+    /// <summary>
+    /// Tingg's <c>account_number</c> must be ≤15 chars with no special chars (underscores allowed).
+    /// Derive a safe value from the merchant transaction id.
+    /// Source: https://docs.tingg.africa/docs/checkout-v3-express-checkout
+    /// </summary>
+    private static string BuildAccountNumber(string merchantTransactionId)
+    {
+        var cleaned = new string(merchantTransactionId.Where(c => char.IsLetterOrDigit(c) || c == '_').ToArray());
+        if (cleaned.Length == 0) cleaned = Guid.NewGuid().ToString("N");
+        return cleaned.Length <= 15 ? cleaned : cleaned[..15];
+    }
+
+    private static PaymentStatus MapPayoutStatus(int? statusCode) => statusCode switch
+    {
+        139 => PaymentStatus.Pending, // posted, pending acknowledgement
+        null => PaymentStatus.Pending,
+        _ => PaymentStatus.Pending
+    };
+
     private async Task<T?> TryGetCachedAsync<T>(string? idempotencyKey, string operation, CancellationToken ct) where T : class
     {
         if (string.IsNullOrWhiteSpace(idempotencyKey)) return null;
@@ -430,50 +500,65 @@ public sealed class CellulantPaymentProvider : BhenguProviderBase, IPaymentGatew
         return $"cellulant:idem:{operation}:{hash}";
     }
 
-    private static PaymentStatus MapStatus(string raw) => raw?.ToLowerInvariant() switch
-    {
-        "success" or "successful" or "completed" or "processed" => PaymentStatus.Completed,
-        "pending" or "processing" or "initiated" => PaymentStatus.Pending,
-        "failed" or "rejected" => PaymentStatus.Failed,
-        "cancelled" or "canceled" => PaymentStatus.Cancelled,
-        "refunded" => PaymentStatus.Refunded,
-        _ => PaymentStatus.Pending
-    };
-
     // === Cellulant API response shapes (internal) ===
+    // Verified status envelope shared by express-request and refund/request:
+    //   { "status": { "status_code": 200, "status_description": "success" },
+    //     "results": { "short_url": "...", "long_url": "..." } }
+    // Source: https://docs.tingg.africa/docs/checkout-v3-express-checkout
+
+    private sealed class CellulantStatusEnvelope
+    {
+        [JsonPropertyName("status_code")] public int? StatusCode { get; set; }
+        [JsonPropertyName("status_description")] public string? StatusDescription { get; set; }
+    }
+
+    private sealed class CellulantCheckoutResults
+    {
+        [JsonPropertyName("short_url")] public string? ShortUrl { get; set; }
+        [JsonPropertyName("long_url")] public string? LongUrl { get; set; }
+    }
 
     private sealed class CellulantCheckoutResponse
     {
-        [JsonPropertyName("checkoutRequestId")] public string? CheckoutRequestId { get; set; }
-        [JsonPropertyName("redirectUrl")] public string? RedirectUrl { get; set; }
-        [JsonPropertyName("status")] public string? Status { get; set; }
-    }
-
-    private sealed class CellulantPayoutResponse
-    {
-        [JsonPropertyName("transactionReference")] public string? TransactionReference { get; set; }
-        [JsonPropertyName("status")] public string? Status { get; set; }
+        [JsonPropertyName("status")] public CellulantStatusEnvelope? Status { get; set; }
+        [JsonPropertyName("results")] public CellulantCheckoutResults? Results { get; set; }
     }
 
     private sealed class CellulantRefundResponse
     {
-        [JsonPropertyName("refundReference")] public string? RefundReference { get; set; }
-        [JsonPropertyName("status")] public string? Status { get; set; }
+        [JsonPropertyName("status")] public CellulantStatusEnvelope? Status { get; set; }
     }
 
+    // UNVERIFIED: Tingg Payouts (global-api) response shape is only partially documented.
+    // Source: https://docs.tingg.africa/reference/postpayment
+    private sealed class CellulantPayoutResponse
+    {
+        [JsonPropertyName("authStatusCode")] public int? AuthStatusCode { get; set; }
+        [JsonPropertyName("authStatusDescription")] public string? AuthStatusDescription { get; set; }
+        [JsonPropertyName("results")] public CellulantPayoutResult[]? Results { get; set; }
+    }
+
+    private sealed class CellulantPayoutResult
+    {
+        [JsonPropertyName("statusCode")] public int? StatusCode { get; set; }
+        [JsonPropertyName("statusDescription")] public string? StatusDescription { get; set; }
+        [JsonPropertyName("payerTransactionID")] public string? PayerTransactionId { get; set; }
+        [JsonPropertyName("beepTransactionID")] public string? BeepTransactionId { get; set; }
+    }
+
+    // Verified IPN/callback fields (subset we consume). snake_case.
+    // Source: https://docs.tingg.africa/reference/4-implement-webhook-via-callback-url-1
     private sealed class CellulantWebhookEvent
     {
-        [JsonPropertyName("eventType")] public string? EventType { get; set; }
-        [JsonPropertyName("data")] public CellulantWebhookData? Data { get; set; }
-    }
-
-    private sealed class CellulantWebhookData
-    {
-        [JsonPropertyName("checkoutRequestId")] public string? CheckoutRequestId { get; set; }
-        [JsonPropertyName("transactionId")] public string? TransactionId { get; set; }
-        [JsonPropertyName("status")] public string? Status { get; set; }
-        [JsonPropertyName("amount")] public decimal? Amount { get; set; }
-        [JsonPropertyName("currency")] public string? Currency { get; set; }
-        [JsonPropertyName("msisdn")] public string? Msisdn { get; set; }
+        [JsonPropertyName("checkout_request_id")] public string? CheckoutRequestId { get; set; }
+        [JsonPropertyName("merchant_transaction_id")] public string? MerchantTransactionId { get; set; }
+        [JsonPropertyName("request_status_code")] public int? RequestStatusCode { get; set; }
+        [JsonPropertyName("request_status_description")] public string? RequestStatusDescription { get; set; }
+        [JsonPropertyName("request_amount")] public decimal? RequestAmount { get; set; }
+        [JsonPropertyName("amount_paid")] public decimal? AmountPaid { get; set; }
+        [JsonPropertyName("currency_code")] public string? CurrencyCode { get; set; }
+        [JsonPropertyName("account_number")] public string? AccountNumber { get; set; }
+        [JsonPropertyName("service_code")] public string? ServiceCode { get; set; }
+        [JsonPropertyName("MSISDN")] public string? Msisdn { get; set; }
     }
 }

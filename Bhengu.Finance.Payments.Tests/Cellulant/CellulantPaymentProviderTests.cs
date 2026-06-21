@@ -36,6 +36,7 @@ public class CellulantPaymentProviderTests
         opts ??= new CellulantOptions
         {
             ServiceCode = "TGNTEST",
+            ApiKey = "apikey-test",
             ClientId = "client-1",
             ClientSecret = "secret-1",
             WebhookSecret = "webhook-test-secret",
@@ -70,20 +71,27 @@ public class CellulantPaymentProviderTests
     }
 
     [Fact]
-    public async Task ProcessPaymentAsync_ReturnsCompletedResponse_OnSuccess()
+    public async Task ProcessPaymentAsync_ReturnsPendingWithHostedUrl_OnSuccess()
     {
+        // Verified v3 express-request: path /v3/checkout-api/checkout-request/express-request,
+        // body in snake_case carrying the apiKey + Bearer; response is a status/results envelope.
+        // Source: https://docs.tingg.africa/docs/checkout-v3-express-checkout
         var handler = ComposeWithToken((req, _) =>
         {
-            Assert.Contains("checkout/v3/express", req.RequestUri!.PathAndQuery);
+            Assert.Contains("v3/checkout-api/checkout-request/express-request", req.RequestUri!.PathAndQuery);
+            Assert.True(req.Headers.Contains("apiKey"), "apiKey header must be present on checkout call");
+            Assert.Equal("Bearer", req.Headers.Authorization?.Scheme);
             return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
-                {"checkoutRequestId":"chk-tingg-1","status":"success","redirectUrl":"https://online.tingg.africa/checkout/chk-tingg-1"}
+                {"status":{"status_code":200,"status_description":"success"},"results":{"short_url":"https://api.tingg.africa/checkout/abc123","long_url":"https://api.tingg.africa/checkout?access_key=k&encrypted_payload=p"}}
                 """);
         });
         var provider = Create(handler);
         var response = await provider.ProcessPaymentAsync(SamplePayment());
 
-        Assert.Equal("chk-tingg-1", response.GatewayReference);
-        Assert.Equal(PaymentStatus.Completed, response.Status);
+        // Express returns the hosted payment page; the payment itself is pending until completed.
+        Assert.Equal(PaymentStatus.Pending, response.Status);
+        Assert.Equal("https://api.tingg.africa/checkout/abc123", response.RedirectUrl);
+        Assert.False(string.IsNullOrEmpty(response.GatewayReference));
     }
 
     [Fact]
@@ -121,11 +129,14 @@ public class CellulantPaymentProviderTests
     [Fact]
     public async Task ProcessPayoutAsync_ReturnsResponse_OnSuccess()
     {
+        // Verified host/path: POST {payout-host}/v1/global-api/payments (Tingg Payouts global-api).
+        // Source: https://docs.tingg.africa/reference/postpayment . NOTE: request/response body is
+        // UNVERIFIED in the provider; this asserts the host/path + status mapping only.
         var handler = ComposeWithToken((req, _) =>
         {
-            Assert.Contains("disbursement/v1/initiate", req.RequestUri!.PathAndQuery);
+            Assert.Contains("v1/global-api/payments", req.RequestUri!.PathAndQuery);
             return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
-                {"transactionReference":"mula-1","status":"processing"}
+                {"authStatusCode":200,"authStatusDescription":"ok","results":[{"statusCode":139,"statusDescription":"Payment posted successfully and pending acknowledgement","payerTransactionID":"ptx-1","beepTransactionID":"beep-1"}]}
                 """);
         });
         var provider = Create(handler);
@@ -137,30 +148,34 @@ public class CellulantPaymentProviderTests
             Description = "Vendor payout"
         });
 
-        Assert.Equal("mula-1", payout.GatewayReference);
+        Assert.Equal("beep-1", payout.GatewayReference);
         Assert.Equal(PaymentStatus.Pending, payout.Status);
     }
 
     [Fact]
-    public async Task ProcessRefundAsync_ReturnsRefundedResponse_OnSuccess()
+    public async Task ProcessRefundAsync_ReturnsPending_OnSuccessfullyLoggedRefund()
     {
+        // Verified refund: POST /v3/checkout-api/refund/request, body with refund_type/amount/
+        // refund_reference; response is a status envelope (200 = request logged, async).
+        // Source: https://docs.tingg.africa/reference/refund
         var handler = ComposeWithToken((req, _) =>
         {
-            Assert.Contains("refunds", req.RequestUri!.PathAndQuery);
+            Assert.Contains("v3/checkout-api/refund/request", req.RequestUri!.PathAndQuery);
+            Assert.True(req.Headers.Contains("apiKey"), "apiKey header must be present on refund call");
             return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
-                {"refundReference":"rf-tingg-1","status":"processed"}
+                {"status":{"status_code":200,"status_description":"Refund request successfully logged"}}
                 """);
         });
         var provider = Create(handler);
         var refund = await provider.ProcessRefundAsync(new RefundRequest
         {
-            GatewayReference = "chk-tingg-1",
+            GatewayReference = "merchant-txn-1",
             Amount = 250m,
             Reason = "Customer requested"
         });
 
-        Assert.Equal("rf-tingg-1", refund.GatewayReference);
-        Assert.Equal(PaymentStatus.Completed, refund.Status);
+        Assert.False(string.IsNullOrEmpty(refund.GatewayReference));
+        Assert.Equal(PaymentStatus.Pending, refund.Status);
     }
 
     [Fact]
@@ -175,8 +190,11 @@ public class CellulantPaymentProviderTests
     [Fact]
     public void VerifyWebhookSignature_ReturnsTrue_ForValidSignature()
     {
+        // NOTE: the HMAC scheme itself is UNVERIFIED against Tingg (their public callback docs
+        // describe no signature). This test only proves the retained HMAC-SHA256 hex check is wired
+        // through SignatureHelpers correctly when a WebhookSecret is configured.
         const string secret = "webhook-test-secret";
-        const string payload = """{"eventType":"payment.success","data":{"checkoutRequestId":"chk_1"}}""";
+        const string payload = """{"request_status_code":178,"merchant_transaction_id":"merchant-txn-1"}""";
         using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
         var validSig = Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant();
 
@@ -194,21 +212,23 @@ public class CellulantPaymentProviderTests
     [Fact]
     public async Task ParseWebhookAsync_ReturnsEvent_ForPaymentSuccess()
     {
+        // Verified IPN shape: snake_case, status-code driven (178 = full payment).
+        // Source: https://docs.tingg.africa/reference/4-implement-webhook-via-callback-url-1
         var provider = Create(ComposeWithToken((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
         var evt = await provider.ParseWebhookAsync("""
-            {"eventType":"payment.success","data":{"checkoutRequestId":"chk_99","status":"success"}}
+            {"request_status_code":178,"request_status_description":"Full payment made","merchant_transaction_id":"merchant-txn-1","checkout_request_id":"chk_99","amount_paid":250,"currency_code":"KES","MSISDN":"254712000000"}
             """);
         Assert.NotNull(evt);
-        Assert.Equal("chk_99", evt!.GatewayReference);
+        Assert.Equal("merchant-txn-1", evt!.GatewayReference);
         Assert.Equal(PaymentStatus.Completed, evt.Status);
     }
 
     [Fact]
-    public async Task ParseWebhookAsync_ReturnsNull_ForUnknownEventType()
+    public async Task ParseWebhookAsync_ReturnsNull_ForUnknownStatusCode()
     {
         var provider = Create(ComposeWithToken((_, _) => new HttpResponseMessage(HttpStatusCode.OK)));
         Assert.Null(await provider.ParseWebhookAsync("""
-            {"eventType":"unknown","data":{"checkoutRequestId":"x"}}
+            {"request_status_code":130,"merchant_transaction_id":"x"}
             """));
     }
 

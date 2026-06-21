@@ -32,6 +32,7 @@ public class CellulantMarketplaceProviderTests
         var opts = new CellulantOptions
         {
             ServiceCode = "TGNTEST",
+            ApiKey = "apikey-test",
             ClientId = "client-1",
             ClientSecret = "secret-1",
             UseSandbox = true
@@ -104,11 +105,14 @@ public class CellulantMarketplaceProviderTests
     [Fact]
     public async Task ChargeWithSplitAsync_ReturnsResponse_FromInlineRules()
     {
+        // Verified: splits ride on the express-request call as `charge_beneficiaries`; response is the
+        // status/results envelope. Source: https://docs.tingg.africa/docs/checkout-v3-express-checkout
         var handler = ComposeWithToken((req, _) =>
         {
-            Assert.Contains("checkout/v3/express", req.RequestUri!.PathAndQuery);
+            Assert.Contains("v3/checkout-api/checkout-request/express-request", req.RequestUri!.PathAndQuery);
+            Assert.True(req.Headers.Contains("apiKey"), "apiKey header must be present on split charge");
             return StubHttpMessageHandler.Json(HttpStatusCode.OK, """
-                {"checkoutRequestId":"CHK-1","status":"successful","redirectUrl":"https://pay.tingg/abc"}
+                {"status":{"status_code":200,"status_description":"success"},"results":{"short_url":"https://pay.tingg/abc","long_url":"https://pay.tingg/abc?x=1"}}
                 """);
         });
         var provider = Create(handler);
@@ -127,8 +131,8 @@ public class CellulantMarketplaceProviderTests
             ]
         });
 
-        Assert.Equal("CHK-1", response.GatewayReference);
-        Assert.Equal(PaymentStatus.Completed, response.Status);
+        Assert.False(string.IsNullOrEmpty(response.GatewayReference));
+        Assert.Equal(PaymentStatus.Pending, response.Status);
         Assert.Equal("https://pay.tingg/abc", response.RedirectUrl);
     }
 

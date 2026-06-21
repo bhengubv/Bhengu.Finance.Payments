@@ -21,10 +21,17 @@ using Microsoft.Extensions.Options;
 namespace Bhengu.Finance.Payments.Cellulant.Providers;
 
 /// <summary>
-/// Cellulant (Tingg) implementation of <see cref="ISettlementProvider"/>. Wraps Tingg's
-/// <c>/settlements/v1</c> endpoints that surface per-service settlement batches and the
-/// constituent payment transactions that rolled into each batch.
+/// Cellulant (Tingg) implementation of <see cref="ISettlementProvider"/>. Surfaces per-service
+/// settlement batches and the constituent payment transactions that rolled into each batch.
 /// </summary>
+/// <remarks>
+/// UNVERIFIED: Tingg's public Checkout 3.0 documentation does not describe a programmatic settlement
+/// reporting API (settlement reports are delivered via the merchant portal / SFTP per merchant
+/// agreement). The <c>settlements/v1</c> paths and response shapes here are retained from prior
+/// behaviour and are NOT confirmed against Tingg docs. The host + auth (apiKey + Bearer) ARE verified
+/// (https://docs.tingg.africa/reference/authenticate-requests). Do not rely on this in production
+/// until verified against your Tingg settlement integration.
+/// </remarks>
 public sealed class CellulantSettlementProvider : BhenguProviderBase, ISettlementProvider
 {
     private readonly HttpClient _httpClient;
@@ -51,9 +58,10 @@ public sealed class CellulantSettlementProvider : BhenguProviderBase, ISettlemen
 
         if (_httpClient.BaseAddress is null)
         {
+            // Verified Tingg Checkout 3.0 hosts. Source: https://docs.tingg.africa/reference/authenticate-requests
             var defaultUrl = _options.UseSandbox
-                ? "https://online.uat.tingg.africa/"
-                : "https://online.tingg.africa/";
+                ? "https://api-approval.tingg.africa/"
+                : "https://api.tingg.africa/";
             _httpClient.BaseAddress = new Uri(_options.BaseUrl ?? defaultUrl);
         }
     }
@@ -159,6 +167,10 @@ public sealed class CellulantSettlementProvider : BhenguProviderBase, ISettlemen
             req.Content = new StringContent(json, Encoding.UTF8, "application/json");
         }
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        // Tingg requires the apiKey header on every call (case-insensitive on the wire).
+        // Source: https://docs.tingg.africa/reference/authenticate-requests
+        if (!string.IsNullOrEmpty(_options.ApiKey))
+            req.Headers.TryAddWithoutValidation("apiKey", _options.ApiKey);
 
         var response = await _httpClient.SendAsync(req, ct).ConfigureAwait(false);
         var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);

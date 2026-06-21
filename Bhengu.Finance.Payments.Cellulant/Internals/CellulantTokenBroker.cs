@@ -49,6 +49,9 @@ public sealed class CellulantTokenBroker
             if (_accessToken is not null && DateTimeOffset.UtcNow < _accessTokenExpiresAt - TimeSpan.FromMinutes(1))
                 return _accessToken;
 
+            // Verified: POST {host}/v1/oauth/token/request with body {client_id, client_secret,
+            // grant_type:"client_credentials"} and the apiKey carried in the `apikey` header.
+            // Source: https://docs.tingg.africa/reference/authenticate-requests
             var requestBody = new
             {
                 grant_type = "client_credentials",
@@ -60,6 +63,10 @@ public sealed class CellulantTokenBroker
             {
                 Content = new StringContent(JsonSerializer.Serialize(requestBody), Encoding.UTF8, "application/json")
             };
+            // Tingg names this header `apikey` (lowercase) on the token endpoint.
+            // Source: https://docs.tingg.africa/reference/authenticate-requests
+            if (!string.IsNullOrEmpty(_options.ApiKey))
+                req.Headers.TryAddWithoutValidation("apikey", _options.ApiKey);
 
             HttpResponseMessage response;
             try
